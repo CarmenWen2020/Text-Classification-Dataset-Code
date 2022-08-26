@@ -1,0 +1,552 @@
+Abstract
+In recent years, DPDK (Data Plane Development Kit, a data plane development tool set provided by Intel, focusing on high-performance processing of data packets in network applications), one of the high-performance packet I/O frameworks, is widely used to improve the efficiency of data transmission in the cluster. But, the busy polling used in DPDK will not only waste a lot of CPU cycles and cause certain power consumption, but also the high CPU usage will have a great impact on the performance of other applications in the host. Although some technologies, such as DVFS (dynamic voltage and frequency scaling, which is to dynamically adjust the operating frequency and voltage of the chip according to the different needs of the computing power of the application running on the chip, so as to achieve the purpose of energy saving) and LPI (low power idle, a technology that saves power by turning off the power of certain supporting circuits when the CPU core is idle), can reduce power consumption by adjusting CPU voltage and frequency, they can also cause performance degradation in other applications. Using thread sleep technology is a promising method to reduce the CPU usage and power consumption. However, it is challenging because the appropriate thread sleep duration cannot be obtained accurately. In this paper, we propose a model that finds the optimal thread sleep duration to solve the above challenges. From the model, we can balance the thread CPU usage and transmission efficiency to obtain the optimal sleep duration called the transmission performance threshold. Experiments show that the proposed models can significantly reduce the thread CPU usage. Generally, while the communication performance is slightly reduced, the CPU utilization is reduced by about 80%.
+
+Introduction
+In the past few years, it has been proven that high-performance packet I/O framework can effectively improve data transmission performance. The network data packet processing speed is slow due to the overhead (memory copy, interruption, etc.) brought by the kernel network protocol stack. The high-performance packet I/O framework, such as Netmap [1], Intel DPDK [2] and PF_RING ZC [3], is a high-speed network packet processing solution proposed to solve the excessive overhead of the kernel network protocol stack. These frameworks can bypass the kernel network protocol stack, directly access and process network card data packets from the user mode, and use technologies such as zero copy, batch processing and busy polling to achieve high-speed processing of data packets [4]. For these reasons, they can achieve single-core processing data packets at a line rate. The high throughput and low latency characteristics of high-performance packet I/O framework make it suitable for network I/O intensive scenarios [5, 6], such as software routers [7, 8], switches [9, 10], middleboxes [11, 12] and IPsec [13]. The high-performance packet I/O framework also uses CPU multi-core and multi-NIC to double the bandwidth, which also makes it very popular in data transmission between hosts in data centers or clusters [14].
+
+Although the high-performance packet I/O framework can maintain high-speed data processing capabilities, it can also cause high CPU usage and a lot of useless power waste. Busy polling technology always keeps threads processing packets in an endless loop. Even when there is no data or when there is little data, the thread keeps empty loop. The empty loop makes the usage of the CPU core reach 100% [15]. In network I/O intensive scenarios, most of the CPU cycles consumed by busy polling are used for data processing and transmission. But when no data or very little data needs to be processed, the large amount of extra CPU cycles consumed by busy polling is useless. This will cause the CPU to heat up severely, thereby affecting the performance and life of the CPU. In a data center or cluster, network traffic is often not a continuous high load [16], but has the characteristics of “tidal effect” [17, 18], which means that a data center or cluster that uses a high-performance packet I/O framework has a lot of energy waste in the communication process [19]. Based on the BPCMFootnote 1 system we studied before, which uses DPDK in the GPU cluster to improve communication performance, we can also conclude that the interaction of AI data is not continuously high, but periodic [14].
+
+Many solutions have been proposed to solve the above-mentioned high CPU usage and energy waste problem. Operating system (OS) provides power management technologies such as dynamic voltage and frequency scaling (DVFS) and low-power idle (LPI) [20]. The high-performance packet I/O framework (such as DPDK) also provides the function of dynamically adjusting the CPU frequency. Moreover, Intel white paper [21] proposed a simple heuristic algorithm based on CPU frequency dynamic adjustment technology to reduce power consumption. Although dynamically adjusting the CPU frequency can reduce power consumption, there are also some problems. For example, in a cluster environment, reducing the host CPU frequency may affect the performance of other service applications running on the host. Moreover, the conversion waiting time for adjusting the CPU frequency is long and cannot adapt to rapid network traffic changes [22]. How to determine the appropriate CPU operating frequency in low power consumption and high speed is also difficult.
+
+In view of the tidal influence of data center network traffic and the periodicity of AI data flow interaction, we can appropriately give up CPU time when there is no data or a small amount of data communication to save useless power waste. The operating system provides thread (or process, later collectively referred to as thread) sleep and delay functions to allow threads to give up CPU time when they are idle. This may be a good choice to save energy during data transmission between hosts in the cluster. When no data or little data is transmitted, the thread is put into a sleep state and the CPU time is given to other service applications. This will not only reduce unnecessary waste of CPU time and reduce CPU usage, but also will not affect the performance of other applications. Both the host OS and the above framework provide corresponding sleep functions and delay functions to reduce the CPU resource occupation of threads in idle state. However, they did not provide (i) the actual real-time CPU usage, (ii) the real-time performance of data transmission (such as real-time transmission speed, packet loss rate and delay) and (iii) appropriate sleep and delay time which can balance CPU usage and data transmission performance. Therefore, a hibernation-based model is established to solve the above challenges in this paper. Our main contributions are as follows:
+
+1.
+Analyzing CPU usage of thread sleep and delay functions provided by OS and DPDK. We analyze the implementation principles of many thread sleep and delay functions provided by the OS and DPDK and verify its impact on the usage of the CPU core. And we proved that using the sleep function in DPDK can reduce the CPU core usage by 80%.
+
+2.
+Discussing the relationship between batch size, data packet size, sleep duration, transmission performance and CPU core utilization. We build a model of the data packet processing of DPDK and conduct experimental analysis. Experimental results show that proper sleep duration while maintaining high-performance data transmission can greatly reduce the thread’s occupation of CPU resources. However, the appropriate sleep duration is related to batch size, data packet size, hardware and applications, etc., and cannot be obtained directly.
+
+3.
+Proposing a CPU usage saving model and algorithm for DPDK, which is based on sleep. For the difficulty of obtaining the appropriate sleep duration, we establish a thread processing model of DPDK in this paper. We propose a real-time estimation algorithm of data packet size and data transmission speed based on one-dimensional Kalman filter and design an optimal sleep duration dynamic search algorithm based on the estimated real-time data packet size and data transmission speed. We also analyze the calculation time of the above algorithm and point out the algorithm setting corresponding to the acceptable calculation time.
+
+4.
+Verifying the performance of our approaches in real scenarios. We apply this algorithm to the previously studied BPCM system and observe its performance [14]. The results show that the method in this paper can reduce the CPU core usage by about 80% while maintaining high-performance data transmission. This not only greatly reduces the CPU usage of DPDK, but also reduces the impact of DPDK on other host applications.
+
+The remainder of this paper is organized as follows. In Sect. 2, we introduce the technical characteristics of DPDK, the advantages and disadvantages of the CPU power management technology DVFS and LPI provided by the OS, and the thread sleep and delay functions provided by the OS and DPDK. In Sect. 3, we establish an analysis model of DPDK and obtain relevant performance indicators from it, such as thread empty polling rate parameters that can characterize the actual real-time CPU utilization. We also discuss the relationship between batch size, packet size, sleep duration and transmission performance and CPU core utilization. We propose a model and algorithm for finding an optimal sleep duration and introduce them in detail in Sect. 4. In Sect. 5, we design experiments to evaluate the performance of the proposed CPU usage saving model and algorithm. Finally, the conclusion and discussion are drawn in Sect. 6.
+
+Background
+In this section, we first introduce the technical characteristic of DPDK and reveal its high-performance nature. Secondly, related methods to reduce CPU usage are introduced, such as DVFS, LPI and the power management functions provided by DPDK itself. Then, we also describe the thread sleep and delay functions provided by OS and DPDK and discuss its underlying implementation principles and performance. Finally, an experimental comparison was conducted to verify that the thread sleep function can greatly reduce the CPU usage of the thread without affecting the transmission performance.
+
+DPDK and BPCM
+The traditional kernel network protocol stack causes unnecessary system interrupts and calls due to multiple copies between the user mode and the kernel mode, which reduces the performance of network I/O. In recent years, DPDK, one of the high-performance packet I/O frameworks, has flourished. DPDK directly interacts with the hardware through the user mode and bypasses the low-performance kernel network protocol stack to increase the speed of network I/O [23]. It mainly uses the following technologies to speed up data packet processing:
+
+1.
+Zero copy: By directly accessing the DMA data area of the NIC in the user mode, the number of data copying between the kernel mode and the user mode is reduced, and the consumption of CPU resources by data copying can be reduced.
+
+2.
+Busy polling: The CPU does not need to wait for the interrupt of the NIC, but directly polls the ring buffer for data, which can eliminate the large amount of delay caused by frequent interrupts. However, even if there is no data, the thread needs to poll continuously, which will cause additional CPU overhead.
+
+3.
+Batch processing: Receiving or sending multiple data packets in each polling process can reduce the time spent on each data packet. Moreover, batch processing can also improve the cache hit rate, prefetch efficiency and prefetch accuracy, thereby reducing CPU waiting time.
+
+Based on the above advantages of DPDK, we developed the BPCM system in our previous research. The BPCM system is based on DPDK technology and can provide low-cost and high-speed communication between nodes in the GPU cluster. In a GPU cluster, the server’s CPU does not participate in most computing tasks and is often relatively idle. The original intention of the BPCM system is to use idle CPU resources to provide high-speed communication for the GPU cluster. The features that DPDK supports for multiple CPU cores and multiple network card communication models are very suitable for this scenario. The BPCM system makes full use of the technical advantages of DPDK and has the following technical characteristics:
+
+1.
+It can be realized based on ordinary network card and Layer 2 switch, and the hardware cost is low.
+
+2.
+The physical bypass connection does not conflict with the traditional network architecture.
+
+3.
+Avoid inefficient traditional protocol stacks and customize efficient and fast transmission protocols in user space.
+
+4.
+The bandwidth of multiple physical network cards is superimposed, which is abstracted as a single higher bandwidth for users.
+
+It can be seen from the technical characteristics of DPDK that busy polling is the main reason for the high CPU utilization. Similarly, this phenomenon has been inherited in the BPCM system. In order to ensure high-speed data transmission and reception, even when there is no data to be processed, the busy polling mechanism still keeps the CPU running. But in most realistic scenarios, the amount of data transmission is not continuously high, but it is periodic. Therefore, the periodicity phenomenon can be used to optimize the busy polling mechanism and reduce CPU utilization.
+
+DVFS, LPI and power management
+Dynamic voltage and frequency scaling (DVFS) technology is an essential feature in almost all modern computer hardware [24, 25]. It can change the power supply voltage according to the CPU workload and reduce the heat generated by the CPU core by adjusting the CPU operating frequency. Low-power idle (LPI) is a technology that saves power by turning off the power of certain supporting circuits (such as clocks and buses) when the CPU core is idle [26, 27]. However, the waiting time for state switching is long, which is not suitable for real-time switching scenes [28,29,30].
+
+DPDK also provides power management functions. For example, the power management function of DPDK allows user space applications to save power by dynamically adjusting the CPU frequency or entering different C-States [2]. In DPDK, scaling_governor is configured in user space. Then, the user space application can write scaling_setspeed to prompt the kernel to adjust the CPU frequency according to the strategy defined by the user space application. The Linux OS kernel also provides a cpufreq module for CPU frequency scaling of each logic core.
+
+Many studies are devoted to achieving energy saving through DVFS or LPI [15] on the server. The power management module of Intel DPDK also reduces power consumption by adjusting the CPU operating frequency, which is very effective at the operating system level. However, it is not applicable to reduce the CPU frequency to achieve energy saving on the hosts in the data center or cluster. Because reducing the CPU operating frequency can reduce the high CPU usage brought by DPDK, it also reduces the performance of other service applications on the server. The application-level thread sleep function may be more suitable for this scenario [31]. If no packet is received after polling, the current thread can be put into a short sleep and give up CPU cycles [32]. It not only does not affect the performance of other service applications, but also reduces the high CPU usage caused by the busy polling of DPDK. Next, we will discuss the sleep and delay of the thread.
+
+Thread sleep and delay
+Linux OS provides various sleep and delay functions for the pthread thread model. The main delay functions are: sleep(), usleep(), nanosleep(), alarm(), etc. The sleep() is accurate to seconds, usleep() can be accurate to microseconds, and nanosleep() can be accurate to nanoseconds. In the actual implementation, nanosleep() and alarm() on linux are the same. They are implemented based on the kernel clock mechanism. Affected by the implementation of the linux kernel clock, it cannot achieve nanosecond precision. This description can also be seen through man nanosleep(). The accuracy given in man is: 10 ms on Linux/i386 and 1 ms on Linux/Alpha. With the improvement of modern CPU technology, its accuracy will continue to improve.
+
+DPDK also provides thread sleep and delay functions, such as rte_pause(), rte_delay_us(), rte_delay_ms(), rte_delay_us_block() and rte_delay_us_sleep(). The ithread thread model of DPDK is implemented on the basis of the pthread model of OS. Therefore, the delay and sleep functions provided by the OS can be used in the DPDK environment. In the newer version of Linux kernel and DPDK, the calling relationship between part of its delay and sleep function implementation is shown in Fig. 1.
+
+Fig. 1
+figure 1
+The relationship between delay and sleep function call
+
+Full size image
+
+Figure 1 shows that the delay and sleep functions provided by DPDK are implemented based on the basic OS functions (_mm_pause(), timer()). The precision of OS sleep() and alarm() functions is seconds, and the precision of nanosleep() is nanoseconds. In newer OS versions, the implementation of usleep() will be linked as nanosleep(), and its precision is microseconds. The functions provided by DPDK such as rte_pause(), rte_delay_us(), rte_delay_ms() and rte_delay_us_block() are implemented on the _mm_pause() of OS, which implements the delay in the way of spin-wait and does not make the thread give up CPU resources [33]. DPDK provides an experimental function rte_delay_us_sleep() after version 18.11.9, which is based on the nanosleep() function of OS and does not block the CPU core. Since the 17.11.3 version used in this paper is older, the rte_delay_us_sleep() function is not provided. Therefore, in the follow-up experiments, we choose the usleep() function of OS instead of the rte_delay_us_sleep() function of DPDK. because they are implemented based on the nanosleep() function.
+
+Fig. 2
+figure 2
+CPU usage with different delays and sleep durations when no data is received
+
+Full size image
+
+We choose the rte_delay_us_block() function of DPDK and the usleep() function of OS for experimental comparison. In the DPDK environment, a single CPU core receives data from a single network card, and the above two functions are used when the thread (DPDK logic core) does not receive data. The model of the physical network card is Intel I350 four-port Gigabit network card. The specific experimental environment is described in detail in Sect. 5. Count the usage of CPU cores corresponding to different delays and sleep durations, as shown in Fig. 2. Figure 2 shows that no matter how large the delay time of the rte_delay_us_block() function of DPDK is, the usage of the CPU core always remains above 95. This should also prove the realization logic of its underlying spin-wait. Spin-wait does not release CPU resources, but always takes up CPU. However, using the usleep() function of OS, the occupancy of the CPU core will decrease as the sleep duration increases. The CPU core usage rates of usleep(0) and usleep(100) in Fig. 2 are close. This is due to the error of the usleep() function in our experimental environment is about 55us.
+
+Considering the situation when there is data, we set the data packet size to 256B and the batch size to 64 and record the CPU core utilization, receiving rate and packet loss rate of the receiver under different delays and sleep durations. After many experiments, we know that when the receiver does not use the usleep(0) function, no packet loss occurs when the sleep duration of the sender is 100us. Therefore, we set the sender delay interval to 100us to compare the transmission performance of the rte_delay_us_block() function of DPDK and the usleep() function of OS. The statistical results of the rte_delay_us_block() function of DPDK are shown in Fig. 3, and the statistical results of the usleep() function of OS are shown in Fig. 4.
+
+Fig. 3
+figure 3
+Transmission performance of DPDK delay function when there is data
+
+Full size image
+
+Fig. 4
+figure 4
+Transmission performance of OS sleep function when there is data
+
+Full size image
+
+Figures 3 and 4 show that in the absence of packet loss, the appropriate delay and sleep duration at the receiver will not affect the transmission performance. With the increase in the delay time of the rte_delay_us_block() function of DPDK, the usage rate of the CPU core has not decreased and is always close to 100. However, the usage of the CPU core using the usleep() function of OS will decrease as the sleep duration increases.
+
+The above performance of the OS usleep() function provides the possibility for us to save CPU usage in DPDK. A proper sleep duration not only does not affect the transmission performance, but the usage rate of the CPU core will be greatly reduced. This is very useful for reducing CPU usage and the impact on the performance of other host applications. Next, we will delve into how to use the sleep function in DPDK to achieve low CPU usage.
+
+Analytical model
+In this section, we will establish an analysis model to experimentally analyze the impact of sleep duration on CPU usage and transmission performance. During the analysis, we considered the impact of batch size, packet size and sleep duration on actual CPU usage and transmission performance. Moreover, we also propose an indicator that reflects the actual efficiency of the CPU core, rather than the actual CPU usage. Through this indicator, we can obtain the current thread’s usage of the CPU core in real time and provide a reference for reducing CPU usage.
+
+Test framework
+We design a test framework based on DPDK, as shown in Fig. 5. The test framework includes data sending node and data receiving node. The processing flow of data sending node and data receiving node simulates the end-to-end communication process in actual communication. On the sending node, a data packet producing thread (DPDK logic core) is responsible for producing a large number of data packets and putting them into the public sending buffer Public_send_ring. Another data packet sending thread (DPDK logic core) continuously takes out data packets and sends them from the public send buffer Public_send_ring. If the thread fails to fetch the data packet from the public send buffer Public_send_ring, it needs to sleep for a period of time. On the receiving node, a packet receiving thread (DPDK logic core) continuously receives packets from the RX_Ring_Buffer. If the thread fails to receive packets, it needs to sleep for a period of time. Otherwise, put packets into the public receiving buffer Public_recv_ring. Another data packet consuming thread (DPDK logic core) is responsible for taking out the data packet from the public receiving buffer Public_recv_ring and releasing it. User communication applications are simulated the data packet generating thread and data packet consuming thread. Their occupation of CPU core resources is not counted in the experiment.
+
+Fig. 5
+figure 5
+Test framework
+
+Full size image
+
+Model description
+By analyzing the execution logic of the data sending and receiving threads (DPDK logic core), a mathematical model is established for the running time 
+ in a loop, as shown in Eq. 1. The total time can be approximately expressed as
+
+
+ 
+
+(1)
+
+where 
+ is the total time consumed for calling DPDK’s batch receiving and sending functions, 
+ is the total time for processing packet, 
+ is the total time for sleep and 
+ is the total time for empty polling.
+
+As the data sending and receiving thread (DPDK logic core), each loop will call rte_eth_rx_burst() and rte_eth_tx_burst() function. There will be time consumption regardless of whether there is a data packet or not. So 
+ can be expressed as
+
+
+ 
+ 
+ 
+
+(2)
+
+where 
+ is the time consumption of rte_eth_rx_burst() and rte_eth_tx_burst() functions when there is data, 
+ is the time consumption of rte_eth_rx_burst() and rte_eth_rx_burst() functions when there is no data, 
+ is the total loop number when there is data and 
+ is the total loop number when there is no data. The sizes of 
+ and 
+ are related to the hardware platform, and different hardware platforms have different values.
+
+Each loop of the data sending and receiving thread (DPDK logic core) will process a batch of packets. The processing time 
+ is related to the actual business, and its calculation method is shown in Eq. 3. 
+ is written as
+
+
+ 
+ 
+
+(3)
+
+where 
+ is the processing time for each batch of data packets.
+
+We can get the values of 
+ and 
+. the total time for sleep 
+ can be approximately expressed as
+
+
+ 
+
+(4)
+
+where 
+ is the total loop number when there is no data. The total number of loop 
+, the total loop number when there is no data 
+, and the total loop number when there is data 
+ satisfy the following relationship in Eq. 5.
+
+
+ 
+
+(5)
+
+The entire running time of a thread is composed of 
+, 
+, 
+ and 
+, as shown in Eq. 1. 
+ and 
+ can be regarded as constants, and they are related to the specific hardware platform and business logic. 
+ can be seen as the useless time consumption of a thread (DPDK logic core). 
+ can be got by Eq. 6.
+
+
+ 
+
+(6)
+
+We assume that 
+ is fixed. In the entire running time of the thread, we can reduce the duration of 
+ by increasing the duration of 
+. In order to measure the useless running time of a thread, we propose an indicator 
+ called the empty polling rate. 
+ can be got by Eq. 7 . DPDK does not provide parameters that can characterize the actual real-time usage of the CPU core. The indicators proposed in this paper have been proven to be very effective in subsequent experiments.
+
+
+ 
+
+(7)
+
+Test analysis
+Batch and packet size
+We count the average time consumption of the data packet batch receiving and sending functions provided by DPDK in different batch sizes and packet sizes, and the results are shown in Fig. 6. Among them, 0B means the time consumption of data packet batch sending and receiving function when there is no data sending and receiving. Figure 6 shows that when the batch size is the same, the time consumption of the packet batch receiving function and the packet batch sending function of different packet sizes are the same. When the packet size is the same, the time consumption increases as the batch size increases. This also reflects the advantages of zero copy and addresses transfer of DPDK. The batch size will affect 
+ in the previous model.
+
+Fig. 6
+figure 6
+The time consumption of rx/tx with different batch sizes
+
+Full size image
+
+Sleep and transmission performance
+For the OS thread sleep function usleep(), the sleep duration will affect the transmission performance. Figure 4 reveals the relationship between the sleep duration of the receiver and the transmission performance when the sleep duration of the sender is fixed. We conclude that when there is no packet loss, the appropriate sleep duration of the receiver will not affect the transmission performance. This section will discuss the relationship between the sleep duration of the sender and the transmission performance when the receiver is not in sleep(the receiver does not use usleep(0)).
+
+We set the receiver not to use the sleep function usleep(0) in the experiment and count the transmission rate and packet loss rate when the sender does not use the sleep function and different packet sizes for different sleep durations. The results are shown in Table 1. When the sender and receiver do not use the sleep function, although the transmission rate of different packet sizes is higher, packet loss will occur. After a certain sleep duration, packet loss will not occur at the sender. Moreover, the transmission speed does not drop too much. This is very important for the feasibility of the method in this paper.
+
+Table 1 Transmission performance of different sleep durations at the sender
+Full size table
+
+In the experiment, we choose the data packet size to be 256B and 512B and record the change trend of the sleep duration of the sender and transmission performance. The result is shown in Fig. 7. When the data packet size is 256B, the packet loss rate corresponding to the sleep duration of 100us at the sender is zero. When the data packet size is 512B, the packet loss rate corresponding to the sleep duration of 200us at the sender is zero. The transmission speed is only reduced by 11 and 3.4. As the sleep duration of the sender increases, the transmission speed and packet loss rate will decrease.
+
+Fig. 7
+figure 7
+The change trend of sleep duration and transmission performance at the sender
+
+Full size image
+
+Sleep and CPU usage
+Usleep(0) and CPU usage In order to verify the impact of usleep(0) on the transmission performance and CPU usage of the receiver and the sender, we set the batch size to 64 and the data packet size to 256B and 512B for testing. The results are shown in Table 2. Using usleep(0) on the receiver and the sender for sleep can reduce the usage of the CPU core to below 10, and the empty polling rate can be reduced by 20. Although there is a certain amount of packet loss, the packet loss rate remains at a few hundred thousandths. When usleep(0) is not used at the sender and usleep(0) is used at the receiver, the packet loss rate will increase to a few ten thousandths. However, the transmission speed will not decrease. The reason why the CPU usage rate can be greatly reduced is the inaccuracy of usleep(0), and the error is about 55us in our experimental environment.
+
+Table 2 The impact of usleep(0) on transmission performance and CPU usage
+Full size table
+
+Transmission performance and CPU usage at the sender We will discuss the impact of the sender’s sleep duration on transmission performance and CPU usage. We use usleep(0) on the receiver and record the CPU usage and empty polling rate of the sender during different sleep durations, including the transmission speed and packet loss rate. We choose data packets of 256B and 512B to send, and the results are shown in Figs. 8 and 9. Since the sending speed and the receiving speed are almost the same, only the receiving speed is shown in Figs. 8 and 9. In Figs. 8 and 9, the transmission speed will start to decrease after a certain sleep duration and gradually decrease as the sleep duration of the sender increases. At the same time, the packet loss rate will decrease as the sending speed decreases. The CPU usage and empty polling rate of the sender will decrease as the sleep duration of the sender increases, but the empty polling rate will decrease faster than the CPU usage in the early stage. In Fig. 8, when the sleep duration of the sender is 60 us, the transmission speed will start to drop; before 60 us, the empty polling rate will drop faster. In Fig. 9, the same phenomenon occurs when the sleep duration of the sender is 150us. We call the sleep duration corresponding to this time the transmission performance sleep threshold .
+
+Fig. 8
+figure 8
+Transmission performance and CPU usage at the sender (packet size is 256B)
+
+Full size image
+
+Fig. 9
+figure 9
+Transmission performance and CPU usage at the sender (packet size is 512B)
+
+Full size image
+
+Transmission performance and CPU usage at the receiver In order to explore the effect of the sleep duration of the receiver on the transmission performance and CPU usage, we fixed the sleep duration of the sender. According to the test results in Table 1, when the packet size is 256B and the sender sleep duration is 100us, the packet loss rate of the receiver without usleep(0) is zero; when the packet size is 512B and the sender sleep duration is 200us, the packet loss rate of the receiver without usleep(0) is zero. Therefore, when the packet size is 256B, we set the sleep duration of the sender to 100us; when the packet size is 512B, we set the sleep duration of the sender to 200us. At this time, the sending speed of the sending end is constant. So, only the receiving speed is shown in Figs. 10 and 11. In Figs. 10 and 11, the transmission speed will start to decrease after a certain sleep duration and gradually decrease as the sleep duration of the receiver increases. However, the packet loss rate will increase as the sleep duration of the receiver increases. The CPU usage and empty polling rate of the receiver will decrease as the sleep duration of the receiver increases, but the empty polling rate will decrease faster than the CPU usage in the early stage. In Fig. 10, when the sleep duration of the receiver is 300us, the transmission rate will begin to drop, and the packet loss rate will begin to soar. In Fig. 11, the same phenomenon occurs when the sleep duration of the receiver is 500us. We call the sleep duration corresponding to this time the transmission performance sleep threshold .
+
+Fig. 10
+figure 10
+Transmission performance and CPU usage at the receiver (packet size is 256B)
+
+Full size image
+
+Fig. 11
+figure 11
+Transmission performance and CPU usage at the receiver (packet size is 512B)
+
+Full size image
+
+Empty polling rate and CPU utilization
+Generally, the CPU usage of a process or thread is the percentage of CPU time occupied by the process or thread to the total CPU time in a period of time. CPU usage is the statistics of the CPU time occupied by user processes or threads by the OS. Its calculation takes a certain amount of time, so it is not real time. Moreover, the calculation results are more accurate as time passes. It is not applicable to measure thread power waste by CPU usage in real-time scenarios within DPDK. According to the mathematical model established in Sect. 3.2 for the running time of the thread (DPDK logic core), the CPU usage rate can be approximately expressed by Eq. 8 and Eq. 9.
+
+
+ 
+
+(8)
+
+
+ 
+
+(9)
+
+The empty polling rate model proposed in this paper is the statistics of the useless empty polling time in the thread, which can reflect the proportion of the useless CPU time consumed to the total CPU time during the thread running. The CPU usage rate reflects the actual CPU time consumed as a percentage of the total CPU time during the thread running period, excluding sleep time. It can be seen from Figs. 8, 9, 10 and 11 that the empty polling rate can more intuitively reflect the effect of thread sleep duration on the useless CPU time consumed during thread running than the CPU usage rate. Of course, due to the error of the sleep function, there will be an error in the empty polling rate. For example, when the sleep duration is zero, the actual sleep duration exists and is about 55us, but the empty polling rate model will still calculate as zero. But this does not affect our model, because in reality, the probability that the sleep duration is zero is very low.
+
+Design of efficient DPDK communication
+In this section, we will explore ways to reduce the useless power consumption of threads (DPDK logic cores) and the impact on other applications based on the relationship between sleep duration and transmission performance and CPU usage obtained from the experiments and analysis in Sect. 3. Combined with actual application requirements, we design CPU saving models and algorithms that can be applied to DPDK. Next, we will introduce the model and algorithm in detail.
+
+Sleep duration and empty polling rate
+In order to visually show the relationship between sleep duration and empty polling rate, we study the running process of threads (DPDK logic core) and draw a running timing diagram with sleep, as shown in Fig. 12. Each small rectangular block in Fig. 12 represents a loop. A loop can be divided into two types according to work tasks. One is batch receiving/sending and processing of packets (green rectangle), and the other is sleep (brown rectangle, the color is deeper means longer sleep duration). In the case of a fixed transmission speed, the arrival time interval of each batch of packets is fixed (the interval between the green rectangles). If the sleep duration is too short, it is easy to perform multiple empty polling during this period, and even the number of receiving/sending packets is less than the batch size. In Fig. 12, the equation satisfying the sleep duration i, j and k is expressed as
+
+where  is the transmission performance sleep threshold. Figure 12 shows that within a reasonable range, the increase in sleep duration can reduce the number of loops. To reduce the number of loops is to reduce the time consumption of empty polling. Appropriate sleep duration will be our research focus.
+
+Fig. 12
+figure 12
+The running timing diagram with sleep
+
+Full size image
+
+Simple method based on usleep(0)
+In Sect. 3, the experimental results show that the use of usleep(0) on the receiver and the sender can greatly reduce the CPU usage of the thread and cause a small increase in the packet loss rate. However, the transmission speed hardly drops. This is because the usleep(0) of the OS has a certain error accuracy, which is about 55us on the experimental platform of this paper. The error accuracy is related to the hardware configuration of the host, and its value cannot be calculated accurately. usleep(0) at the receiver and sender can be used as a simple solution to reduce the CPU usage of DPDK. But, its effect is not optimal. Moreover, the empty polling rate of the thread is not good in this solution. Therefore, next we try to design a method to find the optimal sleep duration.
+
+Dynamically search the optimal sleep duration
+In Sect. 3, we know that different packet sizes have different transmission performance sleep thresholds, and the value of transmission performance sleep thresholds increases as the packet size increases. In order to obtain the optimal sleep threshold, we specially design a dynamic search algorithm. The algorithm is divided into two stages: estimate the current real-time packet size and transmission speed; dynamically search the optimal sleep duration. Next, we will introduce the algorithm in detail.
+
+Real-time packet size estimation
+Due to different network applications, the size of packets transmitted on the network is different. During the packet batch processing of DPDK, the packet size in a batch received/sent each time may be different. Moreover, the packet size in the network is correlated within a certain period of time [34]. Therefore, the real-time optimal estimation of the packet size will be one of the keys. The transmission of network data is affected by many factors and parameters and is not a traditional linear system [35,36,37].
+
+Kalman filter is widely used as an algorithm to make educated predictions in uncertain dynamic systems [38]. Even with various interferences, Kalman filter can always point out what actually happened. Moreover, it is very ideal to use Kalman filter in a continuously changing system. It has the advantage of small memory usage (except for the previous state, no other historical data is required). Kalman filter is very fast and very suitable for real-time problems. Therefore, we hope to apply the Kalman filter prediction algorithm to the real-time estimation algorithm of the packet size in this paper. The scenario of packet size estimation determines the fast and low memory characteristics of the estimation algorithm. Therefore, it will be very suitable to use Kalman filter in real-time packet size estimation algorithm. Of course, the original Kalman filter algorithm cannot be directly used in the packet size estimation scenario in this paper. So, we modify it to apply to the packet size estimation scenario in this paper. Next, we will introduce in detail the real-time packet size estimation algorithm based on one-dimensional Kalman filter [39].
+
+Now, we are ready to get an estimate of the packet size at time t. First, we establish model for the packet receiving/sending, processing and sleep in the thread loop from time t to time , as shown in Fig. 13. In Fig. 13, a rectangle represents a thread loop, a green rectangle represents packet receiving/sending and processing, and a brown represents a sleep (the darker the color, the longer the sleep duration). It is the same as in Fig. 12.
+
+Fig. 13
+figure 13
+Packet size estimation based on one-dimensional Kalman filter
+
+Full size image
+
+We number a batch of packets at time t as n, and the size of each packet is 
+ (i =1, 2, ..., B) where B is the batch size. 
+ is the average of the packet size, and 
+ is the variance of the packet size. They are given by Eq. 11 and Eq. 12, respectively.
+
+
+ 
+ 
+
+(12)
+
+Considering that the packet size in the network is correlated within a certain period of time, we define 
+ as the average of 
+ from time  to time t , which is given by Eq. 13.
+
+
+ 
+ 
+
+(13)
+
+At the same time, we also define 
+ as the variance of 
+ from time  to time t, which is given by Eq. 14.
+
+
+ 
+ 
+
+(14)
+
+The predicted value 
+ of the packet size at time t can be calculated based on the one-dimensional Kalman filter by Eq. 15.
+
+
+ 
+
+(15)
+
+We define 
+ as the Kalman filter measurement value, 
+ as the Kalman filter observation value and 
+ as the Kalman gain. The Kalman gain 
+ is given by Eq. 16.
+
+
+ 
+ 
+
+(16)
+
+In Eq. 16,  is the predicted deviation, which is related to the measured deviation  at time , which is given by Eq. 17.
+
+Finally, the update of the measurement deviation is given by Eq. 18.
+
+
+ 
+
+(18)
+
+The above is an introduction to the mathematical model based on one-dimensional Kalman filter for real-time packet size estimation. The real-time packet size estimation algorithm based on Kalman filter makes full use of the idea of one-dimensional Kalman filter algorithm and combines the statistical characteristics of packet size. The calculation process is described in detail in Algorithm 1.
+
+figure a
+Real-time transmission speed estimation
+The research goal of this paper is to reduce CPU usage and useless power waste while maintaining high transmission performance. Therefore, transmission speed and packet loss rate are crucial reference indicators. DPDK does not provide a method to directly obtain transmission speed and packet loss rate. So, the conventional obtain method is only calculated by statistical results for a period of time [40] which has established a mathematical model and implemented the interface in our last research [14]. However, in a scene with high real-time performance, the sampling accuracy is easy to fluctuate and cause large errors. Therefore, we also establish a new model based on one-dimensional Kalman filter to estimate the transmission speed in real time. From the experiment in Sect. 3, we know that the transmission speed will decrease when the packet loss rate increases. Moreover, the packet loss rate cannot be obtained in the scenario of this paper. So, we only use transmission speed to measure transmission performance.
+
+Fig. 14
+figure 14
+Transmission speed estimation based on one-dimensional Kalman filter
+
+Full size image
+
+In Fig. 14, we define the data transmission speed 
+ at time t, which is given by
+
+where 
+ represents the time interval from the start of the 
+ sleep to the start of the 
+ sleep. Considering that the transmission speed in the network is correlated within a certain period of time, we define 
+ as the average of 
+ from time  to time t, which is given by Eq. 20 .
+
+
+ 
+ 
+
+(20)
+
+At the same time, we also define 
+ as the variance of 
+ from time  to time t , which is given by Eq. 21.
+
+
+ 
+ 
+
+(21)
+
+The transmission speed at time t is estimated based on the one-dimensional Kalman filter, which is defined by Eq. 22. We define 
+ as the Kalman filter measurement value, 
+ as the Kalman filter observation value and 
+ as the Kalman gain. We redefine the observed and measured values of the transmission speed estimation algorithm. This is because the longer the time, the more accurate the calculation of the transmission speed. Therefore, when the deviation of the observed value 
+ is zero, we consider the observed value 
+ to be the predicted value 
+. the Kalman gain 
+ is given by Eq. 23.
+
+
+ 
+ 
+
+(23)
+
+In Eq. 23 ,  is the predicted deviation, which is related to the measured deviation  at time  , which is given by Eq. 24.
+
+Finally, the update of the measurement deviation  is given by Eq. 25.
+
+
+ 
+
+(25)
+
+The above is an introduction to the mathematical model based on one-dimensional Kalman filter for real-time transmission speed estimation. The real-time transmission speed estimation algorithm based on Kalman filter makes full use of the idea of one-dimensional Kalman filter algorithm and combines the statistical characteristics of transmission speed . The calculation process is described in detail in Algorithm 2.
+
+figure b
+Optimal sleep duration dynamic search
+Based on the conclusion of the experiment in Sect.3, “appropriate sleep duration can reduce CPU usage and useless power waste while maintaining high-performance transmission,” we hope to find this appropriate value quickly and accurately. This appropriate value is defined by us as the transmission performance sleep threshold. However, under different hardware and application environments, the appropriate sleep duration may be different. Therefore, a algorithm of optimal sleep duration dynamic search is needed. In the same hardware and application environment, different packet sizes correspond to different transmission performance sleep thresholds. And it increases as the packet size increases. Therefore, we establish a record table for different packet sizes to assist in finding the transmission performance sleep threshold .
+
+In Fig. 15, we take the packet size of 64, 128, 256, 512 bytes as an example for detailed introduction. Of course, the actual packet size should be in the range of 64 to 1500, which is related to the Ethernet communication standard. The record table  has three columns, namely ,  and max(A).  is the packet size, and the value range is 64  1500, that is, the actual size of  is 1436 (1500-64) rows.  is the queried maximum sleep duration corresponding to the packet size. max(A) is the transmission speed corresponding to the queried maximum sleep duration.  is the search step, and its value is neither too large nor too small. When the value of  is too large, although the search speed is fast, large errors are likely to occur. When the value of  is too small, although the error is small, the search speed will be very slow. Based on experience, we will set  to 5us in the experiment. In Fig. 15, P represents the estimated packet size at time t, A represents the estimated transmission speed at time t and st represents the sleep duration at time .
+
+Fig. 15
+figure 15
+The optimal sleep duration dynamic search
+
+Full size image
+
+First, we obtain the value of max(A) corresponding to P in the record table  according to the estimated value P.  represents our tolerance for transmission speed drops. If the estimated value A is equal to or smaller than , then no operation is performed, and st is set as the  corresponding to P in the record table , as shown in Case 5 in Fig. 15; otherwise, the max(A) corresponding to P is set to A, and the  corresponding to all rows (including P ) after P in the record table  is updated. If  is greater than , no operation is performed, as shown in Case 4 in Fig. 15; otherwise,  is set to , as in cases 1, 2, 3 and 6 in Fig. 15. Finally, st is set as the  corresponding to P in the record table . The calculation process is described in detail in Algorithm 3.
+
+figure c
+Time-consuming optimization of the optimal sleep duration dynamic search algorithm
+As an CPU saving model in DPDK, it has higher requirements for real-time performance. If the calculation time of the algorithm exceeds a certain limit, it will have a great impact on system performance. Therefore, it is very meaningful to optimize the time consumption of the three algorithms proposed above. Next, we will introduce the time-consuming optimization process of the above three algorithms in detail.
+
+First, for the packet size real-time estimation algorithm, the time complexity of 
+ and 
+ is O(B), where B is the batch size. The value of B is generally fixed, and the size is 32, 64 or 128 in DPDK. B is set to 64 in our system. The time complexity of 
+ and 
+ is O(N), where the size of N is related to time T. N is given by
+
+where G is the theoretical bandwidth of the physical network card and B is the packet size, whose value is 64  1500B. For example, for a gigabit network card, when T is 10ms, the value of N is 328  14; for a 10 gigabit network card, when T is 1ms, the value of N is 328  14.
+
+Secondly, for the transmission speed real-time estimation algorithm, the time complexity of 
+ is O(B). The time complexity of 
+ and 
+ is , and the size of N is the same as Eq. 26. It can be seen from Eq. 26 that time T plays a decisive role in the time complexity of the packet size real-time estimation algorithm and the transmission speed real-time estimation algorithm. Using appropriate T on different physical links not only does not affect the accuracy of the algorithm, but also reduces the calculation time of the algorithm.
+
+Finally, for the optimal sleep duration dynamic search algorithm, the time complexity of each value search is O(1), and the time complexity of each value update is . When each value is updated, it needs to update all the contents of the subsequent table at the same time. Therefore, the number of update operations is determined by the structure of the table. Figure 16a uses an array structure as the record table, and each update needs to traverse the remaining part of the entire array; Fig. 16b uses packet size segmentation, because similar packet sizes may have little difference in sleep duration and transmission speed. Similar packet sizes can be merged, which can also reduce the number of table update operations; Fig. 16c combines the linked list on the basis of Fig. 16b. Each update operation only needs to operate on the remaining part of the linked list, which greatly reduces the number of operations. The table structure in this paper is the same as that shown in Fig. 16c.
+
+Fig. 16
+figure 16
+Different table structure
+
+Full size image
+
+Evaluation
+In this section, we evaluate the performance of the algorithm we proposed in Sect. 4. We apply this algorithm to the previously studied BPCM system and observe its performance. In the real environment of the BPCM system, we extract some data to analyze and verify the performance of the power saving method proposed in this paper.
+
+Experimental environment
+The BPCM system cluster is constructed by six servers and a 48-port Gigabit Layer 2 switch. The detailed server configuration information is shown in Table 3. Each server has an 8-core Intel Xeon E3-1230 V2@3.3Ghz CPU, two four-port Intel-I350-T4 Gigabit Ethernet cards and a total of eight network ports. The BPCM system is developed based on the DPDK-17.11.3 version and is configured with 8G large page memory, each port has one receiving queue and one sending queue, and the size of the queue is 1024, which can be adjusted.
+
+Table 3 Server configuration information
+Full size table
+
+Evaluation of packet size estimation algorithm
+In order to verify the performance of the packet size estimation algorithm, we sample the real-time packet size estimation of the thread in the BPCM system and show it in Fig. 17. It can be seen from Fig. 17 that most of the estimated packet sizes are below 768 bytes. This is because in the BPCM system we set the packet size not to exceed 768 bytes. That is, the data packet size ranges from 64 to 768 bytes. It can be observed from the overall sampling data that no matter who the measured value and the observed value is smaller, the predicted value is always between the measured value and the observed value. In this way, it is possible to filter out the prediction interference caused by the fluctuation of the observation value. When the variance of the observed value is zero, the predicted value is equal to the observed value. It shows that the observation value is more reliable, such as the 12th group of data in Fig. 17. When the variance of the measured value and the variance of the observed value are not zero, the smaller their variance, the higher the credibility, and the closer the predicted value is to it. This is consistent with the core idea of Kalman filtering.
+
+Fig. 17
+figure 17
+Evaluation of packet size estimation algorithm
+
+Full size image
+
+Evaluation of transmission speed estimation algorithm
+In order to verify the performance of the transmission speed estimation algorithm, we sample the real-time transmission speed estimation of the thread in the BPCM system and show it in Fig. 18. Same as the estimation effect in Fig. 17, the predicted value of the transmission speed is always between the measured value and the observed value. When the variance of the observed value is smaller, the predicted value is closer to the observed value.
+
+Fig. 18
+figure 18
+Evaluation of transmission speed estimation algorithm
+
+Full size image
+
+Evaluation of the transmission performance threshold search algorithm
+Usually in optimization theory, the search direction and search step size play a decisive role in the performance of the optimal solution algorithm. In the dynamic search algorithm for the optimal sleep duration in this paper, because the search direction is determined (gradually increased), the search step size has become a key factor affecting performance. As shown in Table 4, different search step sizes have different final search accuracy. Moreover, different packet sizes also have different final search accuracy. It also shows that the packet size interval in the record table (the interval size of the interval array) affects the final search accuracy. At the same time, the search step size also affects the number of searches. In Fig. 19, as the search step size increases, the number of searches gradually decreases. The search times for different search steps of the same packet size are different, and as the search step increases, the search times decrease.
+
+Fig. 19
+figure 19
+The relationship between the search step size and the search time of the optimal sleep time search algorithm
+
+Full size image
+
+Table 4 The accuracy of searching algorithm for optimal sleep duration
+Full size table
+
+In the BPCM system, the data packet size is set to 768 bytes, and  is 10 bytes. Then, the proportion of  in a batch is . For example, in the actual network environment, the proportion of in a batch is . Such a low proportion has an acceptable influence on the search accuracy of the optimal sleep duration. When the search step  is 10 us, the number of processing cycles required to search for the optimal sleep duration corresponding to 1280 bytes is 64, as shown in Fig. 19. It can be inferred that the number of searches for the maximum packet size (1500 bytes) should be less than 100, which is acceptable for the BPCM system. Finally, in the BPCM system, we set parameter  to 10 bytes, parameter  to 10us, parameter T to 10ms and parameter  to 0.01.
+
+Evaluation of transmission performance and CPU usage
+In order to verify the effect of the solution in this paper, we choose to compare with the original DPDK. We do not compare with the case of using usleep(0) because the performance and CPU usage of using usleep(0) must be somewhere between the above two cases. In the real environment of the BPCM system, we choose five cases where the packet size is set to 128 bytes, 256 bytes, 512 bytes, 768 bytes and 1024 bytes and count the corresponding transmission speed, CPU usage, empty polling rate and packet loss rate. The final result is shown in Figs. 20, 21 and 22.
+
+Fig. 20
+figure 20
+Comparison of transmission speed and CPU usage at the sender
+
+Full size image
+
+Fig. 21
+figure 21
+Comparison of transmission speed and CPU usage at the receiver
+
+Full size image
+
+Fig. 22
+figure 22
+Comparison of packet loss rate
+
+Full size image
+
+It can be seen from Figs. 20 and 21 that the CPU utilization of the original DPDK is always maintained at about 99, no matter on the receiver or the sender. However, the CPU usage of the sleep-based method in this paper is always lower than 20. Compared with the CPU usage of the original DPDK, the CPU usage of the sleep-based method is reduced by more than 80. Moreover, in the empty polling rate of the thread, the method in this paper reduces more than 70 compared with the original DPDK. This is enough to show that using the sleep function has a great effect on saving CPU usage of the thread and even CPU power consumption. Although the transmission speed of sleep-based method is lower than that of the original DPDK, the drop is acceptable. For example, when the packet size is 512 bytes, the transmission speed drops by about 4.3; when the packet size is 768 bytes, the transmission speed drops by about 4.7. In Fig. 22, compared with the packet loss rate of the original DPDK, the packet loss rate of the sleep-based method is increased. However, the packet loss rate is rise by an order of magnitude, from a few hundred thousandths to a few ten thousandths. This value is still within the packet loss rate of five ten-thousandths of a gigabit network card and can be ignored.
+
+Conclusions
+In this paper, we aim at the problem of high useless CPU resources waste of DPDK, one of the very popular high-performance packet I/O frameworks, in the cluster environment, and propose a CPU usage saving model based on thread sleep technology. We first analyze the implementation principles of multiple thread sleep and delay functions provided by the OS and DPDK, and verify its impact on the usage of the CPU core. Experimental results show that thread sleep technology is very promising for solving the above problems. However, it is challenging to obtain an appropriate thread sleep duration because its value is different in different environments. In order to solve the above challenges, we then conduct a lot of experiments to explore the relationship between batch size, packet size, sleep duration, transmission performance and CPU core usage consumption. We also establish a model for the packet processing of DPDK and conduct experimental analysis. Experimental results show that a appropriate thread sleep duration can greatly reduce the thread’s occupation of CPU resources while maintaining high data transmission performance. However, the appropriate sleep duration is related to batch size, packet size, hardware configuration and application processing and cannot be directly and accurately obtained. Aiming at the problem that the appropriate sleep duration cannot be accurately obtained, we propose a dynamic search algorithm for the optimal sleep duration. The algorithm performs dynamic search based on the real-time packet size and transmission speed estimated by the one-dimensional Kalman filter algorithm. We also analyze the calculation time of the algorithm and determine the appropriate algorithm parameter settings. Finally, we apply the algorithm to the previously studied BPCM system and verify its performance. Experimental results show that the sleep-based method can reduce the CPU usage rate by more than 80 when the transmission performance is slightly reduced. Particularly, when the network is idle (no data transmission), the effect is better. This is very valuable for saving CPU resources in a cluster environment using DPDK. The sleep-based method proposed in this paper can not only reduce the high useless power waste and the high CPU usage caused by the empty polling of DPDK, but also reduce the adverse effects of other services caused by the high CPU usage of DPDK.
+
+Currently, DPDK is also widely used in large-scale network traffic generators [41] and 5G network packet processors [42, 43]. In these devices, low power consumption is urgently needed. Our next research work will try to apply the CPU saving model we proposed to these devices to save useless energy consumption.
+
+Notes
+Bypass parallel communication mechanism, a parallel communication technology of multiple network cards in a cluster based on DPDK.

@@ -1,0 +1,456 @@
+Abstract
+The increase of the number of cores in processors used in modern cluster architectures advocates hybrid parallel programming, combining Message Passing Interface (MPI) for internode operations and a shared memory treatment of intranode operations. We propose an MPI+MPI hybrid approach to parallel programming in which shared memory operations are managed by the combination of MPI shared memory windows introduced with MPI-3, C11/C++11 atomic operations and the associated multi-thread memory model. We illustrate the method on fundamental parallel operations (barrier, reduction) and on the ghost update, which is prevalent in many parallel numerical methods. The performance tests on Reedbush-U and Oakbridge-CX systems show that using the C11/C++11 memory model to manage shared memory windows can achieve levels of performance comparable to state of the art MPI implementations, while reducing the variance of execution times as well as increasing the level of synchronization between processes, especially in multiple nodes environments. It also reduces significantly the execution time of ghost updates compared to flat MPI, and the synchronization of shared data with the C++11 memory model is observed to be more efficient than other synchronization methods based on RMA utilities.
+
+
+Keywords
+Hybrid parallel programming
+MPI shared memory model
+MPI-3
+C++11 memory model
+
+1. Introduction
+The study of physical and mechanical phenomena, in particular when several scales are involved, often requires the numerical resolution of large scale problems while ensuring a detailed representation at the local level. The rapid development of large parallel computer architectures have allowed the resolution for problems of increasing size and complexity. In order to effectively utilize these architectures, several parallel programming styles have been proposed. The classical approach is based on the Message Passing Interface (MPI) [14], which offers a simple and effective way to manage the communication between processes. However, following the increase of the number of cores per chip in new processors, modern cluster architectures tend to consist of shared-memory symmetric multiprocessing (SMP) nodes with a large number of cores. Moreover, network interfaces struggle to cope with the highly concurrent usage of the network. For this reason, distributed+shared memory hybrid approaches, such as MPI-OpenMP [13], [16], [20] and MPI-POSIX Threads [9], [22], have become increasingly popular to optimize the use of the shared memory environment, while reducing the workload of the network interface. However, hybridizing with OpenMP and Pthreads, etc., which share the data among threads by default, have downsides especially when there is a significant concurrent access to complex data structures. Those include the high probability of introducing hard-to-find bugs and the need of significant coordination among the developers during development of large projects.
+
+On the other hand, the introduction of MPI Remote Memory Access (RMA), also called one-sided communication, with the MPI-2 standard led to a significant improvement of MPI intranode communications, reducing the network overload by bypassing the use of MPI Send and Receive between shared memory processes. It led to an increased interest into MPI-everywhere programming [6], [15], leading to a new model of MPI-MPI hybrid. MPI-3 standard introduced new features to enable MPI processes within an SMP node to collectively allocate shared segments of memory for direct load/store operations [2], [7], which enables the shared-memory-processes to more efficiently share data. This opened new possibilities for innovative hybrid approaches using MPI-3 shared memory model, in particular for the optimization of MPI collectives [23]. Unlike typical shared memory approaches like OpenMP and POSIX threads, this “all memory is private unless explicitly shared” paradigm provided by MPI shared memory reduces the complexity of hybrid memory programming and does not suffer from the downsides of typical shared memory programming. Although the explicitly shared memory paradigm is not new [10], its availability in ubiquitous MPI makes it a very attractive choice for the developers. Although the degree of improvements brought by this MPI-MPI hybrid approach is problem dependent, it can significantly reduce the access to shared memory in problems where only a fraction of the data in a process needs to be seen by other processes, as is the case in numerical methods like Finite Element Method (FEM), Finite Difference Method (FDM), etc.
+
+When using a base language with a multi-thread aware memory model, using the base language's memory synchronizing primitives with suitably weak memory models could lead to higher performance compared to the standard memory synchronizing functions provided in MPI. In MPI-MPI hybrid models, the compiler of the base language is unaware of the presence of a multi-threaded context. Hence, the standard memory synchronizing functions provided in MPI, like , , etc., must be made conservative to prevent the serial compiler optimization and out of order execution of hardware schedulers breaking the shared memory parallel semantics. MPI synchronization calls act as an optimization barrier [7], thus it can lead to non-optimal performance. Since the C11/C++11 standard, atomic types and memory fences, equipped with different memory orders, can be used to manage the concurrent data access while reducing the stress on memory subsystems [19]. The multi-thread aware memory model of C11/C++11 is an attractive alternative to the MPI provided synchronization functions. Using a suitable atomic variable (e.g., std::atomic_flag) with a suitable weak memory order (e.g., std::memory_order_release/acquire, etc.) to establish memory synchronization and prevent undesired memory reordering, better optimization on the shared memory contents can be achieved. Such fine-grained synchronization based on atomic operations can bring significant improvement to the performance of a parallel program [4], [21], albeit increasing its complexity.
+
+In this paper, we propose an approach of intranode communication based on coupling MPI shared memory windows and C++ atomic operations for synchronization. We will first illustrate the method on standard communication utilities such as barriers and collective reduction operations. It should be noted that the objective of this work is not to propose a method competing with recent hardware-aware hierarchical implementations designed to improve on state-of-the-art collective operations [12], [17], but to present an alternative synchronization approach to higher-level MPI primitives. The proposed implementation for collective operations serves primarily to showcase the method and identify the potential advantages before using it in more specific applications. We will in particular demonstrate its performance by applying it on the ghost update which is a classical operation in parallel numerical methods like FDM, FEM. In particular, we evaluate the gain of performance this method achieves compared to other classical approaches for standard intranode operations and communications. We will also show how to manage internode communications and evaluate the performance of this MPI-MPI hybrid approach for a simple and reproducible FEM setting. In the rest of the paper, to avoid any confusion between computer nodes and FEM nodes (the points of the mesh), we will refer to the latter as points.
+
+Section 2 presents a brief background of the current research. Section 3 details the management of the shared memory operations inside a single SMP node. Section 4 presents the performance tests for fundamental operations (barrier, allreduce) and intranode data exchanges. Section 5 details the extension of the method to an MPI-MPI hybrid approach in multi node architectures. Section 6 presents the performance tests for the MPI-MPI Hybrid method compared to flat MPI. Section 7 consists of a discussion and section 8 offers concluding remarks.
+
+2. Background
+2.1. MPI-3 Remote Memory Access
+2.1.1. MPI-3 extensions
+Hoefler et al. [8] and Dinan et al. [3] discussed the MPI-3 RMA semantics in great detail, and we present here a brief summary of the functionalities relevant to this work. The MPI-2 standard introduced the MPI RMA interface for one-sided communications. Those communication operations involve a window, which consists of a group of processes and a contiguous region of memory at each process. Originally only three operations were available: MPI_Put, MPI_Get, and MPI_Accumulate. The origin process instigates a communication operation on the memory region of the window in the target process. These operations must occur in the context of either an active or passive synchronization epoch, in particular to ensure the completion of communication operations at the end of the epoch. Although MPI-2 RMA interface was made to be portable, it was found to be inadequate for some common use cases [1] and was revised with the introduction of the MPI-3 standard.
+
+In particular, it updated the memory model for data consistency. Originally, RMA was designed with a separate memory model, in which two versions of the same window coexist: the private copy (locally accessible version) and the public copy (remotely accessible version). Since the synchronization of the two copies is required when a window synchronization is performed, local updates and remote updates cannot be performed concurrently even if targeting non-overlapping memory regions. With MPI-3, a new unified memory model was introduced, relaxing some of the above restrictions, assuming that the two copies are identical, relying on the hardware coherent memory subsystems to propagate the updates. MPI-3 also introduced new window types, including shared memory windows which allows processes to allocate a shared memory segment and map it into the address space of each process, and uses the unified memory model by default. It also added new atomic operations MPI_Fetch_and_op and MPI_Get_accumulate allowing atomic read-and-updates operations in a single epoch.
+
+2.1.2. Synchronization options
+MPI-3 RMA provides two approaches for window synchronization: active target synchronization and passive target synchronization.
+
+In active target synchronization, both origin and target processes explicitly participate in the communication. The simplest option is the call of MPI_Win_fence by all processes to define the beginning and the end of an epoch, which ensures a collective synchronization. However this is not generally required and can come at a cost for performance. Instead, the post/start/complete/wait synchronization mode offers a more flexible and local synchronization between communicating processes. The target process opens an exposure epoch with MPI_Win_post allowing other processes to access its window. It also ensures that every local operations called before are completed. The origin process then opens an access epoch by calling MPI_Win_start (which blocks until the corresponding MPI_Win_post), and can then perform remote operations on the window. Once done it closes its access epoch with MPI_Win_complete, ensuring the completion of all RMA operations. The target process then closes the exposure epoch by a call of MPI_Win_wait (which blocks until the corresponding MPI_Win_complete).
+
+In passive target synchronization, only the origin process participates explicitly in the communication. The concept of exposure epoch is here irrelevant since all processes expose their window. The origin process opens and closes an access epoch to the remote window by calling MPI_Win_lock and MPI_Win_unlock, which despite their name do not provide a standard lock or mutex. The lock can either be exclusive or shared depending on the required synchronization of remote operations engaged by different processes. With MPI-3 it became possible for a single origin process to lock simultaneously multiple targets. It in particular introduced the two functions MPI_Win_lock_all and MPI_Win_unlock_all to open an access epoch to all processes in the communicator. MPI-3 also introduced additional functions to ensure data consistency when multiple operations are performed in the same epoch, including MPI_Win_flush which ensures the completion of RMA operations, and MPI_Win_sync which synchronizes the private and public copy of the window. We should note that a flush is automatically performed at the end of an access epoch.
+
+2.2. C11/C++11 memory model
+The C11/C++11's built-in atomic operations and their associated memory model allow a local and flexible control of shared memory. It can create synchronization points for interthread atomic operations and establish the ordering of operations between threads (and by extension the corresponding processes) on atomic and non-atomic variables. The memory model particularly inhibits undesired compiler optimization and hardware schedulers affecting the order of operations so that a desired interprocess ordering can be established, and the user can allow different degrees of optimization by using suitable weaker memory orders.
+
+Without going into details, as it is already explained clearly in the literature [19], we give here the fundamental concepts of memory orders. As for sequential programming, an operation  happens-before , if  completes before  starts. In addition, atomic operations provide the synchronizes-with relationship. Namely, by default, if process A writes a value to an atomic variable and process B reads this value, there is a synchronizes-with relationship between the atomic write and the atomic read operations. As such, any operation (atomic or not) happening before the write in process A also happens-before the read in process B and any subsequent operation. This behavior is ensured by the default memory ordering of atomic operations, sequential consistency [11].
+
+Sequential consistency ensures that the atomic instructions are executed in source code order and there is a global order of all atomic operations on all processes. While sequential consistency makes it easier to ensure the logical correctness of a shared memory program, it is not the optimal choice since it prevents certain compiler optimizations. Indeed, some algorithms allow certain operations to complete even though the effects of preceding operations on other processes are not yet visible. Forcing a global order is costly as it forces the updates of values held in the cache memory if they have been modified by an operation happening-before in another process. For this reason, using a suitably relaxed memory order on atomic operations can be beneficial to the performance.
+
+Moreover, sequential consistency is not necessary to ensure the interprocess synchronizes-with relationship. If a value written by a store operation with a release memory ordering in process 0 is read by a load operation with acquire memory ordering in process 1, it establishes a synchronizes-with relation between the two processes (i.e. all the operation before the store operation in process 0 happen before any of the operation after the load operation of process 1, see Fig. 1). In this case, operations written after the store operation in process 0 and before the load operation in process 1 are not concerned by the happen-before relation, and can even be reordered by the compiler.
+
+Fig. 1
+Download : Download high-res image (102KB)
+Download : Download full-size image
+Fig. 1. Synchronizes-with relationship between processes with release-acquire memory ordering (blue arrows represent allowed re-orderings). (For interpretation of the colors in the figure(s), the reader is referred to the web version of this article.)
+
+In the following sections, we detail how the C11/C++11 memory model can be utilized to efficiently manage shared memory communications. We consider basic operations, like barrier, all-reduce, etc., and later compare their performance with the respective MPI implementations to demonstrate that by managing MPI-shared memory with the C11/C++11 memory model users can obtain high performance on par with state of the art algorithms used in standard MPI libraries.
+
+3. Management of MPI-shared memory with C++11 memory model
+3.1. Barrier
+Barrier is one of the basic tools required in parallel programming, and a simple example to demonstrate the use of the C11/C++11 memory model to manage MPI shared memory. Therefore, we first detail the implementation of a barrier in the shared memory environment, which will serve as the basis for more complex synchronized operations later on. As demonstrated in Section 5 this shared memory based barrier better synchronizes the processes compared to .
+
+To create a barrier, we require only two shared variables:
+
+•
+•
+one shared atomic counter, which records the number of processes that have reached the barrier (counter in Algorithm 1, Algorithm 2).
+
+The shared memory window for the atomic flags can be allocated using: where  is a pointer to the locally allocated memory segment by each process. For each process, we can construct an array of pointers pointing to the atomic flags allocated by other processes (the virtual addresses being accessed through MPI_Win_shared_query). We specify the info key alloc_shared_noncontig to allow allocation of non-contiguous memory with padding to reduce access latency. shared_mem_comm is a communicator, of type , on which shared memory can be created. Similarly, the single atomic counter shared by all processes can be allocated by calling: in the leader process, and in other processes. The pseudo-code for a simple barrier can then be written as given in Algorithm 1. Fig. 2 details the synchronization behavior for three processes.
+
+Fig. 2
+Download : Download high-res image (324KB)
+Download : Download full-size image
+Fig. 2. Synchronization behavior for the simple barrier (Algorithm 1) for 3 processes.
+
+Note that the counter is allocated by the leader process, and therefore the repeated tests on the counter value in line 4 don't involve any access to memory hosted by another process. Similarly, the rest of the processes repeatedly test, in line 10, the state of the atomic flag they have allocated. The only remote memory operations involved are the fetch_add to the counter in line 2, and clearing of atomic flags in line 8.
+
+At line 2,  is not preceded by any store operation so a relaxed memory order is sufficient. However, we need to ensure that the counter is reset before letting the processes increment the counter, otherwise consecutive calls of the barrier can lead to a deadlock. In Algorithm 1,  in line 8 synchronizes-with  in line 10 ensuring the required ordering of operations. As the synchronization is already managed by the while loops,  in line 6 does not need to enforce the ordering, so we can set a relaxed memory order.
+
+This simple barrier is known to be quite inefficient as the leader process has to clear the flags of all other processes in line 8, causing unnecessary waiting time, particularly in modern SMP nodes with large number of CPU cores. Clearing the flags can be completed in  steps, when the ranks are arranged in the tree structure shown in Fig. 3a, with the process at each parent node set to clear the flags of its children processes. Algorithm 2 shows the corresponding pseudo code, and the Fig. 3b shows the expected time progress to clear the flags. Note that the same tree structure can be used for broadcast and gather operations as well, as it will be detailed in the following sections.
+
+Fig. 3
+Download : Download high-res image (72KB)
+Download : Download full-size image
+Fig. 3. Intra-node communication tree for barrier synchronization on an SMP node with 12 processes.
+
+Pinning the processes to sockets so that most children nodes are assigned to the same socket as their parent can reduce the memory access latency, and thereby reduce the time to clear the flags in line 9. If the number of sockets is , and m is the number of cores per socket, pinning the set of ranks 〚〛 to socket 〚〛 will ensure that most of the children nodes will be assigned to the same socket. As an example, in the 2 sockets case, even and odd ranks are assigned to socket 0 and 1, respectively.
+
+3.2. Operations on single variables
+Operations like scatter, gather, broadcast, reduce, allreduce, etc. are widely used basic building blocks in parallel algorithms. For instance, static solvers, like Conjugate Gradient (CG), rely heavily on vector dot product calculations. In a classical parallel program, the data is distributed among processes and the local contributions to operations like dot product are locally calculated. These local contributions are shared with other processes using these basic building blocks like MPI_Allreduce. Since the allreduce operation logically combines both reduce and broadcast operations, we present the shared memory implementation for intra-node allreduce with shared memory.
+
+In the case a pure shared memory environment a butterfly reduction algorithm is often used [18], allowing the sum to be updated in every process at each step. However, this method is not applicable when several SMP nodes are involved as the number of internode communications should be kept to the minimum. For this reason we implemented a 2-step algorithm which can be used in the general case, involving a reduction followed by a broadcast of the result.
+
+Fig. 4 illustrates the shared and private variables involved. In addition to the local value of the result, each process allocates the following three shared memory windows:
+
+•
+result_tmp: a non-atomic scalar type (double, int, etc.) which stores the temporary reduction result
+
+•
+: an array of std::atomic_flag used to synchronize the gathering of other processes' values (initialized to true)
+
+•
+: a std::atomic_flag to synchronize the reading of the final value by each process.
+
+Fig. 4
+Download : Download high-res image (38KB)
+Download : Download full-size image
+Fig. 4. Shared memory for single variable operations.
+
+For the sake of simplicity, let's consider an SMP node with three MPI processes. We will refer to the process with rank 0 as the leader process, whose role is to gather and sum the results of the other processes and copy back the summation to them. The process 0 allocates two gathering flags  and  but no broadcast flag, whereas processes 1 and 2 don't allocate gathering flags but allocate respectively broadcast flags  and . The reduction operation involves the following 5 steps, which are schematically depicted in Fig. 5.
+
+1.
+each process calculates the local contribution (e.g., dot product) and stores the value in 
+
+2.
+the leader process waits in a busy loop for  and  to be cleared by the respective processes
+
+3.
+processes 1 and 2 respectively clear the atomic flags  and , which are shared by the leader process, and start waiting for  and  to be cleared
+
+4.
+the leader process executes the reduction operation locally (e.g., sum), then clears the flags  and  of processes 1 and 2
+
+5.
+processes 1 and 2 read the reduced global value stored in .
+
+Fig. 5
+Download : Download high-res image (199KB)
+Download : Download full-size image
+Fig. 5. Illustration of the steps of dot product.
+
+When more than 3 processes are involved, the above flow of tasks is inefficient since it can create a competition to access the leader process' memory, and the leader process has to sequentially collect the local results  from each process and do most of the work. Instead, we use the same tree structure as in the previous section, where the direction of the flow is inverted. Fig. 6 shows the time flow of the reduction operation for 12 ranks, while the operation of broadcasting the result follows the time flow shown in Fig. 3b. The corresponding pseudo code for the allreduce with summation operation is shown in Algorithm 3.
+
+Fig. 6
+Download : Download high-res image (45KB)
+Download : Download full-size image
+Fig. 6. Reduction time flow.
+
+Algorithm 3
+Download : Download high-res image (66KB)
+Download : Download full-size image
+Algorithm 3. Pseudo code for allreduce.
+
+3.3. Intranode ghost updates
+Discretizing the domain of analysis into partitions with nearly equal computational work load, and assigning each partition to an MPI process is a common strategy used in distributed parallel computing. As an example, consider parallelizing a mesh based numerical method like FEM. The mesh is divided between processes, with nearly equal number of points allocated to each of them (see Fig. 7a). In the following we refer to these points as the inner points of the respective process. During each computational iteration, the values at points with no connection to neighbor processes can be calculated as in serial FEM implementations. However, specific treatment is required for points at the process boundaries. Indeed, these points need to use the value at points that belong to the neighboring processes, to maintain the continuity. One approach is to share the data of these boundary points among the processes so that computation can progress without any additional boundary update. However, data sharing requires careful treatments to prevent potential race conditions, which can lower the overall performance. Furthermore, the reduction of potential race conditions and the controlled sharing of memory is the main motivation of using the MPI-MPI hybrid model. It would also require to have the shared data stored separately from the local data, which is not ideal in term of memory access, for instance during matrix-vector multiplications which constitute most of FEM operations.
+
+Fig. 7
+Download : Download high-res image (324KB)
+Download : Download full-size image
+Fig. 7. Structure of the data for communications.
+
+For these reasons, we chose a data organization close to classical flat MPI programs, in which each process possesses a copy of the boundary points from the neighbor process, often referred as ghost points or halo (see Fig. 7b). This method still relies on intranode memory-to-memory copy and therefore can exacerbate the memory bandwidth problem. However, it has the advantages of limiting the concurrent access to shared data, and allowing an efficient organization of the memory for matrix-vector multiplications (as the ghost data can be continuous and contiguous to the inner data). Also, as the memory organization is kept close to the classical MPI approach, one can easily adapt an existing parallel program in flat MPI by changing the management of communications without modifying the rest of the computational structure.
+
+We consider the vector V of the variable of interest v, so that  corresponds to the value of v at the point with local id i. There are three types of points to consider:
+
+•
+points which have no connection with the neighboring processes, called inner points (in Fig. 7b local ids 0-9)
+
+•
+boundary points which have a connection to the neighboring process, whose data has to be sent to their ghosts in the neighbor process (in Fig. 7b local ids 10-14)
+
+•
+ghost points where the data has to be received (in Fig. 7b local ids 15-19).
+
+So as to reduce the cost of memory-to-memory copies from the sender to the receiver rank, we order the local ids so that the data to send and receive are each stored in contiguous memory locations (see Fig. 8). In practice though it is not always possible to ensure the continuity of the data to send to a specific rank, as some points may need to be sent to several neighbor ranks. These nodes are thus ordered at the end of the sending part of the vector.
+
+Fig. 8
+Download : Download high-res image (60KB)
+Download : Download full-size image
+Fig. 8. Vector data ordering for process 0 in a single node - 3 processes structure.
+
+As in the previous section, we will explain the management of ghost points updates through a simple example, where only 3 processes are considered. Fig. 9 schematically represents the different steps of the updates of the data from process 0 to process 2:
+
+1.
+process 0 copies the data to be sent to the neighbor processes in the shared memory. Data points which have to be sent to both processes 1 and 2 have one copy in each buffer in the shared memory.
+
+2.
+process 0 clears the atomic flag in the neighbor processes.
+
+3.
+process 2 waits until the flag is cleared and proceed to copy the shared buffer to its local ghost data.
+
+Fig. 9
+Download : Download high-res image (193KB)
+Download : Download full-size image
+Fig. 9. Intranode communication process: rank 0 to rank 2.
+
+Algorithm 4 shows the pseudo-code for the intra-node ghost update, which assumes the existence of the following maps:
+
+•
+snd_indices: snd_indices[rank] is the list of the local ids of points to be sent to the neighbor process
+
+•
+snd_buffer: snd_buffer[rank] is the pointer to the beginning of the shared memory buffer in which the data to be sent to the neighbor process will be copied (e.g start of To Rk 2)
+
+•
+rcv_buffer: rcv_buffer[rank] is the pointer to the beginning of the shared memory buffer in which the data from the neighbor process has been copied (e.g start of To Rk 2, virtual address obtained from MPI_Win_shared_query)
+
+•
+rcv_indices: rcv_indices[rank] is the list of the local ids to be received from the neighbor process
+
+•
+snd_flag and rcv_flag: snd_flag[receiver rank] in the sender process and rcv_flag[sender rank] in the receiver process corresponds to the same shared atomic flag used to manage the data transfer from the sender process to the receiver process
+
+•
+chunksize: size of the unit data to be sent (e.g 3 if 3D displacements , ,  are sent).
+
+Algorithm 4
+Download : Download high-res image (73KB)
+Download : Download full-size image
+Algorithm 4. Pseudo code for intra-node ghost update.
+
+4. Experimental evaluation of shared memory operations
+In this section, we evaluate the performance of the use of C11/C++11 atomics and memory model to manage MPI shared memory compared to the use of standard MPI utilities. The performance tests are conducted on the Reedbush-U and Oakbridge-CX supercomputers based at the University of Tokyo, whose specifications are detailed in Table 1. On the Oakbridge-CX system, performance tests are conducted with three MPI libraries: Intel MPI (with vendor-configured compiler) optimized for Intel platforms, and recent versions of Open MPI and MPICH (compiled by the authors). The configuration options for Open MPI (v4.0.5) in Oakbridge-CX are detailed in Appendix A. No special configuration was used for MPICH (v3.3.2).
+
+
+Table 1. Systems' specifications.
+
+Reedbush-U	Oakbridge-CX
+CPU: Intel Xeon E5-2695v4 (Broadwell-EP 2.1 GHz 18core)×2 socket, 45 MB L3-cache, 1209.6 GFLOPS	CPU: Intel Xeon Platinum 8280 (2.7 GHz 28core)×2 socket, 38.5 MB L3-cache, 2419 GFLOPS
+
+Memory: 256 GB, 153.6 GB/sec	Memory: 192 GB (2933 RDIMM 16 GB×12)
+
+OS: Redhat Enterprise Linux 7.2	OS: CentOS 7
+
+Interconnect: Infiniband EDR	Interconnect: Intel Omni-Path Host Fabric Interface (12.5 GB/s)
+
+MPI: Intel C++ compiler version 18.0 Update 1 + Intel MPI library 2018 Update 1	MPI: Intel C++ compiler v18.0 Update 3 + Intel MPI library 2018 Update 3 / Open MPI library v4.0.5 / MPICH library v3.3.2
+4.1. Time synchronization and measurements
+When the processes are not synchronized, the arrival time mismatches are also included in the elapsed time measurements of desired functions, introducing errors to the performance measures. To minimize this error, we call a barrier (around ten times) immediately before the start of elapsed time measurements to improve the synchronization. MPI_Barrier does not mandate high-quality time synchronization, and arrival time mismatches of up to 100 μs were measured following the loop on MPI_Barrier, heavily impacting the execution times for the first calls of tested functions and the calculated average performance. As an illustration, Fig. 10 shows the latency of the first call of MPI_Barrier after 100 calls of either MPI_Barrier or the barrier developed in the previous section (see Algorithm 2). Our barrier implementation leads to a significantly better time synchronization, with arrival time mismatches under 3 μs, and was used for the initial synchronization in all the performance tests.
+
+Fig. 10
+Download : Download high-res image (134KB)
+Download : Download full-size image
+Fig. 10. Execution time of the first call of MPI_Barrier after synchronization on a single node of Oakbridge-CX.
+
+4.2. Process pinning
+In order for our latency measures to be as stable as possible, as well as to ensure optimal performance of some of our algorithms (by reducing the number of inter-socket memory accesses), process pinning is ensured by executing the following command line arguments:
+
+•
+Intel MPI:
+
+mpiexec.hydra -n no_proc
+
+-env I_MPI_PIN=enable
+
+-env I_MPI_PIN_PROCESSOR_LIST map=scatter
+
+./job
+
+•
+Open MPI:
+
+mpiexec -np no_proc –bind-to core - -rank-by socket - -map-by core./job
+
+•
+MPICH:
+
+mpiexec -np no_proc - -bind-to core - -map- bysocket./job
+
+These command line arguments were verified to lead to the same process binding on our systems.
+
+4.3. Barrier
+We measure the barrier performance as the longest time elapsed calling the barrier functions by any of the processes. We compare the performance of the barrier presented in Section 3.1, referred to as shm-barrier, and MPI_Barrier. We test two scenarios:
+
+•
+First call the shm-barrier 10 times, then measure the average time of 100 calls of the shm-barrier
+
+•
+First call the shm-barrier 10 times, then measure the average time of 100 calls of the MPI_Barrier
+
+With Intel MPI, MPI_Barrier shows consistently better results in the shared memory context in both architectures. However, with Open MPI and MPICH, our method leads to significant improvements over MPI_Barrier.
+
+4.4. Operations on a single variable: allreduce
+We then compare the performance of a simple reduction operation, namely the sum over all processes of a double variable. We refer to the allreduce method presented in Section 3.2 as shm-allreduce. We consider three scenarios:
+
+•
+First call the shm-barrier 10 times, then measure the average time of 100 calls of MPI_Allreduce
+
+•
+First call the shm-barrier 10 times, then measure the average time of 100 calls of the shm-allreduce
+
+•
+First call the shm-barrier 10 times, then measure the average time of 100 calls of the shm-allreduce when sequential consistency is used for atomic operations
+
+We observe that with Intel MPI MPI_Allreduce offers a better performance than our approach in both computers, which could be partly explained by the use of a more efficient butterfly algorithm in the shared memory. However, as explained earlier, the butterfly algorithm wouldn't be applicable when internode communications are involved. Regardless, shm-allreduce performance remains close to MPI_Allreduce, especially in Oakbridge-CX. We also observe that there is an observable gain of optimizing the memory ordering of atomic operations, as a fully sequentially consistent operation performs overall 15% worse. As in the barrier tests, our method leads to an almost equal performance with the three MPI libraries, leading to significant improvements over MPI_Allreduce for Open MPI and MPICH. Fig. 13 also shows the influence of different process binding. With Intel-MPI's process pinning option “scatter”, all even numbers and all odd numbers are each respectively in the same memory sockets, which is optimal for the communication tree (Fig. 3). Conversely, with the “bunch” options, the first and latter halves of ranks are respectively in the same memory sockets, leading to numerous intersocket communications. For both architectures, we observe a 20% gain with the scatter process affinity. This gain in performance highlights the advantage of binding ranks to hardware such that the communication pattern (frequency or volume) of the processes is matched to the memory hierarchy of SMP nodes (i.e. most communicating ranks are mapped to the processes sharing same L3-cache or socket).
+
+Fig. 13
+Download : Download high-res image (250KB)
+Download : Download full-size image
+Fig. 13. Comparison of shm-allreduce performance with process affinity (average over 100 × 100 iterations).
+
+4.5. Dot product
+In the previous sections, we only measured the performance of basic intranode communication operations. However, these communication operations are in general only a small part of the constituents of a simulation (e.g dot product). In this part, we evaluate the cost of the intranode communications on the dot product of vectors of increasing size, compared to the maximum computational performance obtained when no communications are involved. The performance is measured in terms of number of floating points operation (FP32) per second per core. For two vectors of size n, the number of floating point operations required is roughly 2n. The results are shown in Fig. 14. The initial peak observed in the maximum performance corresponds to the transition from L2 to L3 cache memory.
+
+Fig. 14
+Download : Download high-res image (489KB)
+Download : Download full-size image
+Fig. 14. Comparison of dot product performance on shared memory.
+
+As expected, there is a gap of performance due to communications, especially for small size vectors. When the ratio of computation to communication time increases with the size of the vector, this gap decreases significantly. This ratio is significantly lower in Oakbridge-CX due to the significant floating point performance improvement of Xeon 8280 CPU compared to the improvement of allreduce operations, which is similar with Reedbush-U (see Fig. 12), explaining the huge loss of performance. Also, we don't observe any significant difference between MPI_Allreduce and our method.
+
+4.6. Ghost updates
+Unlike the previous tests, the performance of ghost updates is dependent on the partitioning, in particular the size and distribution of the data to be sent and received by each process. This distribution can be highly irregular and problem-dependent, especially when the analysis domain is modeled with unstructured meshes or irregular graphs. We use an unstructured mesh with tetrahedral elements for this performance test. So as to generate reproducible results, we consider a simple cube model, of dimensions (1×1×1). Several meshes are generated with Gmsh [5](version 4.4.1) with a homogeneous average elements size of 0.004, 0.005, 0.01, 0.02, 0.03 or 0.05. METIS 5.1.0 is used for partitioning the mesh. A sample mesh is shown in Fig. 15. The average number of points per processes, the average number of neighbor processes as well as the average size of the data (FP64) to be sent to each neighbor (number of ghost points × 8 bytes) are detailed in Table 2 for each mesh. As the average numbers of neighbor processes for each partition are very close, the data size is the main factor influencing the communication time.
+
+Fig. 15
+Download : Download high-res image (105KB)
+Download : Download full-size image
+Fig. 15. Cube mesh (element size 0.01) used for the performance tests.
+
+
+Table 2. Average per process data of a shared memory partition (1average size of the exchanged data per process).
+
+Mesh size	0.005	0.01	0.02	0.03	0.05
+No. of points	133418	20982	3203	1196	339
+Neighbors	8.3	8.7	8.5	8.5	8.3
+Data size1 (kB)	281	78	21	9.8	3.7
+(a) Reedbush-U (36 cores)
+Mesh size	0.004	0.005	0.01	0.02	0.03
+No. of points	174691	87269	13935	2162	830
+Neighbors	9.8	9.5	9.6	9.1	9.4
+Data size1 (kB)	357	217	61	16	7.7
+(b) Oakbridge-CX (56 cores)
+Fig. 16 compares the minimum, average and maximum execution times for the ghost updates with the flat MPI approach, the shared memory window approach presented in Section 3.3, and the shared memory approach where synchronization with atomic flags is replaced by synchronization utilities provided by MPI libraries, specifically:
+
+•
+•
+•
+Fig. 16
+Download : Download high-res image (1MB)
+Download : Download full-size image
+Fig. 16. Performance of ghost updates in the shared memory.
+
+In Algorithm 7,  and  refer respectively to the MPI_Group for the processes' ranks the current process sends to and receives from. In Algorithm 8,  refers to the shared memory window in which the ghost data is copied, and  the window contains the boolean flags used for synchronization (equivalent to the atomic flags used in Section 4.6). Although the data copy at line 6 is a local update, creating a passive target epoch with MPI_Win_lock/unlock is needed to ensure that this update becomes visible in the public window before the receiving process executes the remote copy at line 18. In addition, although it is possible to open only once a global access epoch on the flag window with MPI_Win_lock_all/unlock_all, instead of the single-process locks at line 8 and 10, it was observed to increase the latency of the operation by around 20%.
+
+It should be noted that a barrier on the shared memory communicator must be added at the end of Algorithm 4, Algorithm 8 in the case of consecutive calls to the function, in order to prevent flags being cleared twice by the sending process before being tested by the receiving process, which would result in a deadlock. In Algorithm 6, Algorithm 7, this barrier is already ensured by MPI_Win_fence and MPI_Win_wait respectively.
+
+The shared window approach shows consistently lower execution times for all meshes with every tested MPI library, with the gain becoming more significant with the increase of the size of the data to be exchanged, up to 50% for the finer mesh compared to flat-MPI (see Fig. 16a, 16b, 16c and 16e). This confirms the benefit of bypassing MPI_Send and MPI_Recv for communication in the shared memory nodes especially when a larger amounts of data have to be exchanged. Other methods based on RMA functions for synchronization also proved to bring significant improvement over flat-MPI. Active synchronization involving the post/start/complete/wait combination was observed to perform better than the collective synchronization enforced by MPI_Win_fence (see Fig. 16b and 16e) which is not needed for the ghost update. Similarly, passive synchronization offers a very competitive performance with Open MPI for the larger sets of data, while performing poorly for smaller data sets, with an apparent minimum execution time of around 70 μs reached for the first three mesh sizes (see Fig. 16c). For a small size of exchanged data, the copy time becomes negligible compared to the time required for synchronization operations. This suggests that atomic operations performed by MPI_Accumulate and MPI_Fetch_and_op may be significantly more costly than atomic operations provided in C++11, especially if they are to be called in loops.
+
+It should also be noted that in our tests, the relative performance of RMA synchronization utilities varies significantly with the MPI library we used. In particular, using passive synchronization in Intel MPI and MPICH led to prohibitively high latency (timing out for Intel MPI, and a latency more than ten times higher than MPI_Win_fence for MPICH). This did not seem to be an issue directly related to our program since tests conducted with the Intel MPI benchmark IMB-RMA provided on Oakbridge-CX led also to a time out, suggesting some issue with either the library or the system. Similarly, active RMA synchronization using Algorithm 7 led to an apparent deadlock between MPI_Win_post and MPI_Win_start with Open MPI. This issue could be resolved by either using standard RMA windows (created with MPI_Win_create) instead of shared memory windows, or by using MPI groups corresponding to all processes in the shared memory communicator, although both options led to a higher latency compared to other methods (see Fig. 16d). We suspect that the cause may lie in the impossibility for MPI to ensure the exclusive access by the processes in  to the shared memory window in a given process since all processes may access it through pointers, instead of explicit RMA operations needed for non-shared windows.
+
+Overall, the results suggest that using the C++11 memory model with atomic variables for synchronization performs consistently better than the other methods of synchronization using RMA utilities.
+
+5. Management of internode communications
+The main target of the approach developed in this paper is the application to simulations requiring large scale computing. Therefore, the scope cannot be limited to the shared memory environment in a single SMP node, but needs to be extended to a parallel environment with multiple SMP nodes. This leads to an MPI-MPI hybrid parallel programming, where intranode communications rely on shared memory windows while internode communications use standard MPI utilities such as MPI_Send and MPI_Allreduce. In the following, two MPI communicators will be used in addition to MPI_COMM_WORLD:
+
+•
+shm_comm: communicator of type MPI_COMM_TYPE_ SHARED, on which shared memory can be created (i.e. a communicator inside an SMP node), and  is the rank of a process in shm_comm. We make  the leader rank on shm_comm, and call it shm_leader.
+
+•
+leader_comm: a communicator connecting all the leader processes of the shared memory nodes (i.e. shm_leaders), and  is the rank of a process in leader_comm.
+
+5.1. Barrier
+5.2. Operations on single variables
+Similarly, operations on single variables such as reduction are largely unchanged. The operation is first performed locally inside each SMP node, and is then performed on the leader communicator. Finally each leader process broadcasts the result to the other processes in the shared memory communicator. As seen in Algorithm 10, the only modification needed is calling MPI_Allreduce at line 11.
+
+Algorithm 10
+Download : Download high-res image (81KB)
+Download : Download full-size image
+Algorithm 10. Pseudo-code of intra+inter-node allreduce.
+
+5.3. Ghost updates
+For the ghost updates, taking into account internode communications requires more efforts. First, in order to reduce the time required for internode updates, it is beneficial to organize the data to be sent and received to be as continuous as possible. As for the intranode updates, it is possible to number the ghost points so that the data to be received from each process is continuous in the memory. However, it is not possible to make the sending data continuous as some points may be sent to several processes. Similarly, as for the intranode case shown in Fig. 8, Fig. 17 shows the ordering of points id in the hybrid program.
+
+Fig. 17
+Download : Download high-res image (94KB)
+Download : Download full-size image
+Fig. 17. Vector data ordering for process 0 of node 0 in a 2 nodes - 3 processes structure.
+
+Intranode communications can be managed the exact same way as in the single node case, independently from the internode communications. For the latter, there are two possible options:
+
+•
+Option 1: the leader process of each node gathers the data to be sent to other nodes, and the communication happens only in the leader_comm. After reception by the leader processes, the other processes in the node can directly get the data to be received. This option leads to a few big communications
+
+•
+Option 2: each process individually manages its own communications in MPI_COMM_WORLD as in flat MPI. This option leads to many small communications.
+
+After several tests with an increasing number of SMP nodes, we observed that the first option always led to significantly higher communication times. In particular, we observed that, at least in the architectures of the clusters we used, for the same total data size to exchange, big communications were much more costly than a large number of small communications. This suggests that in our scenario process-to-process communications are not saturating the network interface. Therefore we opted for a flat MPI treatment of internode communications. It is in particular possible to hide internode communications since they are managed independently.
+
+6. Experimental evaluation of MPI-MPI hybrid operations
+In this section, we evaluate the performance of the MPI-MPI hybrid operations presented in the previous section, comparing to classical flat MPI. The same computer architectures are used, with tests ranging from 2 SMP nodes to 16 SMP nodes.
+
+6.1. Barrier
+Fig. 18 shows the results of the Algorithm 9 tested with the same two scenarios considered in Section 4.3. The execution time of our barrier is very stable on multiple runs on both systems, with a low standard deviation (SD), at most equaling 15% of the average for 16 nodes. On the contrary, in Reedbush-U MPI_Barrier was observed to lead to varying execution times, with much higher SD (up to 300% of the average), especially when a higher number of nodes are considered. It is one of the reason why in average MPI_Barrier performs worse than the hybrid approach when more than 8 nodes are considered, as some tests measured execution times ten times higher than the average. As an example, Fig. 19 shows the average execution times on Reedbush-U when extreme values are removed (values more than 10 times the minimum are considered extreme). When MPI_Barrier is used, these extreme cases consistently appear every time the test simulation was run (12 extreme cases were recorded out of 100 runs used for the figures). Comparatively, no extreme case is observed in our hybrid approach. In Oakbridge-CX, the performance of MPI_Barrier is significantly more stable (SD around 15% of the average execution time), with a consistently lower latency although the difference with the hybrid approach decreases with the number of nodes involved. As in the tests on a single node, the latency with our method is similar with Open MPI while the latency of MPI_Barrier increases. With MPICH, the latency increases significantly for both our method and MPI_Barrier.
+
+Fig. 18
+Download : Download high-res image (565KB)
+Download : Download full-size image
+Fig. 18. Comparison of barrier execution times with multiple nodes (average over 100 × 100 iterations).
+
+Fig. 19
+Download : Download high-res image (108KB)
+Download : Download full-size image
+Fig. 19. Barrier execution time in Reedbush-U when extreme values are not taken into account (average over 100 × 100 iterations).
+
+6.2. Operations on single variables
+In Reedbush-U, we observe that our approach improves the performance when at least 8 nodes are considered. Also, the execution time is very stable between tests (SD lower than 5% of the average). MPI_Allreduce also leads to more variance of the execution times, although not as extreme as with MPI_Barrier (SD up to 100% of the average). In Oakbridge-CX, the performance of the hybrid approach and MPI_Allreduce are stable (SD around 5% of the average execution time) and close especially when more than 4 nodes are considered. The performance gain from the adequate choice of operations' memory orders is once again demonstrated. As in the tests on a single node, the latency with our method is similar with Open MPI while the latency of MPI_Allreduce increases. With MPICH, the latency increases significantly for both our method and MPI_Allreduce.
+
+6.3. Dot product
+We conduct the same test as in Section 4.5 on 16 SMP nodes. The first observation (see Fig. 21) is that the gap between the maximum performance and the actual performance is significantly larger than when only one SMP node is used, as expected as communications become more prevalent. The second observation is that MPI_Allreduce and our approach show similar trends, which is expected as average execution times were not observed to be very different (see Fig. 20). However, in Reedbush-U, the variance of MPI_Allreduce performance appears clearly with a high number of cases with very bad performance, compared to relatively stable performance with our method. In Oakbridge-CX, both methods are comparable.
+
+Fig. 21
+Download : Download high-res image (480KB)
+Download : Download full-size image
+Fig. 21. Comparison of dot product performance per core on 16 nodes.
+
+6.4. Ghost update
+To test the ghost update's performance, we use the same cube geometry as in Section 4.6, however only elements size of 0.004, 0.005 and 0.01 are considered. Indeed, larger element sizes lead to partitions with a high ratio of ghost to inner points when more than 4 nodes are considered, and therefore a high communication time compared to the relevant calculation time, which is against standard practice. When several nodes are considered, the partition is generated in two steps. We first perform the partition of the mesh between nodes, then perform the internal partition of each nodes. This ensures that the mesh part managed by a node is a connected space, which in turn reduces the number of connections with other nodes, and thus the internode communication time. Table 3 details the partition information corresponding to the performance tests.
+
+
+Table 3. Partition information for MPI Hybrid (1intranode and internode sizes are the average size of the data exchanged in intranode/internode communications for each process, 2number of processes per node involved in internode communications).
+
+No of processes	56	112	224	448	896
+No of points	174691	90076	46720	24363	12887
+Intranode neighbors	9.8	8.8	8.9	9.3	9.1
+Intranode size1 (kB)	357	222	140	89	56
+Internode processes2	0	16	21	22	27
+Internode neighbors	0	3.7	4.3	4.8	5.2
+Internode size1 (kB)	0	96	73	53	35
+(a) Element size 0.004
+No of processes	36	72	144	288	576	56	112	224	448	896
+No of points	133418	68778	35869	18802	9951	87269	45346	23708	12497	6688
+Intranode neighbors	8.3	8.3	8.0	8.3	8.2	9.5	8.8	9.0	9.3	9.0
+Intranode size1 (kB)	281	170	110	70	43	217	136	86	55	35
+Internode processes2	0	17.5	23	24.5	29.5	0	15	19	22	27.5
+Internode neighbors	0	3.5	4.3	5	5.2	0	3.4	4.3	4.8	5.1
+Internode size1 (kB)	0	83	62	45	30	0	61	48	32	21
+(b) Element size 0.005
+No of processes	36	72	144	288	576	56	112	224	448	896
+No of points	20982	11082	5957	3232	1781	13935	7439	4024	2200	1228
+Intranode neighbors	8.7	8.1	8.1	8.4	8.2	9.6	8.9	9.1	9.3	9.0
+Intranode size1 (kB)	78	47	31	20	12	61	38	24	16	10
+Internode processes2	0	18.5	23	24.5	29	0	16	20	22	27
+Internode neighbors	0	3.6	4.5	4.9	5.2	0	3.6	4.3	5.0	5.2
+Internode size1 (kB)	0	22	18	13	8.8	0	17	13	9.4	6.2
+(c) Element size 0.01
+Execution times for each element sizes are compared in Fig. 22, Fig. 23. When a single node is used, no internode communications occur and our method perform overall consistently better than other synchronization approaches, both for the optimal case (minimum execution time) and the average case, although active RMA synchronization (Intel MPI) and passive RMA synchronization (Open MPI) led to a comparable latency. When the number of computer nodes increases, the number of internode communications increases, and the size of the data to be exchanged by each communication decreases. As internode communications are performed the same way in both our method and flat MPI, we expect the execution times of both methods to get closer, which is what is observed. In particular, although the optimal communication time remains around 30% lower in our method due to the improvement of intranode communications, the average times become almost equal for 16 nodes. However, methods based on RMA functions scale relatively poorly in the hybrid environment, especially when the size of the data to exchange decreases (i.e when most of the execution time consists of communication and synchronization). All methods appear to scale poorly with MPICH, with a significant increase of the latency with more than 8 nodes, accompanied by a high variance (see Fig. 23). In Reedbush-U, the maximum execution time is significantly longer than the average, which is consistent with the performance variance previously observed for MPI functions.
+
+Fig. 22
+Download : Download high-res image (860KB)
+Download : Download full-size image
+Fig. 22. Comparison of ghost updates execution times (Intel MPI).
+
+Fig. 23
+Download : Download high-res image (1MB)
+Download : Download full-size image
+Fig. 23. Comparison of ghost updates execution times (Oakbridge-CX, Open MPI and MPICH).
+
+7. Discussion
+7.1. Implementation and maintenance
+The MPI-MPI hybrid approach proposed in this paper is based on the same data organization as flat MPI. For this reason, its implementation from an existing MPI program is relatively straightforward. In particular, communications can be managed independently from the main core of the program. In addition, as the shared data is used uniquely for communications, and is separated from the local data, the risks normally accompanying the management of shared memory (e.g race condition, memory corruption) are significantly alleviated. Although allocating additional memory space for communications may be costly in applications requiring a large portion of the local data to be exchanged, it has only a minor impact on applications where only a small percentage of the local data is exchanged, such as the finite element method. The presented approach is designed to be as easy to implement and maintain as standard flat-MPI.
+
+7.2. Performance
+The tests conducted in Sections 4 and 6 demonstrate that the combination of MPI shared windows and C11/C++11 atomic operations (and the associated memory model) offers a performance which competes with more standard approaches, even exceeding them for certain classical applications like ghost updates.
+
+In a pure shared memory environment, standard MPI functions perform overall better for fundamental collective communication utilities such as barriers and reductions. However, our approach appears to provide a significantly better degree of time synchronization between processes. The results also showed the gain of setting appropriate memory orders for C++ atomic operations, which can save up to 15% of the execution time while not incurring additional complexity. Setting a suitable process affinity also saved up to 20% of the execution times. When multiple SMP nodes are involved, MPI functions were observed to have a potentially unstable performance depending on the cluster, while the proposed MPI-MPI hybrid approach offered a relatively stable performance regardless of the computing environment. For this reason, although the performance is expected to be most of the time similar with standard MPI functions, the proposed approach can conditionally offer a better average performance. Nevertheless, for most applications the gain of performance on these functions is not significant.
+
+On the other hand, the ghost update, which involves a higher number of communications and size of exchanged data, is responsible for most of the communication time in parallel programs. In each SMP node, the usage of shared memory windows leads to significant improvement (up to 50%) from the usage of MPI_Send and MPI_Recv. Although it brings a more marginal improvement over synchronization methods based on RMA operations in a single SMP node, the performance scales significantly better with the synchronization using the C++ memory model. The performance with the C++ memory model may be further improved by assigning the partitions to the CPU cores in SMP nodes such that the partitions involving largest volume of intranode ghost update data are mapped to the CPU cores sharing same L3-cache, socket, etc., using MPI functionalities like MPI_Dist_graph_create. Such approaches can significantly reduce the stress on memory subsystems and thus further improve the performance, just as the use of process affinity demonstrated in Section 4.4. We observed in particular that RMA based synchronization performed relatively poorly when the size of the data to exchange in the shared memory decreases, which could partly explain the increase of latency with the number of nodes. Since internode communications are identical in the proposed MPI-MPI hybrid and the flat MPI approaches, and are overall more costly than intranode operations, the gain of performance decreases significantly with the number of computer nodes involved. Therefore, the proposed approach is particularly relevant only when the average data size exchanged intranode (per process) is large compared to the average data size exchanged internode (per process), the results suggesting a minimum ratio of around 2. Besides, the variation of performance with the use of different MPI libraries appears much smaller than with RMA synchronization, especially on a single node.
+
+Overall, our method is expected to bring a performance advantage in large scale simulations in which communications, especially intranode communications, occupy a non negligible portion of the total execution time. In particular, the performance gain was relatively consistent compared to the other tested options. When the size of the data to exchange within the shared memory becomes large, the performance gain over flat MPI becomes significant although the improvement over RMA-based synchronization becomes marginal. On the other hand, when the exchanged data size decreases, the performance gain over RMA-based synchronization becomes significant while the improvement over flat MPI becomes marginal. Since the proposed use of C11/C++11 memory model, as well as the use of RMA primitives, are designed to improve data exchanges in the shared memory, the performance gain over flat MPI becomes marginal when a sizable amount of communication time lies in internode communications, especially when the number of SMP nodes used for the simulations increases. However, since modern cluster architectures privilege a large number of cores per node, intranode communications are expected to become increasingly prevalent.
+
+8. Concluding remarks
+We proposed an alternative MPI-MPI hybrid programming approach in which intranode communications combine MPI shared memory windows and C++ atomic operations and memory model. The method is designed to follow the data organization of standard flat MPI, while keeping most of the data private to each process, making it relatively straightforward to implement from an existing MPI program and to maintain. It offers similar performance with existing MPI functions for standard collective communication utilities, and proves to be more stable when multiple SMP nodes are involved. Its application to the ghost update, a prevalent operation in most numerical methods, like finite element method, finite difference method, smooth particle hydrodynamics, etc., exhibited a significant reduction of communication times compared to flat MPI and RMA synchronization approaches such as fences.

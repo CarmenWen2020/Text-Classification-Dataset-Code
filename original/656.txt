@@ -1,0 +1,840 @@
+Abstract
+Graph Neural Networks (GNNs) are powerful deep learning models to generate node embeddings on graphs. When applying deep GNNs on large graphs, it is still challenging to perform training in an efficient and scalable way. We propose a novel parallel training framework. Through sampling small subgraphs as minibatches, we reduce training workload by orders of magnitude compared with state-of-the-art minibatch methods. We then parallelize the key computation steps on tightly-coupled shared memory systems. For graph sampling, we exploit parallelism within and across sampler instances, and propose an efficient data structure supporting concurrent accesses from samplers. The parallel sampler theoretically achieves near-linear speedup with respect to number of processing units. For feature propagation within subgraphs, we improve cache utilization and reduce DRAM traffic by data partitioning. Our partitioning is a 2-approximation strategy for minimizing the communication cost compared to the optimal. We further develop a runtime scheduler to reorder the training operations and adjust the minibatch subgraphs to improve parallel performance. Finally, we generalize the above parallelization strategies to support multiple types of GNN models and graph samplers. The proposed training outperforms the state-of-the-art in scalability, efficiency and accuracy simultaneously. On a 40-core Xeon platform, we achieve  speedup (with AVX) in the sampling step and  speedup in the feature propagation step, compared to the serial implementation. Our algorithm enables fast training of deeper GNNs, as demonstrated by orders of magnitude speedup compared to the Tensorflow implementation. We open-source our code at https://github.com/GraphSAINT/GraphSAINT
+
+Keywords
+Graph representation learning
+Graph Neural Networks
+Graph sampling
+Graph partitioning
+Memory optimization
+
+1. Introduction
+Graph embedding is a powerful dimensionality reduction technique to facilitate downstream graph analytics. The embedding process converts graph nodes with unstructured neighbor connections into points in a low-dimensional vector space. Embedding is essential for a wide range of tasks such as content recommendation [27], traffic forecasting [28], image recognition [5] and protein function prediction [7]. Among the various embedding techniques, Graph Neural Networks (GNNs) (including Graph Convolutional Network (GCN) [12] and its variants [4], [7], [23], [30]) have attained much attention. GNNs produce accurate and robust embedding without the need of manual feature selection.
+
+On large graphs, GNN training proceeds in the unit of minibatches. Due to edge connections, the graph nodes are not I.I.D distributed, and thus cannot be sampled uniformly at random as minibatch data points. State-of-the-art methods construct minibatches by sampling on each GNN layer (i.e., layer sampling). The vanilla GCN [12] and its successor GraphSAGE [7] sample by tracking down the inter-layer connections. Their approaches preserve the training accuracy of the original model, but the parallel training is not work-efficient due to a phenomenon often referred to as “neighbor explosion” [4], [6], [7]. Namely, for every additional GNN layer traversed by their samplers, the number of sampled nodes (i.e., neighbors) grows by an order of magnitude. Consequently, the sampled nodes across different minibatches overlap significantly, especially at the first few GNN layers. The amount of redundant computation thus increases exponentially with the number of GNN layers. To alleviate such high redundancy, FastGCN [4] proposes to independently sample the nodes of each GNN layer, without explicitly considering the layer connection constraint. Although FastGCN is faster than [7], [12], it incurs significant accuracy loss and requires preprocessing on the full graph which is expensive and not easily parallelizable.
+
+Due to the layer sampling design philosophy, it is difficult for state-of-the-art methods [4], [7], [12] to simultaneously achieve accuracy, efficiency and scalability. In this work, we perform sampling on the graph rather than the GNN layers. Our novelty lies in proposing a graph sampling-based minibatch training algorithm via joint optimization on the learning quality and parallelization cost. We achieve scalability by (1) Developing a novel data structure that enables efficient subgraph sampling through supporting fast parallel updates on the sampling probability; (2) Optimizing parallel execution of intra-subgraph feature propagation and layer-wise weight updates — specifically a cache-efficient subgraph partitioning scheme that guarantees near-minimal DRAM traffic. Optimization in the above two steps can be generalized to support multiple kinds of GNN models and sampling algorithms. We achieve work-efficiency by avoiding “neighbor explosion”, as each layer of our minibatched GNN contains the same number of neurons corresponding to the subgraph nodes. Finally, we achieve learning accuracy since our sampled subgraphs preserve connectivity characteristics of the original training graph. The main contributions of this paper are:
+
+•
+We propose a parallel GNN training algorithm based on graph sampling:
+
+–
+Accuracy is achieved since the sampler returns small, representative subgraphs of the original graph.
+
+–
+Efficiency is optimized since we always build complete GNNs on the minibatch subgraphs to avoid “neighbor explosion” in deeper layers.
+
+–
+Scalability is achieved with respect to number of processing cores, graph size and GNN depth by parallelizing various key steps.
+
+•
+We propose a novel data structure that supports fast, incremental and parallel updates to a probability distribution. Our parallel sampler based on this data structure theoretically and empirically achieves near-linear scalability with respect to number of processing units.
+
+•
+We parallelize all the key operations to scale the overall minibatch training to a large number of processing cores. Specifically, for subgraph feature propagation, we perform intelligent partitioning along the feature dimension to achieve close-to-optimal DRAM and cache performance.
+
+•
+We propose a runtime scheduling algorithm for training:
+
+–
+By rearranging the order of various operations, we significantly reduce the training time under a wide range of model configurations.
+
+–
+By partition scheduling and node clipping of subgraphs, we improve the feature propagation performance by better cacheline alignment.
+
+•
+We show that our parallelization and scheduling techniques are applicable to a number of GNN architectures (including graph convolution and graph attention) and graph sampling algorithms (including random edge sampling and variants of random walk sampling).
+
+•
+We perform thorough evaluation on a 40-core Xeon server. Compared with serial implementation, we achieve  overall training time speedup. Compared with state-of-the-art minibatch methods, our training achieves up to  speedup without accuracy loss.
+
+•
+Our parallel training greatly facilitates development of deeper GNN models on larger graphs. We achieve two orders of magnitude speedup for 3-layer GNNs compared to state-of-the-art Tensorflow implementation.
+
+2. Background and related work
+Graph Neural Networks (GNNs), including Graph Convolutional Network (GCN) [12], GraphSAGE [7] and Graph Attention Network (GAT) [23], are the state-of-the-art deep learning models for graph embedding. They have been widely shown to learn highly accurate and robust representations of the graph nodes. Like CNNs, GNNs belong to a type of multi-layer neural network, which performs node embedding as follows. The input to a GNN is a graph whose each node is associated with a feature vector (i.e., node attribute). The GNN propagates the features of each node layer by layer, where each layer performs tensor operations based on the model weights and the input graph topology. The last GNN layer outputs embedding vectors for each node of the input graph. Essentially, both the input node attributes and the topological information of the graph are “embedded” into the output vectors.
+
+2.1. Forward and backward propagation
+In this paper, we mainly consider four types of widely used GNNs: Graph Convolutional Network (GCN) [12], GraphSAGE [7], MixHop [1] and Graph Attention Network (GAT) [23]. We first introduce in detail the GraphSAGE model architecture, and then summarize the layer operations of the other three.
+
+Let the input graph be , where 
+ stores the initial node attributes, and  is the initial feature length. A GraphSAGE layer aggregates signals of nodes  along the edges . A full GraphSAGE network is build by stacking multiple layers, where the inputs to the next layer are the outputs of the previous one. We use superscript “” to denote GNN layer- parameters. For a layer , it contains  nodes corresponding to the graph nodes. Each input and output node of the layer is associated with a feature vector of length 
+ and 
+, respectively. Denote 
+ and 
+ as the input and output feature matrices of the layer, where 
+ and 
+. A layer input node 
+ is connected to a layer output node 
+ if and only if . If we view the input and output nodes as a bipartite graph, then the bi-adjacency matrix 
+ equals the adjacency matrix  of .
+
+Each GraphSAGE layer contains two learnable weight matrices: self-weight 
+ the neighbor-weight 
+. The forward propagation of a layer is defined by: (1)
+where “” is the column-wise matrix concatenation operation, and 
+ is the normalized adjacency matrix. The normalization can be calculated as 
+, where  is the binary adjacency matrix of  and  is the diagonal degree matrix of  (i.e., 
+).
+
+From Eq. (1), each layer performs two key operations:
+
+1.
+Feature aggregation: Each layer- node collects features of its layer- neighbors and then calculates the weighted sum, as shown by 
+.
+
+2.
+Weight transformation: The aggregated neighbor features are multiplied by 
+. The features of a layer- node itself are multiplied by 
+.
+
+After obtaining the node embedding from the outputs of the last GNN layer, we can further perform various downstream tasks by analyzing the embedding vectors. For example, we can use a simple Multi-Layer Perceptron (MLP) to classify the graph nodes into  classes. Let  be the total number of GNN layers. So 
+ is the final node embedding. Following the design of [4], [7], [9], the classifier MLP generates the node prediction by: 
+(2)
+ where 
+. Function  is the element-wise sigmoid or row-wise softmax to generate the probability of a node belonging to a class.
+
+Under the supervised learning setting, each node of  is also provided with the ground-truth class label(s). Let 
+ 
+ be the binary matrix encoding the ground-truth labels. Comparing the prediction with the ground-truth, we can obtain a scalar loss value, , by cross-entropy (CE): (3)
+ 
+
+For the other three types of GNNs under consideration, we need to update Eq. (1) for different forward propagation rules. Specifically, for GCN [12], the main difference from GraphSAGE is that there is not an explicit term 
+ to capture the influence of a node to itself. Instead, the self-influence is propagated by adding a self-connection in the graph. Therefore, the adjacency matrix becomes  and the normalization is performed differently. The forward propagation of each layer is as follows: (4)
+where 
+ is a symmetrically normalized adjacency matrix calculated by 
+ 
+ 
+, and  is the identity matrix.
+
+For MixHop [1], each layer is able to propagate influence from nodes up to -hops away (i.e.,  is said to be -hops away from  if the shortest path from  to  has length ). The forward propagation of each layer is defined as: (5)
+where “” is again the operation for matrix concatenation. 
+ means the symmetrically normalized adjacency matrix raised to the power of . And “order”  is a hyperparameter of the model.
+
+For GAT [23], instead of aggregating the features from the previous layer (i.e., 
+) using a fixed adjacency matrix (i.e., 
+ in GCN or 
+ in GraphSAGE), each GAT layer learns the weight of the adjacency matrix as the “attention”. The forward propagation of a GAT layer is specified as: (6)
+where each element in the attention adjacency matrix 
+ is calculated as: (7)
+where  is a learnable vector and 
+ means the feature vector of node  (i.e., the -th row of the feature matrix 
+). As an extension, Eq. (6) can be modified to support “multi-head” attention. Note that the computation pattern of “multi-head” GAT is the same as that of “single-head” captured by Eq. (6) and our parallelization strategy can be easily extended to support the multi-head version. We therefore restrict to Eq. (6) for the discussion on GAT.
+
+In summary, considering all the four models, the full forward propagation during training takes  as the input and generates  as the output by traversing the GNN layers, the classifier layers, and the loss layer. After obtaining , we perform backward propagation from the loss layer all the way to the first GNN layer and update the weights by gradients. The gradients are computed by chain-rule. In Section 5, we analyze the computation in backward propagation and propose parallelization techniques for each of the key operations.
+
+2.2. Minibatch training methods
+For large scale graphs, training of the GNN has to proceed in minibatches, so that each iteration of weight update involves only a small number of graph nodes. GraphSAGE [7], FastGCN [4], AS-GCN [9] and VR-GCN [6] incorporate various layer sampling techniques to construct minibatches. Upper part of Fig. 1 abstracts the meta-steps of 1. Constructing a full GNN on the training graph , 2. Sampling nodes from the  nodes of each layer, and 3. Forward and backward propagation among the sampled nodes. For the sampling of step 2, various techniques have been proposed to improve learning quality or training speed. For [6], [7], [9], they first randomly select a small number of nodes from the outputs of the last GNN layer as the “minibatch” nodes. Then they treat such minibatch nodes as the roots and back-tracks the layer connections to sample connected nodes in the previous layers. When such back-tracking goes from layer ’s outputs down to layer ’s inputs, the number of multi-hop neighbors of the roots can be orders of magnitude larger than the number of roots. This is referred to as “neighbor explosion” [4], [6], [7] (see also analysis in Section 3.2). Note that if  is a -hop neighbor of , then  is connected to  via a length- path in . Equivalently, node  in layer  of the GNN can influence  in layer . While [6], [9] have proposed techniques to alleviate such “neighbor explosion” of [7], none of them is scalability from the computation complexity perspective. Specifically, the variance reduction based sampler of [6] comes at the cost of much higher memory usage, and the sampler of [9] using an auxiliary neural network incurs significant computation overhead. On the other hand, for [4], the sampling is performed independently at each layer. [4] first computes the sampling probability for each node of , based on the sparse adjacency matrix . Then it selects a fixed number of nodes from each layer according to such probability. Finally, the sampled GNN to generate the embedding for the minibatch is built by connecting the sampled nodes in adjacent layers. Clearly, [4] avoids “neighbor explosion” since the number of samples in each layer is fixed. Unfortunately, such training can result in significant accuracy degradation. Since the sampling in each layer is independent, significant portion of the node samples in layer  may be disconnected to node samples in layer  when  is large.
+
+In our prior work [31], we proposed a minibatch training method for the GraphSAGE model based on graph sampling, and developed parallelization strategies targeting at shared-memory multi-core processors. We designed a table based data structure to support parallel graph sampling, and a data partitioning scheme supporting parallel feature propagation within subgraphs. In this work, we improve the parallel graph sampling algorithm by a more compact design of the data structure. Thus, we significantly reduce the computation cost and storage overhead of graph sampling. We also propose a scheduling algorithm for the overall training. The scheduler intelligently re-orders the operations in GNN layer propagation to reduce computation complexity, and updates the sampled subgraphs to improve the cache performance. Lastly, we show that our parallelization and scheduling strategies are general, and can be extended to various GNN models including but not limited to GraphSAGE.
+
+Our other work, GraphSAINT [30], extends the idea of training GNNs with graph sampling. GraphSAINT focuses on further improving training accuracy by bias elimination and variance reduction techniques, while this work mostly focuses on the parallelization strategies to achieve superior scalability on multi-core platforms. Note that the training algorithm enhancements proposed by GraphSAINT can be easily incorporated into our parallel execution framework without losing any efficiency or scalability.
+
+3. Graph sampling-based minibatch training
+We present a novel graph sampling-based GNN training method. Our parallel minibatch training simultaneously outperforms the state-of-the-art in accuracy, efficiency and scalability. We present the design of the training (Section 3.1), and analyze the advantages in efficiency (Section 3.2) and accuracy (Section 3.3). We then present optimizations to scale training on parallel machines (Sections 4 Parallel graph sampling algorithm, 5 Parallel training algorithm).
+
+3.1. Design of the minibatch training algorithm
+As shown in the lower part of Fig. 1, the graph sampling-based approach does not construct a GNN directly on the original input graph . Instead, for each iteration of weight update during training, we first sample a small induced subgraph 
+ from . We then construct a complete2 GNN on 
+. The forward and backward propagation are both on this small GNN. Algorithm 1 describes our approach. The key distinction from traditional training methods is that the computations (lines 5–13) are performed on nodes of the sampled graph instead of the sampled layer nodes, thus requiring much less computation in training due to reduced redundancy (Section 3.2). In addition, since the GNN on the subgraph 
+ is complete, the forward propagation rule is almost the same as that of the GNN on the full graph. We can directly use Eqs. (1), (4), (5), (6), (2), (3) by just replacing the full feature matrix 
+ and the full adjacency matrix  with the ones for the subgraph, 
+ and 
+. In Section 3.3, we discuss the requirements for the  function (line 3), and present three representative graph samplers that leads to high accuracy of training.
+
+Note that for all the methods discussed in this paper (both the layer sampling based and our proposed graph sampling based), a “minibatch” is always defined as node samples in the output GNN layer. For example, consider a GNN with one hidden layer. If a particular method selects 1000, 100 and 10 nodes in the input, hidden and output layers respectively, then we say the minibatch size is 10, the 1-hop neighborhood size is 100 and the 2-hop neighborhood size is 1000. In this case, the GNN only generates label predictions for the 10 minibatch nodes. The number of hops is with respect to minibatch nodes.
+
+
+Download : Download high-res image (243KB)
+Download : Download full-size image
+3.2. Complexity of graph sampling-based minibatch training
+We analyze the computation complexity of our graph-sampling based training and show that it significantly reduces redundancy in computation. In the following analysis, we do not consider the sampling overhead, and we only focus on the forward propagation, since backward propagation has identical computation characteristics as forward propagation. Later, we also experimentally demonstrate that our technique is significantly faster even with the sampling step included (see Section 7).
+
+Using the GraphSAGE design as a representative GNN model Eq. (1), the main operations to propagate forward by one GNN layer include:
+
+•
+Feature aggregation: Each node feature vector from layer- propagates via layer connections. The aggregation requires 
+ operations.
+
+•
+Weight transformation: Each node multiplies its feature with the weight, leading to the overall complexity of 
+.
+
+For simplicity, assume 
+. Further let 
+ be the average degree of the subgraph 
+. Complexity of -layer forward propagation in one minibatch is: (8)
+
+By convention, one epoch of training is defined as one time traversal of all the training data points by predicting their labels. Thus, by the definition of “minibatch” in Section 3.1, we define an epoch in our training as 
+ number of minibatches (i.e., subgraphs). Clearly, the computation complexity of an epoch is 
+.
+
+Comparison against other GNN training methods.
+As discussed in Section 2.2, for [6], [7], each sampled node in layer  further selects 
+ number of neighbors in layer . For [7], 
+ ranges from  to , and for [6], 
+. So depending on the minibatch size (see Section 3.1), the complexity of one epoch falls between:
+
+Case 1 [Small minibatch size]: 
+.
+
+Case 2 [Large minibatch size] 
+.
+
+We observe that when the minibatch size is much smaller than the training graph size, the layer sampling techniques result in high training complexity (computation load grows exponentially with GNN depth). Essentially, due to “neighbor explosion”, when the layer- nodes are traversed only once, the nodes in the previous layer  are sampled and evaluated 
+ times on average. The repeated evaluation of the layer nodes across different minibatches makes training inefficient due to computation redundancy. On the other hand, when the minibatch size of [6], [7] becomes comparable to the training graph size, the training complexity grows linearly with the GNN depth and training graph size. However, the resolution of “neighbor explosion” comes at the cost of slow convergence and low accuracy [11], since overly large minibatch size hurts generalization of neural networks. So such training configuration of Case 2 does not scale to large graphs.
+
+If we ignore the convergence rate dependent on the input graph, our graph-sampling based training leads to a parallel algorithm whose complexity is linear in GNN depth and training graph size. The work-efficiency of our training is guaranteed by design: throughout the entire training, for each node , the number of times its label is predicted in the output layer is equal to the number of times its feature is computed in any hidden layer. In this sense, there is no redundant computation arising from repeated evaluation of hidden layer nodes as discussed above. In addition, by choosing proper graph sampling algorithms, we can construct small representative subgraphs whose sizes do not grow proportionally with the training graph size (as shown in Section 7).
+
+3.3. Accuracy of graph sampling-based training
+Layer-based sampling methods assume that a subset of neighbors of a given node is sufficient to learn its representation. We achieve the same goal by sampling the graph itself. If the sampling algorithm constructs enough number of representative subgraphs 
+, our training process should absorb all the information in , and generate accurate embeddings. More specifically, as discussed in Section 2, the output vectors “embed” the input graph topology as well as the initial node attributes. A good graph sampler, thus, should guarantee:
+
+1.
+Sampled subgraphs preserve the connectivity characteristics of the training graph.
+
+2.
+Each training graph node has non-negligible probability to be sampled.
+
+It has been widely studied [8] that various random walk based graph sampling algorithms (including unbiased random walk [30], forest fire [15], [16], multiple random walk and frontier sampling [19]) can preserve the various input graph characteristics well. In addition, all these sampling algorithms are able to explore the full set of nodes and edges in the original graph due to the stochasticity in sampling. Thus, such algorithms are all valid candidates for our subgraph sampling based training. From the perspective of computation, unbiased random walk, forest fire and multiple random walk algorithms fall within the “static” category of the random walk family according to [25]. In other words, throughout the sampling process, these three sampling algorithms follow a fixed probability distribution on node or edges, regardless of the historically traversed subgraph structure. However, the frontier sampling algorithm maintains a dynamic probability distribution updated by the “frontier nodes” at the current timestamp. Therefore, for frontier sampling, computation complexity as well as difficulty in parallelization are both higher compared with the other three static algorithms. In the following, we use frontier sampling as a representative and analyze in detail its performance in terms of accuracy and parallel execution. We then discuss how the proposed techniques can be extended to the other three samplers in Section 4.4.
+
+Before going into the specific steps in sampling, we first give some intuition on why training with frontier sampling may lead to high accuracy. Recall the two requirements above characterizing a good sampler. For requirement 1, while “connectivity” may have several definitions, subgraphs output by [19] approximate the original graph with respect to multiple connectivity measures, including degree distribution, assortative mixing coefficient and clustering coefficients. These graph measures critically define how signals on the graph nodes would propagate and mix via GNN layers, and thus should be carefully maintained by the subgraph samples. For requirement 2, during initialization, the frontier sampler picks some root nodes uniformly at random from the original graph (see Section 4.1). These roots constitute a significant portion of the subgraph nodes. Thus, over large enough number of sampling iterations, all input attributes of the training graph will be covered by the frontier sampler. For readers interested in theoretical justification on the choice of those sampling algorithms, please check the analysis in [30].
+
+4. Parallel graph sampling algorithm
+In this section , we first describe our parallelization strategies for the frontier sampling algorithm [19]. Then in Section 4.4, we show how to extend our strategies to other graph samplers.
+
+4.1. Graph sampling algorithm
+The frontier sampling algorithm proceeds as follows. Throughout the sampling process, the sampler maintains a constant-size frontier set  consisting of  vertices in . In each iteration, the sampler randomly pops out a node  in  according to a degree based probability distribution, and replaces  in  with a randomly selected neighbor of . The popped out  is added to the node set 
+ of 
+. The sampler repeats the above update process on the frontier set , until the size of 
+ reaches the desired budget . Algorithm 2 shows the details. According to [19], a good empirical value of  is around .
+
+
+Download : Download high-res image (147KB)
+Download : Download full-size image
+In our sequential implementation of training, we notice that about half of the time is spent in the sampling phase. This motivates us to parallelize the graph sampler. The challenges are: 1. While sampling from a discrete distribution is a well-researched problem, we focus on fast parallel sampling from a dynamic probability distribution. Such dynamism is due to the addition/deletion of new nodes in the frontier. Existing methods for fast sampling such as aliasing [24] (which can output a sample in  time with linear processing) cannot be modified easily for our problem. It is non-trivial to select a node from the evolving  with low complexity. A straightforward implementation by partitioning the total probability of 1 into  intervals would require  work to update the intervals for each replacement in FS. Given  as recommended by the authors in the original paper [19], the  complexity to sample a single 
+ is too expensive. 2. The sampling is inherently sequential as the nodes in the frontier set should be popped out one at a time. Otherwise, 
+ may not preserve the characteristics of the original graph well enough.
+
+To address the above challenges, we first propose a novel data structure that lowers the complexity of frontier sampler and allows thread-safe parallelization (Section 4.2). We then propose a training scheduler that exploits parallelization within and across sampler instances (Sections 4.3 Intra- and inter-subgraph parallelization, 6 Runtime scheduling).
+
+4.2. Dashboard based implementation
+Since nodes in the frontier set are replaced only one at a time, an efficient implementation should allow incremental update of the probability distribution over the  nodes. To achieve such goal, we propose a “Dashboard” table to store the status of current and historical frontier nodes (a node becomes historical after it gets popped out of the frontier set). The next node to pop out is selected by probing the Dashboard using randomly generated indices. In the following, we formally describe the data structure and operations in the Dashboard-based sampler. The implementation involves two arrays:
+
+•
+Dashboard 
+: A vector maintaining the status and sampling probabilities of the current and historical frontier nodes. If a node  is in the frontier, we “pin” a “tile” of  to the “dashboard”. Here a tile is a small data structure storing the meta-data of , and a pin is an address pointer to the tile. One entry of DB corresponds to one pin. A node  will have  pins allocated continuously in DB, each pointing to the same tile belonging to . If  is popped out of the frontier, we invalidate all its pins to . The optimal value of the parameter  is explained later.
+
+•
+Index array 
+: An auxiliary array to help cleanup  upon table overflow. The -th column in IA has 2 slots, the first slot records the starting index of the DB pins corresponding to , where  is the th node added into DB. The second slot is a flag, which is True when  is a current frontier node, and False when  is a historical one.
+
+The symbols related to the design and analysis of the Dashboard data structure are summarized in Table 1.
+
+
+Table 1. Summary of symbols related to the Dashboard based frontier sampling.
+
+Name	Meaning
+Dashboard (DB)	Data structure consisting of “pins” and “tiles” to support
+fast dynamic update of probability distribution
+tile	Data structure storing meta-information of frontier nodes
+pin	Pointer pointing to the tiles. All pins belonging to
+the same node will point to a shared tile
+Index array (IA)	Data structure helping the cleanup of DB when it is full
+Number of nodes in the frontier set
+Total number of nodes to be sampled in the subgraph
+Average degree of frontier nodes
+Enlargement factor controlling the computation-storage
+tradeoff. Larger : larger DB and less frequent cleanup
+Since the probability of popping out a node in frontier is proportional to its degree, we allocate 
+ continuous entries in , for each 
+ currently in the frontier set. This way, the sampler only needs to probe DB uniformly at random to achieve line 4 of Algorithm 2. Clearly,  should contain at least  entries, where  is the average degree of the frontier nodes. For the sake of incremental updates, we append the entries for the new node and invalidate the entries of the popped out node, instead of changing the values in-place and shifting the tailing entries. The invalidated entries become historical. To accommodate the append operation, we introduce an enlargement factor  (where ), and set the length of  to be . As an approximation, we set  as the average degree of the training graph . As the sampling proceeds, eventually, all of the  entries in DB may be filled up by the information of current and historical frontier nodes. In this case, we free up the space occupied by historical nodes before resuming the sampler. Although cleanup of the Dashboard is expensive, due to the factor , such scenario does not happen frequently (see complexity analysis in Section 4.3). Using the information in IA, the cleanup phase does not need to traverse all of the  entries in DB to locate the space to be freed. When DB is full, the entries in DB can correspond to at most  vertices. Thus, we safely set the capacity of IA to be  + 1. Slot 1 of the last entry of IA contains the current number of used DB entries.
+
+4.3. Intra- and inter-subgraph parallelization
+Since our subgraph-based GNN training requires independently sampling multiple subgraphs, we can sample different subgraphs on different processors in parallel. Also, we can further parallelize within each sampling instance by exploiting the parallelism in probing, book-keeping and cleanup of DB.
+
+
+Download : Download high-res image (338KB)
+Download : Download full-size image
+
+Download : Download high-res image (350KB)
+Download : Download full-size image
+Algorithm 3 shows the details of Dashboard-based parallel frontier sampling, where all arrays are zero-based. Considering the main loop (lines 20 to 30), we analyze the complexity of the three functions in Algorithm 4. Denote 
+ and 
+ as the cost to generate one random number and to perform one memory access, respectively.
+pardo_POP_FRONTIER.
+Anytime during sampling, on average, the ratio of valid DB entries (those occupied by current frontier vertices) over total number of DB entries is . Probability of one probing falling on a valid entry equals . Expected number of rounds for  processors to generate at least 1 valid probing can be shown to be 
+ 
+, where one round refers to one repetition of lines 5 to 7 of Algorithm 4. After selection of 
+, 
+ number of slots needs to be updated to invalid values INV. Since this operation occurs  times, the  function incurs 
+ 
+ 
+ cost.
+
+pardo_CLEANUP.
+Each time cleanup of DB happens, we need one traversal of IA to calculate the cumulative sum of indices (slot 1) masked by the status (slot 2), to obtain the new location for each valid entries in DB. On expectation, only  entries of IA is filled, so this step costs . Afterwards, only the valid entries in DB will be moved to the new, empty DB based on the accumulated shift amount. This translates to  number of memory operations. The  function is fully parallelized. The cleanup happens only when DB is full, i.e., 
+ 
+ times throughout sampling. Thus, the cost is 
+ 
+ 
+. We ignore the cost of computing the cumulative sum as .
+
+pardo_ADD_TO_FRONTIER.
+Adding a new frontier 
+ to DB requires appending 
+ new entries to DB. This costs 
+ 
+.
+
+Considering all operations in pardo_POP_FRONTIER, pardo_CLEANUP and pardo_ADD_TO_FRONTIER, the overall cost to sample one subgraph on  processors equals: (9)
+ 
+ 
+ 
+
+Assuming 
+, we have the following scalability bound:
+
+Theorem 1
+
+For any given , Algorithm 2 guarantees a speedup of at least 
+ 
+ 
+.
+
+Proof
+
+Note that 
+ 
+ 
+ 
+. This follows from 
+ 
+ 
+ 
+ 
+ 
+ 
+. Further, since , we have 
+ 
+ 
+. Now, speedup obtained by Algorithm 2 compared to a serial implementation () is 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+Setting , then for any value of , Theorem 1 guarantees good scalability () for at least  processors. As we will see later in this section, we perform the intra-sampler parallelism via AVX instructions. So we do not require  to scale to a large number in practice. Note that the above performance analysis always holds as long as we know the expected node degree in the subgraphs. During the sampling process, when the sampler enters a well connected local region of the original graph, cleanup may happen more frequently since the frontier contains more high degree nodes. However, the sampler would eventually replace those high degree frontier nodes with low degree ones, so that the overall subgraph degree is similar to that of the original graph. Also, note that for graphs with skewed degree distribution, it is possible that the next node to be added into the frontier set has very high degree. Such a node may even require more slots than that is totally available in DB. In this case, we would cleanup DB and allocate all the remaining slots to that node, without further expanding the size of DB. This only slightly alters the sampling distribution since the higher the node degree is, the sooner it would be popped out of the frontier. In the experiments, we also observe that such a corner case does not affect the training accuracy (see Section 7.2).
+
+While the scalability can be high for dense graphs, it is challenging to scale the sampler to massive number of processors on sparse graphs. Feasible parallelism is bound by the graph degree. In summary, the parallel Dashboard based frontier sampling algorithm 1. enables lower serial complexity by incremental update on probability distribution, and 2. scales well up to  number of processors. Compared with our original Dashboard based sampling in [31], the data structure presented in this section is more compact. In the original design, the meta-data of a frontier node  (i.e., the 4-tuple in line 14 of Algorithm 3) is repeatedly stored  times in DB. In the current design, the meta data is only stored once by introducing the “pin-tile” mechanism. Thus, the DB size is reduced from  to . Such “pin-tile” design significantly reduces both the memory storage and the memory movement cost simultaneously.
+
+To further scale the graph sampling step, we exploit task parallelism across multiple sampler instances. Since the topology of the training graph  is fixed over the training iterations, sampling and GNN computation can proceed in an interleaved fashion, without any dependency constraints. Detailed scheduling algorithm of the sampling phase and the GNN computation phase is described in Section 6. The general idea is that, during training, we maintain a pool of sampled subgraphs
+
+
+. When
+
+is empty, the scheduler launches 
+ frontier samplers in parallel, and fill the pool with subgraphs independently sampled from the full graph . Each of the 
+ sampler instances runs on 
+ number of processing units. Thus, the scheduler exploits both intra- and inter-subgraph parallelism. In each training iteration, we remove a subgraph 
+ from
+
+, and build a complete GNN upon 
+. Forward and backward propagation stay the same as lines 9 to 15 in Algorithm 1.
+When filling the pool of subgraphs, total amount of parallelism 
+ is fixed on the target platform. We should choose the value of 
+ and 
+ carefully chosen based on the trade-off between the two levels of parallelism. Note that the operations on DB mostly involve a chunk of memory with continuous addresses. This indicates that intra-subgraph parallelism can be well exploited at the instruction level using vector instructions (e.g., AVX). In addition, since most of the memory traffic going into DB is in a random manner, it is desirable to have DB stored in cache. As coarse estimation, with , , , the memory consumption by one DB is .3 This indicates that DB mostly fits into the private L2 cache (size ) in modern shared memory parallel machines. Therefore, during sampling, we bind one sampler to one processor core, and use AVX instructions to parallelize within a single sampler. For example, on a 40-core machine with AVX2, 
+ and 
+.
+
+Finally, note that the size of DB is determined by the number of frontier nodes, , rather than the number of subgraph nodes . While it is true that we may need to increase  when the original training graph  grows, the size of  would not need to change. The authors of [19] interpret  as the dimensionality of the random walk — frontier sampling on  is equivalent to a single random walk on  raised to the th Cartesian power. With such understanding, the authors of [19] use a fixed number of  on all experiments in ranging from small graphs to large ones.
+
+4.4. Extension to other graph sampling algorithms
+By Section 3.3, it is reasonable to use other graph sampling algorithms to perform minibatch GNN training. Here we evaluate two sampling algorithms: random edge sampling (“Edge”) and unbiased random walk sampling (“RW”). The two algorithms are recommended in [30]. The “Edge” sampler assigns the probability of picking an edge  as 
+ 
+ 
+, and can be understood as a special case of the “RW” algorithm by setting the walk length to be 1. Algorithm 5 specifies the steps of the two algorithms. Under the categorization in Section 3.3, “Edge” and “RW” samplers are static since the sampling probability does not change during the sampling process. Therefore, their computation complexity is much lower than that of frontier sampling. It is easy to show that both have computation complexity of 
+ (we can use alias method [24] for “Edge” sampling to achieve such complexity).
+
+
+Download : Download high-res image (253KB)
+Download : Download full-size image
+For the “Edge” and “RW” samplers, we thus only apply inter-sampler parallelism to achieve scalability. We can use exactly the same inter-sampler parallelization strategy discussed above. The only difference is that each subgraph in the pool
+
+
+is now obtained by a serial “Edge” or “RW” sampler.
+To further improve the training accuracy with “Edge” and “RW” samplers, we further integrate the aggregator normalization and loss normalization techniques [30] into our implementation. Such normalization requires two minor modifications to our training algorithm:
+
+•
+Pre-processing: Before training, we would need to independently sample a given number of subgraphs to estimate the probability of each  and  being picked by the sampling algorithm. The pre-processing can be parallelized by the strategies discussed above.
+
+•
+Applying the normalization coefficients: with aggregator normalization, the feature aggregation (i.e., 
+) would be based on a re-normalized adjacency matrix. With loss normalization, the loss 
+ would be computed with weighted sum for the minibatch nodes. Therefore, the two normalization steps do not make any change on the computation pattern.
+
+5. Parallel training algorithm
+We next present parallelization techniques for the forward and backward propagation. Specifically, the subgraph based training enables a simple partitioning scheme that ensures near-optimal feature propagation performance.
+
+5.1. Computation kernels in training
+After obtaining the subgraphs as minibatches, the GNN computation mainly involves forward and backward propagation along the layers. We first analyze in detail the backward propagation computation for the GraphSAGE model [7]. Then we show that all the four GNN variants presented in Section 2 share the same set of key computation operations. And thus the parallelization strategy can be generally applied to all the models. As for the forward propagation, Eqs. (1), (2), (3) have already defined all the operations required for the various layers. Next, we derive the equations for calculating gradients.
+
+Starting from the minibatch loss 
+, we first compute the gradient with respect to the classifier output on the subgraph nodes 
+. Then, using chain-rule, we compute the gradients with respect to the variables of the MLP layer and the graph convolution layers (from layer  back to layer ).
+
+For the layer with cross-entropy loss, the gradients are computed by: (10)
+ 
+ 
+
+For the MLP layer, the gradients are computed by: (11)
+
+For each graph convolution layer , the gradients are computed by: (12)
+ 
+ 
+ 
+ 
+
+From the equations of forward and backward propagation, we observe that the GraphSAGE computation consists of three kernels:
+
+•
+Feature/gradient propagation in the sparse subgraph – e.g., 
+;
+
+•
+Dense weight transformation on the feature/gradient – e.g., 
+;
+
+•
+Sparse adjacency matrix transpose – i.e., 
+.
+
+In fact, the above three are also the key operations for GCN [12], MixHop [1] and GAT [23]. For GCN [12], the forward propagation only contains one pass as compared to the two paths in GraphSAGE (i.e., the two paths being concatenated by the “” operation). Therefore, in the backward propagation, we replace 
+ with 
+ and only keep the terms containing 
+ in Eq. (12). For example, we have 
+.
+
+For MixHop [1], each layer in the forward propagation consists of  paths as compared to the two paths in GraphSAGE. Therefore, we need to introduce the 
+ terms (where ) to Eq. (12) in the backward pass. For example, we need 
+ to compute 
+. Further note that 
+. And even though 
+ is sparse, the product 
+ is again a dense matrix. So the forward and backward propagation for MixHop does not involve sparse–sparse matrix multiplication and the MixHop computation can still be covered by the three key operations listed above.
+
+For GAT [23], in the forward pass, we need to compute the attention values for each element in the subgraph adjacency matrix. Such computation according to Eq. (7) only involves dense algebra. After obtaining the attention adjacency matrix, the rest of the propagation by Eq. (6) is the same as that of GCN. In the backward pass, according to chain rule, we can still break down the computation steps following the logic in the forward pass. For example, to obtain the gradient with respect to attention parameters , we first obtain the gradients with respect to the attention matrix 
+ by a series of dense matrix operations on 
+, 
+ and . Then we obtain the gradient with respect to  based on the gradient with respect to 
+. Even though the mathematical expression for the GAT gradient computation is more complicated, it is easy to see that all the operations involved are again covered by the three key operations listed above.
+
+In summary, if we can efficiently parallelize the three operations listed above, we are automatically able to execute the full forward and backward propagation for the four GNNs. We present our method for transposing the sparse adjacency matrix in Section 5.2 and the techniques for parallel feature propagation in Section 5.3. Now consider the dense matrix multiplication involved in the weight transformation step. Since this operation is a standard BLAS level 2 routine, it can be efficiently parallelized using standard libraries such as Intel® MKL [10].
+
+In the following, we use 
+ to represent the subgraph adjacency matrix used in each GNN layer. For different models, the 
+ may be replaced by 
+ or 
+.
+
+5.2. Transpose of the sparse adjacency matrix
+Since we assume the training graph and the sampled subgraphs are undirected, the transpose of the subgraph adjacency matrix 
+ can be performed efficiently with low computation and space complexity. We first discuss the serial implementation before moving forward to the parallel version.
+
+Suppose the original adjacency matrix 
+ is represented in the CSR format, consisting of a size-
+ index pointer array (Indptr), a size-
+ indices array (Indices) and a size-
+ data array (Data). For an undirected graph, if edge 
+, then 
+. Therefore, the index pointer and the indices arrays of 
+ are identical as the ones of 
+. To transpose 
+ thus means to generate a new data array by permuting the original Data of the CSR of 
+.
+
+
+Download : Download high-res image (199KB)
+Download : Download full-size image
+We propose to generate the permuted data array for 
+ by a single pass of Indptr and Indices of 
+. Our algorithm relies on a weak assumption on Indices of 
+: for any node , we assume its neighbor IDs in the indices array, , is sorted in ascending order. The transpose operation is shown in Algorithm 6. The correctness of the algorithm can be reasoned as follows. Suppose a column  of the original adjacency matrix has  non-zeros denoted as 
+, where  and the node IDs satisfy 
+ for . When we traverse the CSR of 
+ (lines 4 to 5), we will read 
+ before 
+ if the node IDs have 
+. After transpose, the neighbor data – 
+ – should be placed in a continuous subarray  of 
+. In addition, 
+ should locate to the left of 
+ if 
+. Therefore, once reading 
+ of the edge 
+ from 
+, we can simply append 
+ to ’s data subarray of the transposed CSR.
+
+The computation and space complexity of Algorithm 6 are 
+ and 
+ respectively, which are low compared with other operations in training. We parallelize the adjacency matrix transpose at the subgraph level. During sampling, each of the 
+ processors sample one subgraph and permute the corresponding Data array by Algorithm 6. The information of the original and transposed subgraphs are all stored in the pool of
+
+
+(Section 4.3), to be later consumed by the GNN layer propagation.
+5.3. Parallel feature propagation within subgraph
+During training, each node in the graph convolution layer  pulls features from its neighbors, along the layer edges. Essentially, the operation of 
+ can be viewed as feature propagation within the subgraph 
+.
+
+A similar problem, label propagation within graphs, has been extensively studied in the literature. State-of-the-art methods based on vertex-centric [2], edge-centric [20] and partition-centric [13] paradigms perform node partitioning on graphs so that processors can work independently in parallel. The work in [32] also performs label partitioning along with graph partitioning when the label size is large. In our case, we borrow the above ideas to allow two dimensional partitioning along the graph as well as the feature dimensions. However, we also realize that the above techniques may lead to sub-optimal performance in our GNN based feature propagation, due to two reasons:
+
+•
+The propagated data from each node is a long feature vector (consisting of hundreds of elements) rather than a small scalar label.
+
+•
+Our graph sizes are small after graph sampling, so partitioning of the graph may not lead to significant advantage.
+
+In the following, we analyze the computation and communication costs of feature propagation after graph and feature partitioning. We temporarily ignore load-imbalance and partitioning overhead, and address them later on.
+
+Suppose we partition the subgraph into 
+ number of disjoint node partitions
+
+
+. Let the set of nodes that send features to 
+ be
+
+. Note that 
+, since we follow the design in [7] to add a self-connection to each node. We further partition the feature vector 
+ of each node  into 
+ equal parts
+
+. Each of the processors is responsible for propagation of
+
+, flowing from 
+ into 
+ (where 
+ and 
+).
+Define 
+ 
+ as a metric reflecting the graph partitioning quality. While 
+ depends on the partitioning algorithm, it is always bound by 
+ 
+.
+
+Let 
+ and 
+. So 
+ 
+ and 
+ 
+.
+
+In our performance model, we assume  processors operating in parallel. Each processor is associated with a private fast memory (i.e., cache). The  processors share a slow memory (i.e., DRAM). Our objective in partitioning is to minimize the overall processing time in the parallel system. After partitioning, each processor owns 
+ 
+ number of 
+, and propagates its 
+ into 
+. Due to the irregularity of graph edge connections, accesses into 
+ are random. On the other hand, using the CSR format, the neighbor lists of nodes in 
+ can be streamed into the processor, without the need to stay in cache. In summary, an optimal partitioning scheme should:
+
+•
+Let each 
+ fit into the fast memory;
+
+•
+Utilize all of the available parallelism in the system;
+
+•
+Minimize the total computation workload;
+
+•
+Minimize the total slow-to-fast memory traffic;
+
+•
+Balance the computation and communication load among the processors.
+
+Each round of feature propagation has 
+ 
+ 
+ computation, and 
+ 
+ 
+ communication (in bytes).4 Computation and computation over 
+ rounds are: 
+(13)
+
+Note that 
+ is not affected by the partitioning scheme. We thus formulate the following communication minimization problem: (14) 
+ 
+ 
+ Next, we prove that without any graph partitioning we can obtain a 2-approximation for this optimization problem for small subgraphs.
+
+Theorem 2
+
+ 
+ results in a 2-approximation of the communication minimization problem Eq. (14), for 
+ 
+ and 
+, irrespective of the partitioning algorithm.
+
+Proof
+
+Note that since 
+ and 
+, 
+: 
+ 
+Set 
+ and 
+ 
+. Clearly, 
+.
+
+Case 1, 
+ 
+ In this case, 
+. Thus both constraints are satisfied. And, 
+ 
+ due to .
+
+Case 2, 
+ 
+ In this case, 
+ is a feasible solution. And, 
+ 
+ 
+ 
+ due to 
+.
+
+In both cases, the approximation ratio of our solution is ensured to be: 
+ 
+ 
+ 
+
+Note that this holds for 
+. So for a cache size of 256 KB, number of edges in the subgraph (i.e., ) can be up to 128 K. Such upper bound on 
+ can be met by the subgraphs in consideration. Also, since , the condition  holds for most of the shared memory platforms in the market. Note that the above theorem is derived by a simple lower bounding on the ratio 
+ for any (including the optimal) partitioning scheme. However, finding such optimal partitioning is computationally infeasible even on small subgraphs, since there are exponential number of possible partitioning. We thus do not provide experimental evaluation on this theorem.  □
+
+Using typical values , , and , then for up to 
+ 
+ cores,5 the total slow-to-fast memory traffic under feature only partitioning is less than 2 times the optimal. Recall the two properties (see the beginning of this section) that differentiate our case with the traditional label propagation. Because the graph size  is small enough, we can find a feasible 
+ solution to satisfy the cache constraint 
+ 
+. Because the value  is large enough, we can find enough number of feature partitions such that 
+. Algorithm 7 specifies our feature propagation.
+
+
+Download : Download high-res image (155KB)
+Download : Download full-size image
+Lastly, the feature only partitioning leads to two more important benefits. Since the graph is not partitioned, load-balancing (with respect to both computation and communication) is optimal across processors. Also, our partitioning incurs almost zero pre-processing overhead since we only need to extract continuous columns to form sub-matrices. In summary, the feature propagation in our graph sampling-based training achieves 1. Minimal computation; 2. Optimal load-balancing; 3. Zero pre-processing cost; 4. Low communication volume.
+
+6. Runtime scheduling
+6.1. Computation order of layer operations
+Both the forward and backward propagation of GNN layers (Eq. (4), (1), (5), (6), (12)) involve multiplying a chain of three matrices. Given a chain of matrix multiplication, it is known that different orders of computing the chain leads to different computation complexity. In general, we can use dynamic programming techniques to obtain the optimal order corresponding to the lowest computation complexity [17]. Specifically, for our training problem, we have a chain of three matrices whose sizes and densities are known once the subgraphs are sampled. Consider a sparse matrix 
+ (with density ), and two dense matrices 
+ and 
+. To calculate 
+, there are two possible computation orders. Order 1 of 
+ computes the partial result 
+ first and then computes 
+. This order of computation requires 
+ Multiply-ACcumulate (MAC) operations. Order 2 of 
+ computes the partial result 
+ first and then computes . This order requires 
+ MAC operations. Therefore, if 
+, order 1 is better. Otherwise, we should use order 2. Similarly, suppose 
+ and our target is 
+. Then order 1 of 
+ is better than order 2 of 
+ if and only if 
+.
+
+Consider a GraphSAGE layer . If 
+, we should use order 1 to calculate the forward propagation of Eq. (4), order 1 to calculate 
+ of Eq. (12) and order 2 to calculate 
+ of Eq. (12).
+
+Note that the decision of the scheduler only relies on the dimension of the matrices, and thus can be made during runtime at almost no cost. In addition, the partitioning strategy presented in Section 5.3 does not rely on any specific computation order. In summary, the light-weight scheduling algorithm reduces computation complexity without affecting scalability.
+
+6.2. Scheduling the feature partitions
+After partitioning the feature matrix (Section 5.3), the question still remains how to schedule these partitions for further performance optimization. Ideally, since the operations on the partitions are completely independent, any scheduling would lead to identical performance. However, in reality, the partitions may undesirably interact with each other due to “false sharing” of data in private caches. If the size of each feature partition is not divisible by the cacheline size, then in the private cache of the processor owning partition , there may be one cacheline containing data of both partitions  and , and another cacheline containing data of both partitions  and . Therefore, if the partitions ,  and  are computed concurrently, there may be undesirable data eviction to keep the three caches clean. So the scheduler should try not to dispatch adjacent partitions at the same time, and we follow the processing order as specified by lines 5 and 6 of Algorithm 7 to achieve this goal.
+
+When the number of processors is large or the number of feature partitions is small (i.e., line 4 of Algorithm 7 finishes in one iteration), it is inevitable to process adjacent partitions in parallel. On the other hand, note that if the partition size is divisible by the cacheline size, we can avoid “false sharing” regardless of the scheduling. The partition size equals 
+, where  specifies the word-length. Suppose the cacheline size is 
+. Then our goal is to make 
+ divisible by 
+. For example, if we use double-precision floating point numbers in training and the cacheline size is 128 bytes, then we can clip the number of subgraph nodes to be divisible by . Considering that 
+ is in the order of 
+, such clipping has negligible effect on the subgraph connectivity and the training accuracy. The node clipping can be performed before the induction step (line 9 of Algorithm 2) by randomly dropping nodes in 
+. Therefore, the clipping step incurs almost zero cost.
+
+6.3. Overall scheduler
+
+
+Download : Download high-res image (241KB)
+Download : Download full-size image
+Algorithm 8 presents the overall training scheduler. By Section 4.3, multiple samplers can be launched in parallel without any data dependency. This is shown by lines 4 to 8. Note that the clipping follows the objective specified in Section 6.2 and the transpose of 
+ follows Algorithm 6. After the GNN is constructed, the forward and backward propagation operations are parallelized by the techniques presented in Section 5. The scheduler performs two decisions based on the sampled subgraphs. The first decision (during runtime) is to perform node clipping to improve cache performance (Section 6.2). The second decision (statically performed before the actual training) is to determine the order of matrix chain multiplication in both forward and backward propagation to reduce computation complexity (Section 6.1).
+
+Note that our scheduler is a general one, in the sense that the training can replace the frontier sampler with any other graph sampling algorithm in a plug-and-play fashion. The processing by the scheduler has negligible overhead.
+
+7. Experiments
+7.1. Experimental setup
+We conduct experiments on 4 large scale real-world graphs as well as on synthetic graphs. Details of the datasets are described as follows:
+
+•
+PPI [21]: A protein–protein interaction graph. A node represents a protein and edges represent protein interactions.
+
+•
+Reddit [21]: A post–post graph. A node represents a post. An edge exists between two posts if the same user has commented on both posts.
+
+•
+Yelp [26], [30]: A social network graph. A node is a user. An edge represents friendship. Node attributes are user comments converted from text using Word2Vec [18].
+
+•
+Amazon [30]: An item–item graph. A node is a product sold by Amazon. An edge is present if two items are bought by the same customer. Node attributes are converted from bag-of-words of text item descriptions using singular value decomposition (SVD).
+
+•
+Synthetic graphs: Graphs generated by Kronecker generator [14]. We follow [14] and set the initiator matrices to be proportional to the 2 by 2 matrix . We generate two sets of Kronecker graphs. The first set consists of graphs with fixed average degree of 16 and number of nodes equals 
+, 
+, 
+, 
+, 
+ and 
+. The second set consists of graphs with 
+ nodes and the average degree equals , , , , ,  and .
+
+The PPI and Reddit datasets are standard benchmarks used in [4], [6], [7], [9], [12]. The larger scale graphs, Yelp and Amazon, are processed and evaluated in [30], [31]. We use the set of four real-world graphs for a thorough evaluation on accuracy, efficiency and scalability. Table 2 shows the specification of the graphs. We use “fixed-partition” split, and the “Train/Val/Test” column shows the percentage of nodes in the training, validation and test sets. “Classes” shows the total number of node classes (i.e., number of columns of  and 
+ 
+ in Eq. (3)). For synthetic graphs, we can only generate the graph topology. The node attributes and the class memberships are filled by random numbers.
+
+For our graph sampling based GNN training, we open-source two implementations in Python (with Tensorflow) and C++ (with OpenMP), respectively.6 We use the Python (Tensorflow) version for single threaded accuracy evaluation in Section 7.2, since the baseline implementations are provided in Python with Tensorflow. We use the C++ version to measure scalability of our parallel training in Sections 7.3 Evaluation on scalability, 7.4 Effect of cache size, 7.7 Deeper learning. The C++ implementation is necessary, since Python and Tensorflow are not flexible enough for parallel computing experiments (e.g., AVX and thread binding are not explicit in Python). Our C++ implementation achieves comparable accuracy as the Tensorflow one.
+
+
+Table 2. Dataset statistics.
+
+Dataset	Nodes	Edges	Attributes	Classes	Train/Val/Test
+PPI	14,755	225,270	50	121 (M)	0.66/0.12/0.22
+Reddit	232,965	11,606,919	602	41 (S)	0.66/0.10/0.24
+Yelp	716,847	6,977,410	300	100 (M)	0.75/0.15/0.10
+Amazon	1,598,960	132,169,734	200	107 (M)	0.80/0.05/0.15
+Synthetic	
+–
+–
+50	2 (S)	0.50/0.25/0.25
+(M): Multi-class classification; (S): Single-class.
+
+We run experiments on a dual 20-Core Intel® Xeon E5-2698 v4 @2.2 GHz machine with 512GB of DDR4 RAM. For the Python implementation, we use Python 3.6.5 with Tensorflow 1.10.0. For the C++ implementation, the compilation is via Intel® ICC (-O3 flag). ICC (version 19.0.5.281), MKL (version 2019 Update 5) and OMP are included in Intel Parallel Studio Xe 2018 update 3.
+
+7.2. Evaluation on accuracy and efficiency
+Our graph sampling-based training significantly reduces computation complexity without accuracy loss. To eliminate the impact of different parallelization strategies on training time, here we run our implementation as well as all the baselines using single thread. Fig. 2 plots the relation between accuracy (F1 micro score) and sequential training time. To be consistent with the settings in the original papers of the baselines, all measurements here are based on the GNN models of two GCN/GraphSAGE layers. Accuracy is measured on the validation set at the end of each epoch. Between the two baselines [7], [12], GraphSAGE [7] achieves higher accuracy and faster convergence. Compared with [7], our minibatch training achieves higher accuracy on all graphs, showing that our graph sampler can preserve important characteristics from the original training graph. Frontier, random walk and edge sampling algorithms perform similarly on Reddit, Yelp and Amazon. On PPI, random walk and edge sampling algorithms result in lower accuracy than the frontier sampler. This is potentially due to the fact that frontier sampler preserves some graph measures better than simpler samplers such as Edge and RW [19]. Due to the stochasticity in training, we define an accuracy threshold to measure training time speedup. Let 
+ be the highest accuracy achieved by the baselines on a given dataset. We define the accuracy threshold as 
+. Serial training time speedup is calculated as: the time for the best performing baseline to reach the threshold divided by the time for our model to reach the threshold. We achieve serial training time speedup of , ,  and  for PPI, Reddit, Yelp and Amazon, respectively. As stated in Section 7.1, in this set of experiments, all the runs are executed under the same Tensorflow framework using single thread. Therefore, the speedup achieved by us is not related to our parallelization strategies and is purely due to our graph sampling based training algorithm. Such significant speedup verifies that our minibatch training improves the computation efficiency by avoiding “neighbor explosion” (see Section 3.2).
+
+7.3. Evaluation on scalability
+In the following, we evaluate scalability of the various operations (graph sampling, feature propagation and weight transformation) in training.
+
+7.3.1. Scalability of overall training
+For the proposed GNN training, Fig. 3 shows the parallel training speedup relative to sequential execution. The execution time includes every training steps specified by lines 2 to 13 of Algorithm 8 — 1. frontier graph sampling (with AVX enabled) and subgraph transpose, 2. feature aggregation in the forward propagation and its corresponding operation in the backward propagation, 3. weight transformation in the forward propagation and its corresponding operation in the backward propagation, and 4. all the other operations (e.g.,  activation, sigmoid function, etc.) in the forward and backward propagation. As before, we evaluate scaling on a 2-layer GraphSAGE model, with small and large hidden dimensions, 
+ and , respectively. As shown by the plots A and D of Fig. 3, the overall training is highly scalable, consistently achieving around  speedup on 40-cores for all datasets. The performance breakdown in plots G and H of Fig. 3 suggests that sampling time corresponds to only a small portion of the total training time. This is due to 1. low serial complexity of our Dashboard based implementation, and 2. highly scalable implementation using intra- and inter-sampler parallelism. In addition, feature aggregation for Amazon corresponds to a significantly higher portion of the total time compared with other datasets. This is due to the higher degree of the subgraphs sampled from Amazon. The main bottleneck in scaling is the weight transformation step performing dense matrix multiplication (see analysis in Section 7.3.4). The overall performance scaling is also data dependent. For denser graphs such as Amazon, the scaling of the feature aggregation step dominates the overall scalability. For the other sparser graphs, the weight transformation step has a higher impact on the training. Lastly, our parallel algorithm can scale well under a wide range of configurations — whether the hidden dimension is small or large; whether the training graph is small or large, sparse or dense.
+
+
+Download : Download high-res image (377KB)
+Download : Download full-size image
+Fig. 2. Time–Accuracy plot for sequential execution..
+
+7.3.2. Scalability of parallel graph sampling
+We evaluate the effect of inter-sampler parallelism for the frontier, random walk and edge sampling algorithms, and intra-sampler parallelism for the frontier sampling algorithm.
+
+For the frontier sampling algorithm, the AVX2 instructions supported by our target platform translate to maximum of 8 intra-subgraph parallelism (
+). The total of 40 Xeon cores makes 
+. Fig. 4. A shows the effect of 
+, when 
+ (i.e., we launch 
+ independent samplers, where AVX is enabled within each sampler). Sampling is highly scalable with inter-subgraph parallelism. We observe that scaling performance degrades when going from 20 to 40 cores, due to mixed effect of lower boost frequency and limited memory bandwidth. With all the 20 cores in one chip executing AVX2 instructions, the Xeon CPU can only boost to 2.2 GHz, in contrast with 3.4 GHz for executing AVX instructions only on one core. Fig. 4.B shows the effect of 
+ under various 
+. The bars show the speedup of using AVX instructions comparing with otherwise. We achieve around  speedup on average. The scaling on 
+ is data dependent. Depending on the training graph degree distribution, there may be significant portion of nodes with less than 8 neighbors, resulting in under-utilization of the AVX2 instruction. We can understand such under-utilization of instruction-level parallelism as a result of load-imbalance due to node degree variation. Such load-imbalance explains the discrepancy from the theoretical modeling on the sampling scalability (Theorem 1).
+
+Fig. 4.C and 4.D show the effect of 
+ for random walk and edge sampling algorithms. Both sampling algorithms scale more than 20 when 
+. As we do not use AVX instructions for these two samplers (i.e., 
+, and the CPU frequency is unaffected), the scalability from 20 cores to 40 cores is better than that of the frontier sampler.
+
+7.3.3. Scalability of feature aggregation
+Fig. 3 shows the scalability of the feature aggregation step using our partitioning strategy. We achieve good scalability (around  speedup on 40 cores) for all datasets under various feature sizes, thanks to our caching strategy and the optimal load-balance discussed in Section 5.3. According to the analysis, the scalability of feature aggregation should not be significantly affected by the subgraph topological characteristics. Therefore, we observe from plots B and E of Fig. 3 that, the curves for the four datasets look similar to each other.
+
+7.3.4. Scaling of weight transformation
+As discussed in Section 5.1, the weight transformation operation is implemented by cblas_dgemm routine of the Intel® MKL [10] library. All optimizations on the dense matrix multiplication are internally implemented in the library. Plots C and F of Fig. 3 show the scalability result. On 40 cores, average of  speedup is achieved. We speculate that the overhead of MKL’s internal thread and buffer management is the bottleneck on further scaling.
+
+7.4. Effect of cache size
+Since our partitioning strategy for feature aggregation (Section 5.3) is based on the L2-cache size of the system, we evaluate the cache miss rate under various cache sizes by simulation. We use CSR format to represent the sparse adjacency matrix of the subgraph and column major layout to represent the dense feature matrix 
+. We use the open-source simulator DynamoRIO [3] to simulate our C++ implementation. We configure the system to be 40 cores with two levels of cache, where the first level of cache corresponds to the L2-cache of the real system. We vary the size of the first level of private cache from 32 KB to 2048 KB. We fix the size of the second level of shared cache to be 50MB. We let the simulator to run one full training iteration and record the cache miss rate for the first level of private cache. Fig. 6 shows the effect of cache size on cache miss rate. When the cache size increases from 32 KB to 512 KB, the cache miss rate quickly drops to below 5%. The parallel execution using our partitioning strategy indeed leads to low cache miss rate. This indicates small amount of slow-to-fast memory data traffic as a benefit of our partitioning strategy.
+
+
+Download : Download high-res image (120KB)
+Download : Download full-size image
+Fig. 6. L2 Cache Miss Rate..
+
+7.5. Comparison with GPU
+We compare the proposed training algorithm with GPU implementation from Tensorflow. We run the GPU program on an Nvidia Tesla P100 GPU with 16 GB of GDDR5 memory, with the same Xeon CPU server as described in Section 7.1. Table 3 shows the performance of the proposed training algorithm on CPU and the Tensorflow implementation on GPU. Both use the same parallel graph sampling algorithm as described in Section 4. For the CPU execution, we use all the available 40 cores. For GPU program, the sampling is done on CPU with 40 cores, while the rest parts are done on GPU. We use the frontier sampling algorithm with node budget  and 
+. We choose hidden dimension  and record the average execution time per iteration for 100 iterations. The GPU program runs faster than the CPU program by 1.93, 2.71, 2.05 and 2.20 on PPI, Reddit, Yelp and Amazon dataset. Note that the peak performance of the CPUs is only 3.5 TFLOPS while the peak performance of the GPU is 10.3 TFLOPS. As stated in Section 5, the proposed parallel training algorithm scales up to 136 cores on CPU. On a 64- or 128-core machine, the proposed algorithm would out-perform GPU based on our modeling (Section 5.3). Importantly, the fast training on GPU also indicates the effectiveness of our graph sampling based minibatch algorithm as well as our parallelization strategy on the frontier sampler.
+
+
+Table 3. Execution time (s) per iteration (hidden dimension  512).
+
+Dataset	CPU	GPU
+PPI	0.1974	0.1021
+Reddit	0.3676	0.1357
+Yelp	0.2917	0.1420
+Amazon	0.4416	0.2004
+7.6. Evaluation on synthetic graphs
+Since the largest available real-world dataset for GNN training (i.e., Amazon) contains only about 1.5 million nodes, we generate synthetic graphs of much larger sizes to perform more thorough scalability evaluation. In the left plot of Fig. 5, the sizes of the synthetic graphs grow from 1 million nodes to around 33 million nodes. All synthetic graphs have average degree of 16. We run a 2-layer GNN with hidden dimension of 512 on the subgraphs of the synthetic graphs. The vertical axis denotes the time to compute one iteration (i.e., the time to perform forward and backward propagation on one minibatch subgraph). The subgraphs are all sampled by the frontier sampling algorithm with the same sampling parameters of  and . With the increase of the training graph size, the iteration time converges to a constant value of around 100 ms. This indicates that our parallel training is highly scalable with respect to the graph size. When increasing the number of graph nodes, we keep the average degree unchanged. Therefore, the degree of the sampled subgraphs also keeps unchanged (due to the property of frontier sampling). Since we set the node budget  to be fixed, the subgraph size (in terms of number of nodes and edges) in each iteration is approximately independent of the total number of nodes in the training graph. So the cost to perform one step of gradient update does not depend on the training graph size (for a given training graph degree).
+
+In the right plot of Fig. 5, we fix the graph size as 
+ and increase the average degree. Under the same sampling algorithm, if the original graph becomes denser, the sampled subgraphs are more likely to be denser as well. The computation complexity of feature aggregation is proportional to the subgraph degree. We observe that the iteration time approximately grows linearly with the average degree of the original training graph. This indicates that our parallel training algorithm can handle both sparse and dense graphs very well.
+
+7.7. Deeper learning
+Although state-of-the-art training methods [4], [6], [7], [9] are not evaluated on GNN models deeper than 3 layers, adding more layers in a neural network is proven to be very effective in increasing the expressive power (and thus accuracy) of the network [22]. Here we evaluate the efficiency and overall training speedup of our GNN implementation compared with [7], under various number of layers using 40 processors. The evaluation is based on our C++ implementation.
+
+We first evaluate the computation efficiency. As discussed in Section 3.2, layer sampling based training methods such as [7] suffer from “neighbor explosion”. Therefore, on deep models, there may be significant amount of redundant computation across training iterations. Recall that we analyze the per epoch computation complexity in Section 3.2, under the two cases of large and small batch sizes respectively. Fig. 7 shows the severity of “neighbor explosion” by visualizing the number of sampled nodes per GNN layer for the two training methods. Denote  as number of graph convolution layers. The minibatch sampling of [7] proceeds as follows. [7] first randomly pick the  number of root nodes from the output of the last graph convolution layer (i.e., layer-). Then, to generate the layer  samples, it randomly pick 
+ neighbors of each layer  sampled nodes. [7] completes the minibatch construction when it has finished picking the input nodes of layer . Following the recommended setting of [7], we set , 
+ and 
+ for . Regarding our proposed training algorithm, since the sampling is performed on the training graph rather than the GNN, all layers have the same 
+ number of nodes. Fig. 7 shows the number of unique sampled nodes per layer for the two training methods. When the GNN model is deep, [7] requires orders of magnitude more samples than our training method. In addition, the number of sampled nodes of [7] eventually converges to the full graph size  when the GNN depth is high. In summary, Fig. 7 empirically verifies the complexity analysis in Section 3.2 and shows the advantage in high training efficiency of our method.
+
+
+Download : Download high-res image (125KB)
+Download : Download full-size image
+Fig. 7. Comparison on the number of sampled nodes per GNN layer..
+
+We further compare the overall training time for deep GNN models. As shown in Fig. 8, we increase the GNN depth from  to , and set the sampling parameters as described in the above paragraph. Execution of both training methods uses all the 40 processing cores. We do not consider the difference in convergence rate and thus only measures the per-iteration execution time. We normalize the training time by setting the 1-layer GNN execution time as 1. When , the implementation of [7] results in prohibitively high training cost on PPI and Reddit, and throws runtime error on Yelp and Amazon. On the other hand, the training time of our method scales almost linearly with respect to the model depth. We conclude that our minibatch training algorithm, together with the parallelization and scheduling techniques, significantly facilitate the development and deployment of deeper GNN models.
+
+
+Download : Download high-res image (107KB)
+Download : Download full-size image
+Fig. 8. Comparison of training time on deep GNN models..
+
+8. Discussion
+This work proposed co-design of the GNN minibatch training algorithm and the corresponding parallelization strategy. We next discuss potential extensions to our parallel training algorithm.
+
+Hardware acceleration.
+Our minibatch training algorithm can be used to facilitate hardware accelerator design as well. Apart from higher computation efficiency, another benefit of constructing minibatches by subgraphs is the reduction in communication cost. Suppose we use a resource-constrained hardware accelerator (e.g., FPGA) to speedup GNN training. We can sample small subgraphs so that the features of the subgraph nodes fit in the on-chip memory (whose typical size is tens of mega bits). Each iteration, once the input node features of the subgraph is transferred on-chip, the FPGA can perform the full forward and backward propagation without any communication to the external DDR memory. Therefore, we potentially achieve close-to-peak computation performance on the FPGA. The work in [29] has developed a high-performance accelerator on the CPU-FPGA heterogeneous platform using our graph sampling based training algorithm. They quantify the feasibility of implementing the various training algorithms [4], [6], [7], [9] on hardware by a metric called computation–communication ratio , where higher value of  indicates lower overhead in external memory communication. They further show that our algorithm achieves significantly higher  than the other methods [4], [6], [7], [9].
+
+Distributed processing.
+The graph sampling based minibatch training is suitable to be executed in the distributed environment. After partitioning the training graph in distributed memory, each processing node can perform graph sampling independently on the local partition. Afterwards, forward and backward propagation can be executed without data access to the remote memory. In order to ensure convergence quality, shuffling of the node and edge data is required during the training. The optimal shuffling probability may then be derived given the graph sampling algorithm and the connectivity among the processing nodes. It is worth noticing that on each processing node, we can still locally speedup the forward and backward layer computation by designing hardware accelerators or using the parallelization strategy shown in this paper.
+
+9. Conclusion and future work
+We presented an accurate, efficient and scalable GNN training method. Considering the redundant computation incurred in state-of-the-art GNN training, we proposed a graph sampling-based minibatch algorithm which ensures accuracy and efficiency by resolving the “neighbor explosion” challenge. We further proposed parallelization techniques and a runtime scheduler to scale the graph sampling and overall training to large number of processors.
+
+We will extend our graph sampling based training by integrating other graph sampling algorithms and evaluating their impact on learning accuracy. We will also work on the theoretical foundation to understand the convergence property of the graph sampling based minibatch training.

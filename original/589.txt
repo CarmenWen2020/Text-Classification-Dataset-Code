@@ -1,0 +1,302 @@
+Abstract
+In large-scale data-parallel analytics, shuffle, namely the cross-network read and the aggregation of partitioned data between tasks with data dependencies, usually bring in large overhead. To reduce shuffle overhead, we present SCache, an open-source plug-in system that particularly focuses on shuffle optimization. SCache adopts heuristic pre-scheduling combining with shuffle size prediction to pre-fetch shuffle data and balance load on each node. Meanwhile, SCache takes full advantage of the system memory to accelerate the shuffle process. We also propose a new performance model called Framework Resources Quantification (FRQ) model to analyze DAG frameworks and evaluate the SCache shuffle optimization. The FRQ model quantifies the utilization of resources and predicts the execution time of each phase of DAG jobs. We have implemented SCache on both Spark and Hadoop MapReduce. The performance of SCache has been evaluated with both simulations and testbed experiments on a 50-node Amazon EC2 cluster. Those evaluations have demonstrated that, by incorporating SCache, the shuffle overhead of Spark can be reduced by nearly 89%, and the overall completion time of TPC-DS queries improves 40% on average. On Apache Hadoop MapReduce, SCache optimizes end-to-end Terasort completion time by 15%.
+
+Previous
+Next 
+Keywords
+Distributed DAG frameworks
+
+Shuffle
+
+Optimization
+
+Performance model
+
+1. Introduction
+We are in an era of data explosion — 2.5 quintillion bytes of data are created every day according to IBM’s report.1 In industry 4.0, an increasing number of IoT sensors are embedded in the industrial production line [26]. During the manufacturing process, the information about the assembly lines, stations, and machines is continuously generated and collected. Using distributed computing frameworks to analyze industrial big data is an inevitable trend [27].
+
+According to a cross-industry study [5], both industrial and traditional big data share a characteristic during analytical processing — a small fraction of the daily workload uses well over 90% of the cluster’s resources, and these workloads often contain a huge shuffle size. According to another MapReduce trace analysis from Facebook, the shuffle phase accounts for 33% of the job completion time on average, and up to 70% in shuffle-heavy jobs [11]. The shuffle phase is crucial and heavily affecting the end-to-end application performance. Most of the popular frameworks define jobs as directed acyclic graphs (DAGs), such as map-reduce pipeline in Hadoop MapReduce,2 RDDs in Spark,3 vertices in Dryad [23], etc. Shuffle phase is always essential as communication between successive computation stages.
+
+Although continuous efforts of performance optimization have been made among a variety of computing frameworks [2], [3], [6], [9], [18], [28], [35], [43], the shuffle phase is often poorly optimized in practice. One of the major deficiencies of the shuffle phase is lacking coordinated management among different system resources [16]. As Fig. 1 shows, the shuffle write is responsible for writing intermediate results to disk. And the shuffle read fetches intermediate results from remote disks through the network. Once scheduled, a fixed bundle of resources (i.e., CPU, memory, disk, and network) named slot is assigned to a task, and slots are released only after the task finishes. Such task aggregation together with the coupled scheduling effectively simplifies task management. However, attaching the I/O intensive shuffle phase to the CPU/memory intensive computation phase results in a poor multiplexing between computational and I/O resources. Moreover, since the shuffle read phase starts fetching data only after the corresponding reduce task starts, all the corresponding reduce tasks start fetching shuffle data almost simultaneously. Such synchronized network communication causes a burst demand for network I/O, which in turn greatly enlarges the shuffle read completion time.
+
+To optimize the data shuffling without significantly changing DAG frameworks, we propose S(huffle)Cache, an open source4 plug-in system for different DAG computing frameworks. Specifically, SCache takes over the whole shuffle phase from the underlying framework. The workflow of a DAG framework with SCache is presented in Fig. 1. SCache replaces the disk operations of shuffle write by the memory copy in map tasks and pre-fetches the shuffle data. SCache’s effectiveness lies in the following two key ideas. First, SCache decouples the shuffle write and read from both map and reduce tasks. Such decoupling effectively enables more flexible resource management and better multiplexing between the computational and I/O resources. Second, SCache pre-schedules the reduce tasks without launching them and pre-fetches the shuffle data. Such pre-scheduling and pre-fetching effectively overlap the network transfer time, desynchronize the network communication, and avoid the extra early allocation of slots.
+
+
+Download : Download high-res image (251KB)
+Download : Download full-size image
+Fig. 1. Workflow comparison between Legacy DAG computing frameworks and frameworks with SCache.
+
+We evaluate SCache on a 50-node Amazon EC2 cluster on both Spark and Hadoop MapReduce. In a nutshell, SCache can eliminate explicit shuffle time by at most 89% in varied applications. More impressively, SCache reduces  of overall completion time of TPC-DS,5 a standardized industry benchmark, on average on Apache Spark. On Apache Hadoop MapReduce, SCache also optimizes end-to-end Terasort completion time by 15%.
+
+The rest of the paper is organized as follows: We present the methodologies of optimization which using by SCache in Section 3 and detail the implementation of SCache in Section 4. We introduce the FRQ performance model in Section 5. In Section 6, we present comprehensive evaluations about SCache and the FRQ model. We also discuss the related work in Section 7 and conclude in Section 8.
+
+2. Background and observations
+In large scale data parallel computing, shuffle is designed to achieve an all-to-all data transfer among nodes. For a clear illustration, we use map tasks to define the tasks that produce shuffle data and use reduce tasks to define the tasks that consume shuffle data.
+
+Overview of shuffle process. Each map task partitions the result data (key, value pair) into several buckets according to the partition function (e.g., hash). The total number of buckets equals the number of reduce tasks in the successive step. The shuffle process can be further split into two parts: shuffle write and shuffle read. Shuffle write starts at the end of a map task and writes the partitioned map output data to local persistent storage. Shuffle read starts at the beginning of a reduce task and fetches the partitioned data from remote as its input.
+
+Impact of shuffle process. Shuffle is I/O intensive, which might introduce a significant latency to the application. Reports show that 60% of MapReduce jobs at Yahoo! and 20% at Facebook are shuffle-heavy workloads [1]. For those shuffle-heavy jobs, the shuffle latency may even dominate Job Completion Time (JCT). For instance, a MapReduce trace analysis from Facebook shows that shuffle accounts for 33% JCT on average, up to 70% in shuffle-heavy jobs [11].
+
+2.1. Observations
+We ran some typical Spark applications on a 5-node m4.xlarge EC2 cluster and analyzed the design and implementation of shuffle in some DAG frameworks. Here we present the hardware utilization trace of one node running Spark’s GroupByTest. This job has 2 rounds of tasks for each node. The Map Execution is marked from the launch time of the first map task to the execution end time of the last one. The Shuffle Write is marked from the beginning of the first shuffle write in the map stage. The Shuffle Read and Reduce Execution is marked from the launch time of the first reduce task.
+
+2.1.1. Coarse granularity resource allocation
+When a slot is assigned to a task, it will not be released until the task completes. On the reduce side, the network transfer of shuffle data introduces an explicit I/O delay during shuffle read. Meanwhile, both shuffle write and shuffle read occupy the slot without significantly involving CPU. The current coarse slot-task mapping results in an imbalance between task’s resource demand and slot allocation thus decreasing the resource utilization. Unfortunately this defect exists not only in Spark [45] but also Hadoop MapReduce and Apache Tez [37]. A finer granularity resource allocation scheme should be provided to reduce these delays.
+
+2.1.2. Synchronized shuffle read
+Almost all reduce tasks start shuffle read simultaneously. The synchronized shuffle read requests cause a burst of network traffic. The data transfer causes a high demand of network bandwidth, which may result in network congestion and further slow down the network transfer. It also happens in other frameworks that follow Bulk Synchronous Parallel (BSP) paradigm, such as Hadoop MapReduce, Dryad [23], etc.
+
+2.1.3. Inefficient persistent storage operation
+At first, both shuffle write and read are tightly coupled with task execution, which results in a blocking I/O operation. This blocking I/O operation along with synchronized shuffle read may introduce significant latency, especially in an I/O performance bounded cluster. Besides, the legacy of storing shuffle data on disk is inefficient in modern clusters with large memory. Compared to input dataset, the size of shuffle data is relatively small. For example, the shuffle size of Spark Terasort is less than 25% of input data. The data reported in [32] also show that the amount of data shuffled is less than the input data by as much as . On the other hand, memory based distributed storage systems have been proposed [15], [28], [31] to move data back to memory, but most of the DAG frameworks still store shuffle data on disks (e.g., Spark [45], Hadoop MapReduce, Dryad [23], etc.). We argue that the memory capacity is large enough to store the short-living shuffle data with cautious management.
+
+To mitigate the shuffle overhead, we propose an optimization that starts shuffle read ahead of reduce stage to overlap the I/O operations in multi-round map tasks, and uses memory to store the shuffle data. To achieve this optimization:
+
+•
+Shuffle process should be decoupled from task execution to achieve a fine granularity scheduling scheme.
+
+•
+Reduce tasks should be pre-scheduled without launching to achieve shuffle data pre-fetching.
+
+3. Shuffle optimization
+This section presents detailed methodologies to achieve shuffle optimization. Firstly, we discuss the reason causes shuffle overhead in the DAG frameworks. In the following subsection, we propose a shuffle data management system to decouple shuffle from execution. And we propose the pre-scheduling and pre-fetching to hide shuffle overhead in multi-round map tasks. Furthermore, two heuristic algorithms (Algorithms 1, 2) are used to improve the accuracy of prediction in the pre-scheduling.
+
+3.1. Decouple shuffle from execution
+To decouple the shuffle from reduce tasks, we propose a shuffle data management system called SCache to take over all shuffle data from the DAG frameworks. SCache provides two APIs named  and  to manage the shuffle data. On the map side, after shuffle data blocks are produced, the map task uses  to transfer the data blocks to SCache. Inside the , SCache uses memory copy to move the shuffle data blocks to SCache’s reserved memory and release the slot immediately. After getting the shuffle data, SCache starts to shuffling data immediately. On the reduce side, due to the shuffle data pre-fetching of SCache, the reduce task use  to get the shuffle data from SCache.
+
+SCache caches the shuffle data on the memory instead of storing on disk like Spark or Hadoop MapReduce. In this aspect, SCache optimizes the time of shuffle read and shuffle write since memory gets better I/O performance.
+
+3.2. Pre-scheduling and pre-fetching shuffle data
+The pre-scheduling and pre-fetching are the most critical aspects of the optimization. SCache starts pre-fetching and hides shuffle overhead into multi-round map tasks. However, the shuffle data cannot be pre-fetched without the awareness of task-node mapping.
+
+To optimize shuffle phase, we propose a co-scheduling scheme with two heuristic algorithms (Algorithms 1, 2). The DAG frameworks follow the co-scheduler to start reduce tasks.
+
+3.2.1. Shuffle output prediction
+The simplest way of pre-scheduling is mapping tasks to nodes randomly and evenly. But without considering job context, the random mapping scheduling shows poor performance due to data skew and ignoring data locality. For the most DAG applications with random large scale input, the shuffle output can be predicted accurately by a linear regression model based on the observation that the ratio of map output size and input size are invariant given the same job configuration [17]. However, the linear regression model can fail in some scenarios. For example, some customized partitions may cause large inconsistency between observed map output distribution and the final reduce input distribution. To illustrate the case, we present a particular spark job which uses the Spark RangePartitioner in Fig. 2(a). The observed map outputs are picked randomly. The job uses the Spark RangePartitioner and introduces an extremely high data skew. Due to the extremely high data skew introduced by the partition, the linear regression model cannot fit the result well. That is, for one reduce task, almost all of the input data are produced by a particular map task (e.g., the observed map tasks only produce data for reduce task 0–5 in Fig. 2(a)). The data locality skew results in a missing of other reduce tasks’ data in the observed map outputs.
+
+To solve this problem, we propose a new methodology named weighted reservoir sampling. SCache uses this method instead of the linear regression to predict output when using a RangePartitioner or a customized non-hash partitioner. For each map task, we use classic reservoir sampling to randomly pick  of samples, where  is the number of reduce tasks and  is a tunable parameter. After that, the map function is called locally to process the sampled data. Finally, the partitioned outputs are collected with the 
+ as the weight of the samples. The 
+ is the input size of th map task. 
+ represents the size of block which is produced by map 
+ for reduce 
+: (1)
+ 
+
+It can be discovered that as the increase of parameter , more samples are included in the sampling, that is, the result of sampling is more accurate. Based on our experiment, we discover that when  is set to , the result of sampling prediction is the best and much better than linear regression, as shown in Fig. 2(a). Fig. 2(b) further proves that the sampling prediction can provide a much more accurate result than the linear regression.
+
+During both predictions, the composition of each reduce partition is calculated as well. We define 
+ as (2)
+ 
+ 
+The 
+ represents the size of a reduce task, which is represented by 
+. We use 
+ to achieve a better data locality while performing shuffle pre-scheduling.
+
+3.2.2. Heuristic MinHeap scheduling
+To balance load while minimizing the network traffic, we present the Heuristic MinHeap Scheduling algorithm (Algorithm 1). To keep the pre-scheduling load balance, we maintain a min-heap in the first  loop (i.e., lines 6–11). We use the min-heap to simulate the load of each node and apply the longest processing time rule (LPT)6 to achieve  optimum. Spark FIFO only can achieve  optimum. After pre-scheduling, the task-node mapping will be adjusted according to the locality. The  will be triggered when the  of a task does not equal the . Based on the , the normalized probability  is calculated as a bound of performance degradation. Inside the , tasks will be selected and swapped without exceeding the . Since the algorithm only maintains a min-heap and traverses  for swapping, the algorithm needs  operations.
+
+To evaluate Heuristic MinHeap Scheduling algorithm, we use traces from OpenCloud7 for the simulation. As shown in Fig. 3, we run the simulation under three scheduling schemes: Random Mapping, Spark FIFO, and heuristic MinHeap. After balancing load based on the job context (e.g. shuffle size, data locality), Heuristic MinHeap Scheduling has a better improvement (average 5.7%) than Spark (average 2.7%) and Random Mapping.
+
+
+Download : Download high-res image (263KB)
+Download : Download full-size image
+3.2.3. Cope with multiple shuffle dependencies
+A reduce stage can have more than one shuffle dependency in the current DAG computing frameworks. To cope with multiple shuffle dependencies, we present the Accumulated Heuristic Scheduling algorithm.
+
+As illustrated in Algorithm 2, the sizes of previous shuffles scheduled by Heuristic MinHeap Scheduling are counted. When a new shuffle starts, the predicted , , and  in  are accumulated with previous shuffles. After scheduling, if the new  of a reduce task is not equal the original one, a re-shuffle will be triggered to transfer data to the new host. This re-shuffle is rare since the previous shuffle data contributes a huge composition (i.e., high ) after the accumulation, which leads to a higher probability of tasks swap in .
+
+To traverse  for accumulating previous  and re-shuffling data, the algorithm needs  operations.
+
+
+Download : Download high-res image (202KB)
+Download : Download full-size image
+4. Implementation
+This section presents an overview of the implementation of SCache. We first present the system overview and the details of sampling in Section 4.1. 4.2 subsection focuses on two constraints on memory management. In Section 4.3, we discuss the fault tolerance of the system.
+
+4.1. System overview
+As shown in Fig. 4, SCache consists of three components: a distributed shuffle data management system, a DAG co-scheduler, and a worker daemon. As a plug-in system, SCache needs to rely on a DAG framework. The master node of SCache includes a DAG co-scheduler and a storage manager. The DAG co-scheduler is responsible for pre-scheduling the reduce tasks assignment and then forcing the DAG framework to assign reduce tasks according to this assignment. The storage manager is used for managing the shuffle blocks saved in worker nodes.
+
+When a DAG job is submitted, the DAG information is generated in the framework task scheduler. If the RangePartitioner or a customized non-hash partitioner is used, SCache will insert an extra sampling job before the job starts. The sampling job uses a reservoir sampling algorithm [42] on each partition to gather the sample data. SCache master predicts the reduce partition size based on the data and then calls Algorithm 1 or 2 to do the pre-scheduling.
+
+After a map task finishes computing, the shuffle writes in the map task are modified to use SCache API to memory copy all shuffle blocks to the SCache worker reserved memory. The SCache records the block ID and the size and sends them to the master. If the collected shuffle blocks reach a threshold, which is defined by the memory usage, the SCache co-scheduler will run the scheduling Algorithm 1 or 2 to pre-schedule the reduce tasks. The lower the threshold is set, the more shuffle requests are issued since the amount of data to be shuffled remains the same. After pre-scheduling, SCache workers start pre-fetching shuffle blocks according to the assignment from the master. To enforce the DAG framework to assign tasks according to the SCache pre-scheduled results, we also insert some lines of codes in the framework scheduler.
+
+4.2. Memory management
+SCache uses memory management described below to ensure performance. If the reserved memory is running out, SCache will flush some of the blocks into the disk temporarily and then re-fetch them if needed. SCache leverages two constraints to manage the shuffle blocks: all-or-nothing and context-aware-priority.
+
+4.2.1. All-or-nothing constraint
+As discussed in the observation in Section 2.1, it is common to have multi-round execution of each stage. If one of the tasks in a round missed a memory cache, the re-fetch overhead will become a bottleneck and then slow down the whole stage. PACMan [2] has also proved that for multi-round stage/job, the completion time improves in steps when  of tasks have data cached simultaneously. Therefore, SCache master sets blocks of one round as the minimum unit of storage management. We refer to this as the all-or-nothing constraint.
+
+4.2.2. Context-aware-priority constraint
+SCache leverages application context to select victim storage units when the reserved memory is full. At first, SCache flushes blocks of the incomplete units to disk cluster-widely. SCache master follows the scheduling scheme of Spark to determine the inter-shuffle priority. For example, Spark FIFO scheduler schedules the tasks of different stages according to the submission order. If all the units are completed, SCache selects victims (i.e., tasks with lower priority) based on two factors: (a) For the tasks in the different stages, SCache sets the lower priority to storage units with an earlier submission time; (b) For the tasks in the same stage, SCache sets the lower priority to storage units with a smaller task ID.
+
+4.3. Discussion of fault tolerance
+For fault tolerance, SCache restarts failed workers without recovering their data currently. If a failure happens in a SCache worker during shuffle phases, SCache daemon can block the shuffle write/read operations until the worker process restarts without violating the correctness of the DAG computing. During the re-computing, the DAG frameworks can still use SCache to gain benefits in the shuffle phase.
+
+Although the entire computing task has to be re-computed, we consider that there is a trade-off between the efficiency of fault recovery and the performance benefits gain from SCache. SCache brings significant benefits due to the in-memory shuffle management, although the overhead such as re-computing is also introduced when failure occurs, such drawback is tolerable.
+
+In the current design of SCache, we leave the server faults (e.g., node failures) to the DAG frameworks, due to the characteristic of shuffle data (e.g., short-lived, write-once, read-once). We believe this way is more promising since most DAG frameworks have more advanced fast recovery schemes on the application layer, such as the paralleled recovery of Spark.
+
+To ensure an efficient fault tolerance mechanism, we can introduce some fault recovery strategies, such as using a backup mechanism (i.e., storing the backup of processed data on the disk before pre-shuffling the same as mentioned in Magnet [39]) to mitigate the overhead of fault recovery, which may introduce some drawback to resource utilization in I/O resources. Another possible solution is to use checkpoint mechanism between a certain interval by storing necessary metadata as used in Apache Flink [4]. Presto [38] also stores intermediate data in memory to mitigate latency. They run clusters in different availability modes depending on the use case and adjust the available nodes according to the failures in production environment. On the other hand, they point out that fault tolerance mechanisms including checkpointing and replications can consume significant resources. The introduction of these strategies can be our future work.
+
+5. Framework resources quantification model
+In this section, we introduce Framework Resources Quantification (FRQ) model to evaluate the performance of DAG frameworks. The FRQ model is able to predict the execution time required by the application under most circumstances, including different DAG frameworks, hardware environments, etc. We first introduce the FRQ model in Section 5.1. In Section 5.2, we use the FRQ model to describe different computation jobs and discuss their performance.
+
+5.1. The FRQ model
+We propose the FRQ model to better analyze the relationship between the computation phase and the shuffle phase in the DAG computing. The FRQ model focuses on describing the shuffle overhead which is significantly affected by the scheduling strategy. After quantifying computing and I/O resources, we use the FRQ model to evaluate different resource scheduling strategies.
+
+As Fig. 5 shows, the FRQ model divides the job into three phases: map, shuffle, and reduce. The horizontal axis represents time and the vertical axis represents different phases. Firstly, we introduce five input parameters of the FRQ model:
+
+•
+Input Data Size : The Input data size of the job.
+
+•
+Data Conversion Rate : The conversion rate of the input data to the shuffle data during a computation phase.
+
+•
+Computation Round Number : The number of rounds needed to complete the computation phase. These rounds depend on the current computation resources and the configuration of the framework. Take Hadoop MapReduce as an example. Suppose we have a cluster with 50 CPUs and enough memory (i.e., sufficient for the input data and the run-time memory of the frameworks), the map phase consists of 200 map tasks, and each map requires 1 CPU. Then we need 4 rounds of computation to complete the map phase.
+
+•
+Computation Speed 
+: The computation speed for each computation phase.
+
+•
+Shuffle Speed 
+: Transmission speed in the shuffle phase.
+
+The FRQ model calculates the execution time of each phase of the job with these five parameters. The total execution time of a job is the sum of the map phase time and reduce phase time: (3)
+
+The formulas of map phase time and shuffle phase time are as follows: (4)
+ 
+ 
+
+ is defined as the penalty time of fault recovery, which depends on the fault tolerance mechanism of the frameworks. With SCache, since the intermediate data is stored in memory, when fault occurs the entire computing task need to be re-computed from the beginning.
+
+The reduce phase time formula is as follows: (5)
+ 
+
+ 
+ represents the ideal computation time of a reduce phase, and (
+) represents the computing overhead. 
+ represents the overlap time between the shuffle phase and the reduce phase as shown in Fig. 5. 
+ represents the total time of the shuffle phase.  is an empirical value which represents the overhead caused by shuffle waiting. Because the computation of the reduce phase relies on the results of data transferring of the shuffle phase, a portion of the computation needs to wait for the results of transferring. This waiting causes the overhead.
+
+According to Eqs. (3), (5), we can optimize the job completion time by reducing 
+. By using different resource scheduling strategies, the formulas of 
+ are different. In the next subsection, we show the formulas and discuss the performance of different strategies.
+
+5.2. Different scheduling strategies on the FRQ model
+Fig. 6 shows a scheduling strategy which is used by Hadoop MapReduce. In this scheduling strategy, shuffle phase and reduce phase start at the same time. In this case, 
+ is equal to 
+. Due to the increase in 
+, the time of reduce phase increases (according to Eq. (5)). Because the shuffle phase and the computation phase are executed in parallel, the total execution time of a job is the sum of 
+ and 
+ (see Eq. (3)). The execution time of the shuffle phase is hidden in the reduce phase.
+
+Fig. 5, Fig. 7 show the scheduling strategy for Hadoop MapReduce with SCache (Suppose N is 4). SCache also overlaps the shuffle phase and the map phases by starting pre-fetching and pre-scheduling in the map phase. This scheduling strategy avoids the I/O resource being idle in the map phase. According to the design of SCache pre-fetching, we found that using the FRQ model to describe the scheduling strategy of SCache needs to distinguish two situations:
+
+1.
+ (Fig. 5)
+
+The meaning of the inequality is that the speed of generating shuffle data (
+) is greater than or equal to the shuffle speed (
+). In this situation, the shuffle phase is uninterrupted. The I/O resource will be fully utilized during the whole shuffle phase. As a result, the formula of 
+ is as followed: (6)
+ 
+
+2.
+ (Fig. 7)
+
+When the shuffle speed (
+) is faster, SCache needs to wait for shuffle data to be generated. As Fig. 7 shows, the shuffle phase will be interrupted in each round. In this case, the formula of 
+ is as followed: (7)
+ 
+
+Compared to the original Hadoop MapReduce resource scheduling strategy, Hadoop MapReduce with SCache shortens 
+ and thus shortens 
+. This is how pre-fetching optimizes the total execution time of a job.
+
+6. Evaluation
+This section reveals a representative evaluation of SCache performance on both Spark and Hadoop MapReduce. In industrial big data, SQL-based big data technologies are widely used in these systems, such as data mining, predictive analytics, text analytics, and statistical analysis [33].
+
+We first evaluate SCache with TPC-DS.8 to prove the performance gain of SCache in industry TPC-DS is a standard benchmark which focuses on modeling industrial workload. Then we use a recognized shuffle intensive benchmark Terasort [21] to evaluate SCache with different data partition schemes. In summary, SCache decreases  89% time of Spark shuffle and improves  40% of the overall completion time of TPC-DS on average. Meanwhile, Hadoop MapReduce with SCache optimizes job completion time by up to 15% and an average of 13%. We performed the experiments for about three to five times each variously, which ensured the accuracy of the evaluation.
+
+6.1. Setup
+We use Spark version 1.6.2 and Hadoop MapReduce version 2.8.5. The shuffle configuration of Spark is set to the default.9 We run the experiments on a 50-node m4.xlarge cluster on Amazon EC2. Each node has 16 GB memory and 4 CPUs. The network bandwidth of each node is about 300 Mbps.
+
+6.2. Spark with scache
+6.2.1. Simple DAG analysis
+We first run Spark’s GroupByTest on Amazon EC2. This job has 2 rounds of tasks for each node. As shown in Fig. 8, the hardware utilization is captured from one node during the job. Note that since the completion time of the job with SCache is about 50% less than Spark without SCache, the duration of Fig. 8(b) is only half of Fig. 8(a). As shown in Fig. 8(a), the network transfer of shuffle data introduces an explicit I/O delay during shuffle read. And the several bursts of network traffic in shuffle read result in network congestion. As shown in Fig. 8(b), an overlap among CPU, disk, and network can be easily observed. It is because the decoupling of shuffle prevents the computing resource from being blocked by I/O operations. On the one hand, the decoupling of shuffle write helps free the slot earlier, so that it can be re-scheduled to a new map task. On the other hand, with the help of shuffle pre-fetching, the decoupling of shuffle read significantly decreases the CPU idle time at the beginning of a reduce task. At the same time, SCache manages the hardware resources to store and transfer shuffle data without interrupting the computing process. As a result, the utilization and multiplexing of hardware resource are increased, thus improving the performance of Spark.
+
+In the map stage, the disk operations are replaced by the memory copies to decouple the shuffle write. It helps eliminate 40% of shuffle write time (Fig. 10(a)), which leads to a 10% improvement of map stage completion time in Fig. 9(a). Note that the shuffle write time can be observed even with the optimization of SCache. The reason is that before moving data out of Spark’s JVM, the serialization is inevitable and CPU intensive [32].
+
+
+Download : Download high-res image (552KB)
+Download : Download full-size image
+Fig. 11. TPC-DS Benchmark evaluation.
+
+In the reduce stage, most of the shuffle overhead is introduced by network transfer delay. By doing shuffle data pre-fetching, the explicit network transfer is perfectly overlapped in the map stage. With the help of the co-scheduling scheme, SCache guarantees that each reduce task has the benefit of shuffle pre-fetching. As a result, the combination of these optimizations decreases  100% overhead of the shuffle read in a reduce task (Fig. 10(b)). In addition, the heuristic algorithm can achieve a balanced pre-scheduling result, thus providing  80% improvement in reduce stage completion time (Fig. 9(b)).
+
+Overall, SCache can help Spark decrease by  89% overhead of the whole shuffle process.
+
+6.2.2. Industrial production workload
+We also evaluate some queries from TPC-DS.10 TPC-DS benchmark is designed for modeling multiple users submitting varied queries (e.g. ad hoc, interactive OLAP, data mining, etc.). TPC-DS contains 99 queries and is considered as the standardized industry benchmark for testing big data systems. As shown in Fig. 11, the horizontal axis is query name and the vertical axis is query completion time. Note that we skip some queries due to compatible issues. Spark with SCache outperforms the original Spark in almost all tested queries. Furthermore, in some shuffle-heavy queries, Spark with SCache outperforms original Spark by an order of magnitude. It is because those queries contain shuffle-heavy operations such as groupby, union, etc. The overall reduction portion of query time that SCache achieved is 40% on average. Since this evaluation presents the overall job completion time of queries, we believe that our shuffle optimization is promising.
+
+
+Table 1. Hadoop MapReduce on 4 nodes cluster in the FRQ model.
+
+SCache	32 GB	1	4	0.65 GB/s	1 GB/s	0.47 GB/s	0.5	49.23	68.09 s	31.16 s	47.58 s	96.81 s	104 s	6.91%
+48 GB	1	6	0.65 GB/s	1 GB/s	0.47 GB/s	0.5	73.85	102.13 s	40.59 s	68.29 s	142.14 s	151 s	5.87%
+64 GB	1	8	0.65 GB/s	1 GB/s	0.47 GB/s	0.5	98.46	136.17 s	50.02 s	89.01 s	187.47 s	193 s	2.87%
+Legacy	32 GB	1	4	0.65 GB/s	1 GB/s	0.47 GB/s	0.6	49.23 s	68.09 s	68.09 s	72.85 s	122.08 s	135 s	9.57%
+48 GB	1	6	0.65 GB/s	1 GB/s	0.47 GB/s	0.6	73.85 s	102.13 s	102.13 s	109.28 s	183.12 s	188 s	2.59%
+64 GB	1	8	0.65 GB/s	1 GB/s	0.47 GB/s	0.6	98.46 s	136.17 s	136.17 s	145.70 s	244.16 s	249 s	1.94%
+
+Table 2. Hadoop MapReduce on 50 AWS m4.xlarge nodes cluster in the FRQ model.
+
+SCache	128 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.5	111.30	91.43	18.29	96.81	208.12	232	10.29%
+256 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.5	222.61	182.86	36.57	193.63	416.24	432	3.65%
+384 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.5	333.91	274.29	54.86	290.44	624.36	685	8.85%
+Legacy	128 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.6	111.30 s	91.43 s	91.43 s	142.53 s	253.83 s	266 s	4.57%
+256 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.6	222.61 s	182.86 s	182.86 s	285.06 s	507.67 s	524 s	3.12%
+384 GB	1	5	1.15 GB/s	1.46 GB/s	1.4 GB/s	0.6	333.91 s	274.29 s	274.29 s	427.59 s	761.50 s	776 s	1.87%
+
+Download : Download high-res image (366KB)
+Download : Download full-size image
+Fig. 12. CPU utilization and I/O throughput of a node during a Hadoop MapReduce Terasort job.
+
+6.3. Hadoop MapReduce with SCache
+Unlike Spark, Hadoop MapReduce has only one Map and one Reduce phase. Such a simple workflow alleviates the defect of the naive scheduling schemes and reduces the benefits of pre-scheduling. However, SCache can still provide considerable optimization on shuffle-heavy workloads.
+
+We use Terasort [21] benchmark to evaluate the performance gain of SCache and also prove the cross-framework ability of SCache. Terasort consists of two consecutive shuffles. The first shuffle reads the input data and uses a hash partition function for re-partitioning. The second shuffle partitions the data through a Spark RangePartitioner.
+
+As shown in Fig. 12(b), Hadoop MapReduce without SCache starts shuffle and reduce simultaneously. The beginning part of reduce phase needs to wait for network transfer because a large amount of shuffle data reaches the network bottleneck. This causes the CPU resources to be idle. On the other hand, in Fig. 12(a), Hadoop MapReduce with SCache decouples shuffle from reduce and starts pre-fetching in the map phase. SCache utilizes the idle I/O throughput in the map phase. As shown in Fig. 13, after decoupling, Hadoop MapReduce with SCache optimizes Terasort overall completion time by up to 15% and an average of 13% with input data sizes from 128 GB to 512 GB.
+
+6.4. The FRQ model evaluation
+To evaluate the FRQ model, we run Terasort with Hadoop MapReduce with two different environments. The parameters , , , 
+, 
+, and 
+ are set according to the application and the environment. We set  to 0.5 and 0.6 since SCache alleviates the defect on the reduce phase. Table 1 shows the results in the in-house environment. While enabling SCache, Terasort satisfies the situation in Fig. 5 (
+). While without SCache, 
+ is equal to 
+ (see Eq. (4)). 
+ represents the actual experiment job times and  represents the error between 
+ and 
+. Table 2 shows the results in Amazon EC2. In this environment, Terasort on Hadoop MapReduce satisfies the situation in Fig. 7 (
+), thus the formula of 
+ is Eq. (7).
+
+As shown in Table 1 and 2, the experimental values are all larger than the calculated values. This is because the application has some extra overhead at runtime, such as network warm-up, the overhead of allocating slots, etc. This overhead will be amplified when the input data is small or the total execution time is short. Overall, the error between 
+ and 
+ is mainly below 10%, such errors are acceptable.
+
+7. Related work
+Modeling. Verma et al. [41] proposed the ARIA model to estimate the required resources based on the job information, the amount of input data and a specified soft deadline. Khan et al. [24] proposed the HP model which extends the ARIA model. The HP model adds scaling factors and uses a simple linear regression to estimate the job execution time on larger datasets. In [19], Herodotou proposed a detailed set of mathematical performance models for describing the five phases of a MapReduce job and combined them into an overall MapReduce job model. Chen et al. [7] proposed the CRESP model which is a cost model that estimates the performance of a job then provisions the resources for the job. Farshid Farhat et al. [14] proposed a closed-form queuing model which focuses on stragglers and tries to optimize them. However, the above models are not able to accurately describe the overhead caused by the shuffle process under different scheduling strategies.
+
+Industrial big data. More than 1000 Exabytes industrial data is annually generated by smart factories and the data is expected to increase 20-fold in the next ten years [44]. Nowadays, the real challenge of big data is not how to collect it, but how to manage it logically and efficiently [30]. Several distributed computing frameworks become efficient tools in industrial big data analysis [26], [29], [36].
+
+DAG Optimization. Slow-start from Hadoop MapReduce is a classic approach to handle shuffle overhead. Starfish [20] gets sampled data statistics for self-tuning system parameters (e.g. slow-start, etc.). DynMR [40] dynamically starts reduce tasks in late map stage. iShuffle [17] decouples shuffle from reducers and designs a centralized shuffle controller. But it can neither handle multiple shuffles nor schedule multiple rounds of reduce tasks. iHadoop [13] aggressively pre-schedules tasks in multiple successive stages to start fetching shuffle. In data skew mitigation, Skewtune [25] partitions the data dynamically. When a straggler task happens, it re-partitions the data and forces them to transfer to other nodes. LIBRA [8] proposes a new sampling method for DAG frameworks and uses an innovative approach, which supports the split of large keys, to balance the load among the reduce tasks. ToF [46] proposed a DAG optimization system to address the performance and monetary cost optimizations in the cloud. Different from these works, SCache pre-schedules multiple shuffles and uses pre-fetching to gain optimization without breaking load balancing.
+
+Network layer optimization. Varys [12] and Aalo [10] provide the network layer optimization for shuffle transfer. Though the efforts are limited throughout whole shuffle process, they can be easily applied on SCache to further improve the performance. According to [22], [34], we can also combine SDN with SCache to further improve the performance on the network later.
+
+8. Conclusion
+In this paper, we present SCache, a plug-in shuffle optimization for DAG computing frameworks. By task pre-scheduling and shuffle data pre-fetching with application context, SCache decouples the shuffle from computing tasks and mitigates the shuffle overhead. We also propose Framework Resources Quantification (FRQ) model to evaluate the shuffle process of DAG computing frameworks. The evaluations show that SCache can provide a promising speedup in industrial production workloads.

@@ -1,0 +1,501 @@
+This article presents a solution to path tracing of massive scenes on multiple GPUs. Our approach analyzes the memory access pattern of a path
+tracer and defines how the scene data should be distributed across up to
+16 GPUs with minimal effect on performance. The key concept is that the
+parts of the scene that have the highest amount of memory accesses are
+replicated on all GPUs.
+We propose two methods for maximizing the performance of path tracing when working with partially distributed scene data. Both methods
+work on the memory management level and therefore path tracer data
+structures do not have to be redesigned, making our approach applicable to other path tracers with only minor changes in their code. As a
+proof of concept, we have enhanced the open-source Blender Cycles path
+tracer.
+The approach was validated on scenes of sizes up to 169 GB. We show
+that only 1–5% of the scene data needs to be replicated to all machines
+for such large scenes. On smaller scenes we have verified that the performance is very close to rendering a fully replicated scene. In terms of
+scalability we have achieved a parallel efficiency of over 94% using up to
+16 GPUs.
+CCS Concepts: • Computing methodologies → Computer graphics;
+Ray tracing; Distributed algorithms;
+Additional Key Words and Phrases: Multi GPU path tracing, NVLink,
+CUDA unified memory, data distributed path tracing, distributed shared
+memory path tracing
+1 INTRODUCTION
+In this article, we present a solution for path tracing of massive scenes by combining the performance and, most importantly,
+memory of multiple GPUs. The proposed approach is applicable
+to production rendering. In recent years, the advances in GPU
+technology made GPU rendering popular for its superior speed
+over CPU rendering [Maxon 2019]. However, the significant drawback of GPUs when compared to CPUs is the limited memory size.
+This is one of the key reasons why CPUs still play a dominant
+role in production rendering as described by authors of the major rendering systems used in film production [Burley et al. 2018;
+Christensen et al. 2018; Fascione et al. 2018; Georgiev et al. 2018;
+Kulla et al. 2018]. For instance, Christensen et al. [2018] show that
+scenes from Pixar’s Coco movie were using up to 120 GB. Scenes
+of such sizes do not fit into the memory of a single GPU.
+Our main technical contribution is a solution to this problem that
+is based on replication of a small amount of scene data, between 1%
+and 5%, and well-chosen distribution of the rest of the data into the
+memory of several GPUs. Both replication and distribution of data
+is based on a memory access pattern analysis of a path tracer during a 1spp prepass. The data with the highest number of memory
+accesses are replicated and the rest is stored only in the memory of
+the GPU that had the highest number of accesses to it. This minimizes the penalty associated with reading data from the remote
+memory and is effective at providing near-linear scalability. To the
+best of our knowledge, this article presents the first work describing multi-GPU-based path tracing of massive scenes where a major
+part, up to 99%, of scene data is split up among the memories of up
+to 16 GPUs.
+Our second main contribution is the demonstration that our
+proposed approach works on a memory management level. This
+means that any path tracing code that supports GPU acceleration
+using CUDA can adopt our approach without redesigning its internal data structures. As a proof of concept, the proposed mechanism
+was implemented in the complex open-source Blender Cycles path
+tracing engine [Blender Foundation 2018].
+Our approach relies on two key technologies: (i) NVLink GPU
+interconnect, which enables multiple GPUs to efficiently share the
+content of their memories due to its high bandwidth and low latency, [Li et al. 2020] and (ii) CUDA Unified Memory (UM), which
+provides programmers with control over data placement across the
+memories of interconnected GPUs [Harris 2017].
+Today, in the professional computer graphics sector, only two
+GPUs can be connected using NVLink. However, in the world
+of High-performance Computing (HPC) NVLink is already used
+to interconnect up to 16 GPUs [NVIDIA 2018c] as in the case
+of NVIDIA DGX-2, which has 512 GB of shared GPU memory
+[NVIDIA 2019]. We expect that it is merely a matter of a few years
+before servers like this will be equipped with GPUs with hardware acceleration for path tracing such as Ray Tracing (RT) cores
+[NVIDIA 2018d].
+The article is organized as follows. Section 2 describes the state
+of the art in the field. Section 3 gives basic information about
+Blender Cycles and our modifications in the path tracer to support
+multi-GPU rendering. It also describes hardware platforms and
+scenes used for benchmarking. Section 4 describes the proposed
+methods together with analysis of the memory access patterns
+during the path tracing. This section also shows how different
+aspects of data management in memory affects the performance.
+Section 5 provides a performance and scalability evaluation on
+massive scenes. Finally, Section 6 provides a summary of the
+article and our future plans in this area.
+2 RELATED WORK
+The majority of film production rendering systems rely on path
+tracing. These systems almost exclusively use CPUs to deliver the
+final image [Burley et al. 2018; Christensen et al. 2018; Fascione
+et al. 2018; Georgiev et al. 2018; Kulla et al. 2018] as their scenes
+are too large to fit in the limited memory of a GPU. There are two
+possible solutions for the limited local memory: (i) out-of-core rendering and (ii) distributed or parallel rendering. We discuss both
+approaches, but more attention is given to the distributed rendering, since our proposed solution belongs to this area.
+2.1 Out-of-core Rendering
+The GPU accelerated rendering of large scenes is mostly handled
+using out-of-core techniques. Budge et al. [2009] presented an approach that dealt with out-of-core data management for heterogeneous architectures consisting of multiple CPU/GPU nodes. Son
+et al. [2017] addressed the problem of path tracing on various sets
+of device configurations. Their approach supported out-of-core
+rendering for heterogeneous clusters with CPU/GPU nodes and
+network interconnection.
+In terms of multi-GPU rendering, Zhou et al. [2009] presented a
+photorealistic rendering system that used an out-of-core approach
+for textures together with dynamic scheduling for efficient parallelization. As it implemented REYES rendering on GPUs [Cook
+et al. 1987] it mainly contributed to rasterization rather than path
+tracing. Pantaleoni et al. [2010] proposed a rendering system capable of fast lighting iterations over large scenes. It used an out-ofcore GPU ray tracing algorithm for the computation of directional
+occlusion and spherical integrals. Wang et al. [2013] suggested a
+GPU rendering framework that can handle massive scenes with
+out-of-core geometry and complex lighting. The solution was designed to use only one GPU and applied a many-lights method
+instead of path tracing.
+2.2 Distributed Rendering
+There is a large body of work on distributed rendering techniques
+for massive scenes on distributed memory systems. In the standard classification proposed by Molnar et al. [1994] these works
+fall into one of these categories: sort-first, which results in imagebased partitioning; sort middle, related to rasterization only; and
+sort-last, which uses scene data distribution.
+2.2.1 Image-Parallel Rendering. Sort-first methods are based
+on screen-partitioning, and the workload is distributed among processors or machines per blocks of pixels of a rendered image. In the
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.
+GPU Accelerated Path Tracing of Massive Scenes • 16:3
+most common (and also the most efficient) way the scene data is
+fully replicated in all local memories, and ray tracing is embarrassingly parallel. In the case of ray tracing complex scenes that
+do not fit into local memory, this approach results in on-demand
+scene data movement while rays remains fixed [Demarle et al.
+2005; Keller et al. 2017; Parker et al. 1998; Wald et al. 2003]. Our proposed solution is based on scene data communication while rays
+never leave the GPU they are created on.
+2.2.2 Data-Parallel Rendering. Sort-last methods, also called
+data-parallel, distribute the workload by subdividing the scene
+data. In the case of distributed ray tracing, these approaches transfer ray data among processors or machines, while scene data do
+not move after the initial distribution. Kato et al. [2001] used this
+approach for production rendering on a cluster of workstations.
+More recently this approach was used in the field of scientific visualizations of massive data sets from scientific simulations on supercomputers [Usher et al. 2019]. Navratil et al. (2014, 2012) proposed a hybrid (combination of image-parallel and data-parallel)
+approach for distributed memory supercomputers that used dynamic ray scheduling. The proposed dynamic solutions worked
+well, except in situations where ray communication costs exceeded
+data load costs such as in high-quality rendering at high resolution.
+2.3 Distributed Shared Memory Systems
+During the late 1990s Shared Memory Processors (SMP) with large
+amounts of Distributed Shared Memory (DSM) became commercially available [Protic et al. 1995]. In such machines, each processor has a local memory with caches, and a hardware or software
+layer transparently creates an illusion of global shared memory for
+applications [Protic et al. 1996]. As multiple processors read and
+write from/to one shared memory, the key problem is preserving
+a coherent view of shared data, which in practice is solved by various cache-coherent mechanisms [Hennessy et al. 1999].
+DSM systems exhibit Non-Uniform Memory Access (NUMA), as
+the latency to access remote data is considerably larger than the latency to access local data. On such machines, good data locality is
+therefore critical for high performance. There were several methods that improved data locality over basic cache coherency using
+replication/migration techniques as summarised in Soundararajan
+et al. [1998]. This is also the key concept of our proposed approach.
+In addition to data replication, the performance of DSM systems
+can also be improved by application-specific techniques to reduce
+memory bandwidth requirements. For ray tracing of incoherent
+rays, such a technique was proposed by Aila and Karras [2010].
+In the past large DSM systems such as SGI Origin 2000, KSR1,
+and Stanford DASH were used for ray tracing of large scenes, such
+as in Parker et al. [1999], Keates and Hubbold [1994], and Singh
+et al. [1994], respectively. In these works, authors used screen
+partitioning, but proposed different solutions to work distribution, load balancing, and synchronization in the case of interactive
+rendering.
+2.4 CUDA Unified Memory for Multi-GPU Systems
+NVIDIA’s Unified Memory (UM) [Harris 2017; Sakharnykh 2017b]
+manages communication between multiple GPUs and CPUs transparently by adopting DSM techniques. Alternative approaches
+have been also proposed [AlSaber and Kulkarni 2013; Gelado et al.
+2010a; Jablin et al. 2012a]. UM simplifies both out-of-core processing between GPUs and CPUs as well as multi-GPU processing,1
+and combinations of both. Previously, the applications focusing on
+large data processing on GPUs required algorithm-specific techniques for memory handling [Al-Saber and Kulkarni 2015; Gelado
+et al. 2010b; Huynh et al. 2012; Jablin et al. 2012b; Krizhevsky et al.
+2012; Sabne et al. 2013; Seo et al. 2015; Shamoto et al. 2015].
+In terms of HW technologies, NVlink interconnect is the key
+enabler of DSM multi-GPU systems. Li et al. [2020] provided
+thorough evaluation of several variants of NVLink interconnects
+against PCIe bus. Chien et al. [2020] evaluated the performance
+of advanced UM features such as prefetching and user controlled
+data placement [NVIDIA 2018a] on two different platforms, one
+with PCIe 3.0 interconnect between CPUs and GPUs and one with
+NVLink interconnect (based on Power9 CPU). A critical mechanism for UM is prefetching, page-eviction due to memory over
+subscription, and page migration between GPUs. The works of
+[Agarwal et al. 2015; Baruah et al. 2020; Ganguly et al. 2019, 2020;
+Young et al. 2018] proposed new algorithms to improve UM performance in the case of transparent memory management. In contrast, our approach controls the page placement and replication
+manually based on analysis of memory access patterns.
+Several works from the CG area use UM on multi-GPU systems.
+Christensen et al. [2017] efficiently used NVLink for image composition after distributed rendering on up to 8 GPUs. Kim et al. [2017]
+utilized multiple GPUs for scalable split frame rendering (SFR),
+which assigns disjoint regions of a frame to different GPUs. Finally, Xie et al. [2019] used multi-GPU system for rendering for
+Virtual Reality systems. They exploited the data locality of scene
+objects to reduce inter-GPU memory traffic.
+3 BLENDER CYCLES PATH TRACER
+Blender has a production renderer called Cycles. It is an unbiased
+renderer based on unidirectional path tracing that supports CPU
+and GPU rendering. For ray tracing acceleration it uses a Bounding
+Volume Hierarchy (BVH). The BVH code is based on an implementation by NVIDIA [Aila and Laine 2009; Aila et al. 2012] with some
+additional code adaptation from Embree [Wald et al. 2014].
+In terms of GPU rendering, Cycles supports CUDA, Optix, and
+OpenCL technology. CUDA and OpenCL implementations support
+the same features as a CPU one does, except for Open Shading Language (OSL) and Advanced Volume Light Sampling support. Optix support enables hardware acceleration of ray tracing on GPUs
+with RT cores, i.e., GPUs based on Turing architecture.
+3.1 Extensions for Multi-GPU Support
+In our previous work [Jaros et al. 2017], we extended the Cycles to
+support new parallel hardware architectures (e.g., Intel Xeon Phi
+co-processors and processors) and other HPC technologies (e.g.,
+distributed rendering using MPI). We build on this extended Cycles
+version, although none of these extensions is needed for the work
+presented here. The original Cycles version can be used directly,
+since our approach uses only rendering routines for x86 CPUs and
+CUDA kernels for GPUs.
+1All GPUs must be in a single server.
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.
+16:4 • M. Jaroš et al.
+To implement the proposed approach, only a few changes need
+to be made to the original GPU branch of Cycles. Most importantly,
+the core of the path tracing CUDA kernel used for the final rendering remains unchanged. The only modifications inside this kernel
+concern implementations of software counters that record memory access statistics. From a rendering point of view, the functionality of this kernel remains completely unchanged. Our modification splits each data structure used by the path tracer into chunks
+of a predefined size and counts the number of accesses per chunk.
+Since there is a performance overhead caused by this extra work it
+is recommended to have these modifications in a separate kernel.
+The most significant changes are made to the CPU code to support the CUDA Unified Memory, which is used to both replicate
+or distribute selected chunks of scene data among multiple GPUs.
+This is done using cudaMallocManaged instead of cudaMalloc, together with cudaMemAdvise data placement hints introduced in
+CUDA 8.0. The CUDA UM mechanism is thoroughly described in
+[Chien et al. 2020; Ganguly et al. 2019; Gayatri et al. 2019]. For a
+shorter description, see Appendix C.
+The overall workflow is as follows:
+(1) distribute the data structures evenly among all GPUs,
+(2) run the kernel with memory access counters and get the
+memory access statistics,
+(3) redistribute the data structures among GPUs based on memory access statistics,
+(4) run the original path-tracing kernel with redistributed data.
+Our extended version of Cycles works as a distributed renderer
+that is able to render a single image using multiple servers with
+replicated scene data. It is in the form of a command line tool that
+uses Blender to preprocess a scene, generate a complete scene description (needed for path tracing), and save it into a file. This file
+is then passed to the Cycles as a command line parameter.
+3.2 Multi-GPU Benchmark Systems
+In this article, we use two multi-GPU platforms that can perform massive scene rendering. The first one is a BullSequana
+X410-E5 NVLink-V blade server [Atos 2017] with 4 Tesla V100
+GPUs [NVIDIA 2017], each with 16 GB of memory and direct
+NVLink interconnect. The server is installed in the Barbora HPC
+cluster at IT4Innovations [2019] and therefore we will refer to it
+as Barbora.
+The second, more advanced platform is NVidia DGX-2 [NVIDIA
+2019], which is able to process massive scenes of sizes up to 512 GB
+in the shared memory of its 16 Tesla V100 GPUs, each with 32 GB
+of memory. The uniqueness of this platform is the enhancement
+of the NVLink interconnect by using NVSwitches [NVIDIA 2018c],
+which enable the connection of all 16 GPUs and higher bandwidth.
+Similar machines can be found in the portfolio of many cloud
+providers and HPC centers. The key hardware parameters of both
+platforms related to this article are summarized in Table 1, for more
+details see Appendix B.
+3.3 Benchmark Scenes
+We used four scenes for benchmarking. The first one was the
+Moana Island Scene [Walt Disney Animation Studios 2018]. It was
+Table 1. Parameters of HW Platforms Used for Validation of Our
+Proposed Approach
+Server GPUs
+Local memory
+bandwidth &
+latency
+Remote memory
+bandwidth &
+latency
+Total GPU
+memory
+Barbora 4× V100 740 GB/s 4 μs 48 GB/s 7 μs 64 GB
+DGX-2 16× V100 790 GB/s 4 μs 138 GB/s 10 μs 512 GB
+Bandwidth and latency is measured by the STREAM benchmark.
+selected due to its uniqueness and wide acceptance by both industry and the research community as a key production grade benchmark. The second one is based on the Natural History Museum
+scene [Birn 2015], and is extended by sculpture models [Threedscans 2020] to increase the geometric complexity, and by paintings [The Art Institute of Chicago 2020] to increase the size and
+number of textures. Finally, the remaining two scenes come from
+the recent open movies produced by the animation studio of the
+Blender Institute, namely, Agent 327: Operation Barbershop [Studio
+2020a] and Spring [Studio 2020b].
+These scenes of different sizes were created through the surface
+subdivision functionality and by increasing the texture resolution.
+4 DATA DISTRIBUTED MULTI-GPU PATH TRACING
+In this section, we propose a method designed to minimize the
+negative impact of the remote memory accesses on an algorithmic
+level to maximize path tracing performance and scalability.
+We propose two approaches for splitting data structures used
+by a path tracer. Each approach works with a different granularity of data placement control. We also evaluate how different data
+distributions affect overall performance.
+In Section 4.1, we describe a less complex methodology that
+works with entire data structures. Then, in Section 4.2, we introduce an advanced methodology that works with data structures
+divided into chunks, and controls how these chunks are placed in
+the memory of individual GPUs.
+The description of the methodology in this section is demonstrated using the Moana 12 GB and Moana 27 GB scenes for the
+Barbora and DGX-2 servers, respectively. The 12 or 27 GB value
+refers to the overall size of all data structures used by Cycles for
+path tracing. The scenes of these sizes were selected, because they
+fit into the memory of a single GPU of the respective platform, and
+we are therefore able to provide a full scalability evaluation from
+1 to 4, or from 1 to 16 GPUs.
+4.1 Basic Distribution of Entire Data Structures
+There are approximately 40 data structures in Cycles that describe
+the scene. Structures are accessed only for reading. Every data
+structure can be independently replicated or distributed across
+GPUs.
+4.1.1 Memory Access Analysis. We define the order in which
+data structures are replicated as a ratio of the total memory accesses to a particular data structure over its size. To be able to
+analyze its behavior, Cycles was modified to count the number
+of accesses to each data structure. The analysis was done on
+the first sample when rendering the scenes with a resolution of
+5, 120 × 2, 560 pixels.
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.
+GPU Accelerated Path Tracing of Massive Scenes • 16:5
+The structures that have the highest number of memory accesses per byte are shown in Figure 2. These are:
+• small_structures—a set of data structures smaller than 16MB
+(the most important one is svm_nodes, which stores Shader
+Virtual Machine (SVM) data and codes),
+• bvh_nodes—stores the BVH tree without its leaves (leaves are
+stored in a separate structure),
+• prim_tri_verts—holds coordinates of all vertices in the scene,
+• prim_tri_index—is a set of all triangles in the scene and it
+contains indices to the prim_tri_verts.
+As an example, we shall examine the Moana 27 GB scene on
+the DGX-2 server. Evidently, the most important data structure is
+bvh_nodes, because it is responsible for 79.6% of all memory accesses. This means that if it is replicated in the memory of all GPUs,
+the 79.6% of all memory accesses will be to the local memory. See
+the solid black line in Figure 2 . The size of this structure is 7.2 GB,
+which represents 26.5% of the entire scene size.
+The remaining lines in Figure 2 show how the path-tracing performance is affected by the distribution and replication of these
+data structures. 0% scene replication means that all data structures
+are split into 2 MB chunks and these are distributed in a round
+robin fashion among all GPUs. One can see that this naive distribution leads to an almost 3.7× longer rendering time (370%) in cases
+all 16 GPUs are used. The performance penalty decreases when
+using a smaller number of GPUs. The path-tracing time for fully
+replicated scenes is used as a baseline for relative rendering time
+evaluation. The relative rendering time is decreased to only 149%
+by replicating small_structures and bvh_nodes on all 16 GPUs. If
+in addition to small_structures and bvh_nodes, prim_tri_index and
+prim_tri_verts are also replicated, then the relative rendering time
+is only 109% while 40.7% of the scene is replicated and the rest is
+distributed.
+Consequently, the total memory allocation per GPU is 12.1 GB2
+instead of 27.2 GB.
+4.1.2 Performance and Scalability Evaluation. The scalability of
+the proposed approach is evaluated for four different cases:
+(1) all data structures are replicated—this case serves as a baseline as it achieves the best performance and scalability,
+(2) all data structures are evenly distributed,
+(3) small structures and bvh_nodes are replicated while all other
+data structures are distributed,
+(4) small structures, bvh_nodes, prim_tri_index, and prim_tri_
+verts are replicated while all other data structures are distributed.
+For case (2), two different forms of data distribution are evaluated: (a) continuous distribution: the structures are divided into
+large chunks of a size equal to the structure size over a number of
+GPUs, and each GPU owns one chunk, (b) round robin distribution:
+the distributed structure is divided into chunks of 2 MB,3 which
+are distributed in a round robin fashion.
+211.1 GB replicated + (16.1 GB / 16 GPUs) distributed = 12.1 GB per GPU. 3The 2 MB chunk is the smallest possible size, which still provides good performance
+and is optimal for scenes of these sizes. Smaller chunks always yield worse performance for the SetReadMostly memory hint, which replicates the chunks over all GPUs.
+Fig. 2. Analysis of memory accesses covered by the most important data
+structures (solid black lines). Impact of the data structure distribution and
+replication on rendering performance. Results for 0% replication represent
+full distribution of all data structures.
+The results of these tests are shown in Figure 3. The rendering times are for one sample per pixel and an image resolution
+of 5,120 × 2,560 pixels. Several conclusions can be made from the
+presented results:
+(1) round robin distribution of small chunks performs better
+than continuous distribution of large chunks, therefore it
+is always used to distribute non-replicated data structures,
+(2) path tracing with fully distributed data structures does not
+scale on both platforms (there is reasonable scalability for
+two GPUs on DGX-2, but not beyond that),
+(3) if small structures and bvh_nodes are replicated, the scalability is significantly improved:
+• on Barbora the speedup is 3.8 for 4 GPUs,
+• on DGX-2 the speedup is 7 and 6.7 for 8 GPUs and 11.8
+and 11.5 for 16 GPUs for Moana 12GB and Moana 27GB
+scenes, respectively,
+(4) if small structures, bvh_nodes, prim_tri_index, and prim_tri_
+verts are replicated, the scalability is further improved:
+• on Barbora the speedup is 3.9 for 4 GPUs,
+• on DGX-2 the speedup is 13.7 and 14.3 for 16 GPUs for
+Moana 12 GB and Moana 27 GB scenes, respectively,
+4.2 Advanced Distribution Based on Memory Access
+Pattern and Statistics
+Now, we present an advanced data placement algorithm that
+takes full advantage of the Unified Memory mechanism and data
+placement hints introduced in CUDA 8.0 (SetReadMostly, SetPreferredLocation, ...).
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.
+16:6 • M. Jaroš et al.
+Fig. 3. Scalability of the Cycles path tracer for different data distribution
+using entire structures on the Barbora GPU server and DGX-2 for Moana
+12 and 27 GB scenes. The rendering time is for one sample and the resolution is 5,120 × 2,560.
+The data placement is done with chunks, and hints are set for
+each chunk individually. The optimal chunk size was identified
+experimentally by benchmarking the path tracer performance for
+chunks of sizes from 64 kB to 128 MB. We observed that:
+• for scenes smaller than 30 GB the optimal chunk size is 2 MB
+(smaller chunks are not recommended),
+• for scenes of sizes around 40 GB the optimal chunk size is
+16 MB,
+• for scenes of sizes above 120 GB the optimal chunk size is
+64 MB.
+The workflow of this data placement strategy can be summarized by the following steps (more details are given in the subsections below):
+(1) copy/distribute every data structure across all GPUs in a
+round robin fashion using chunks of an optimal size,
+(2) run the path tracing kernel with memory access counters
+for 1spp to measure the statistics,
+(3) gather the statistics on the CPU and run the proposed algorithm to get the optimal data chunks distribution,
+(4) use cudaMemAdvise to migrate or replicate all chunks,
+(5) run the original unmodified path tracing kernel.
+4.2.1 Memory Access Pattern Analysis. To identify the memory
+access pattern, per chunk access counters have been implemented
+in the GPU path tracing kernel of Cycles. There are independent
+counters for all data structures and all their chunks, therefore, a
+total number of memory accesses per chunk can be recorded for
+each GPU.
+The memory analysis starts with all data structures being evenly
+distributed using a round robin distribution. Then the modified
+path tracing kernel with memory access counters is executed on
+all GPUs for one sample.
+When the kernel finishes, then for every chunk of every structure, a number of accesses from all GPUs is recorded. This data is
+the input for the data placement algorithm described in the next
+section. As is the case for final rendering, even during the analysis,
+the rendering workload is distributed, and each GPU works on its
+own part of the image. The workload is distributed among GPUs
+by horizontal stripes so that each GPU works on one stripe. Load
+balancing is done by changing the height of stripes.
+The analysis of the memory accesses for the Moana scenes of
+different sizes is shown in Figure 4. The figure shows that 1% of
+scene data covers between 56.7% and 74.4% of memory accesses,
+depending on the scene size. This is significantly better than working with entire structures. For illustration and direct comparison,
+we have added the dashed lines to Figure 4, which represent the
+solid black lines from Figure 2. Another important fact is that for
+the Moana 12 GB, 27 GB, 38 GB, and 169 GB scenes, 8.6%, 17.1%,
+18.8%, and 18.2%, respectively, of the scene data chunks was not
+accessed at all.
+Comparing these results with those in Figure 2, the following
+conclusions can be drawn:
+• for the Moana 27 GB scene small_structures, bvh_nodes,
+prim_tri_index, and prim_tri_verts cover 95.1% of all memory access at cost of 40.7% scene replication—this results in
+12.1 GB4 of data per GPU for 16 GPUs in total,
+• for the same scene, the method presented in this section covers 95.1% of memory accesses with just 10.1% of replicated
+data—this results in 4.2 GB5 of data per GPU, which is 2.9
+times smaller.
+This analysis shows that there are clear candidates among the
+chunks that should be replicated on all GPUs, while a major portion of the data is accessed infrequently and can be distributed with
+an acceptable impact on performance. The algorithm that decides
+the placement of each chunk based on this analysis is described in
+the next section.
+4.2.2 Data Placement Algorithm Based on Memory Access Pattern. Algorithm 1 processes the three-dimensional array of memory access counters Counters[G][S][C], where G are GPUs, S
+are data structures, and C are chunks within a particular data
+structure. The output of the algorithm provides an optimal location for each chunk (the GPU in which the chunk should be placed)
+411.1 GB replicated + (16.1 GB/16 GPUs) distributed = 12.1 GB per GPU. 52.7 GB replicated + (24.5 GB/16 GPUs) distributed = 4.2 GB per GPU.
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.
+GPU Accelerated Path Tracing of Massive Scenes • 16:7
+Fig. 4. The analysis of the memory accesses of the Cycles path tracer for
+Moana of 12, 27, 38, and 169 GB scenes. The figure shows that 1% of scene
+data broken into 2 MB chunks covers between 57% and 74% memory accesses depending on scene size. For comparison, we have added the data
+points from Figure 2 as dashed lines to show the advantage of this method.
+and decides whether the chunk should be distributed or replicated
+to all GPUs.
+In the first step, the per GPU counters are summed to get the
+total number of accesses asum for each chunk c ∈ C of each data
+structure s ∈ S and a (asum,s,c) tuple is created. One tuple now
+represent one chunk of scene data. Next, all tuples are put into
+a single 1D array Hcomb. The array is sorted by asum from the
+largest value (the highest number of accesses) to the smallest one
+and stored in H< array.
+The last input of the algorithm is the number of chunks that
+can be replicated Ndup. This value can either be set manually or
+automatically using the formula
+Ndup = 1
+Cs
+
+Gf − Ss
+Nд
+
+, (1)
+where Gf is the amount of free memory per GPU in MB available
+to store scene data, Ss is the scene size in MB, Nд is the total number of GPUs, and Cs is the chunk size in MB (2–64 MB based on
+scene size).
+We define a threshold t as the Ndup-th element in the sorted
+array H< and evaluate all tuples in the array H<. If the counter
+value asum is larger than t, then the corresponding chunk will be
+set as SetReadMostly, and therefore replicated.
+In the opposite case, the chunk is set as SetPreferredLocation and
+is assigned to the GPU with the highest number of accesses to this
+chunk. If the memory of this GPU is full, then the GPU with second, third, fourth, and so on, highest number of accesses is selected
+until a GPU with free memory is found.
+If the counter value is equal to zero (without any accesses), then
+the corresponding chunk will be distributed in a round robin fashion across GPUs with free memory.
+4.2.3 Performance Evaluation. The performance of the proposed algorithm was evaluated for different ratios between replicated and distributed data at a 2 MB chunk level of granularity for
+the Moana 12 and 27 GB scenes. The range is from 0% of replicated chunks (fully distributed), all the way up to 100% of replicated chunks if possible. Please note that there is a difference in
+how chunks are distributed when compared to the approach presented in Section 4.1. Previously the chunks were placed in a naive
+Fig. 5. Analysis of the path tracing performance for different ratios of
+replicated and distributed data for the Moana 12 GB and 27 GB scenes.
+Runtime is for one sample per pixel. A key observation is that the Barbora
+server with 4 GPUs with 16 GB of memory is able to render the Moana 27
+GB scene as fast as the DGX-2 system with 4 GPUs with 32 GB of memory
+in which the scene is fully replicated.
+round robin fashion. However, the chunks are now placed in the
+memory of the GPU that had the highest number of accesses to
+it. Chunks are placed in the GPU memories so that each GPU
+has the same amount of data, whilst attempting to simultaneously
+place chunks into the memory of the GPUs that will access them
+the most. This explains the different and better performance for
+the fully distributed scenes, i.e., 0% replication.
+Figure 5 shows the path tracing performance for one sample per
+pixel and 5, 120 × 2, 560 pixel resolution for both scenes and platforms, and for all available GPUs. The baseline for evaluation is
+the runtime for 1 GPU on DGX-2, which is 1,564 ms for the smaller
+scene and 2,032 ms for the larger scene. For the Moana 12 GB scene
+the speedup for fully a replicated scene on 4 GPUs on both platforms is 3.97, and parallel efficiency is 99%. On DGX-2 the speedup
+for 16 GPUs is 15.5, and the parallel efficiency is 97%. For the Moana
+27 GB scene and 16 GPUs the speedup is 15.4, and the parallel efficiency is 96%. We expect these results to be positive as in this
+scenario the path tracing is an embarrassingly parallel problem.
+When both platforms are compared, one can see that there is
+a performance difference only for fully distributed scenes. Once
+at least 1% of chunks are replicated, the performance is almost
+identical.
+The Moana 27 GB scene does not fit into a single GPU memory
+used by the Barbora platform. For 2 GPUs, only up to 2% of chunks
+can be replicated. However, the parallel efficiency is still as high as
+96% based on the single GPU baseline measured on the GPU in
+DGX-2 with 32 GB of memory. For 4 GPUs up to 25% of chunks
+can be replicated on the Barbora server, which yields 95% parallel
+ACM Transactions on Graphics, Vol. 40, No. 2, Article 16. Publication date: April 2021.

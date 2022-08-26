@@ -1,0 +1,371 @@
+GPU-based platforms provide high computation throughput for large mini-batch deep neural network computations. However, a large batch size may not be ideal for some situations, such as aiming at low latency, training on edge/mobile devices, partial retraining for personalization, and having irregular input sequence lengths. GPU performance suffers from low utilization especially for small-batch recurrent neural network (RNN) applications where sequential computations are required. In this article, we propose a hybrid architecture, called FARNN, which combines a GPU and an FPGA to accelerate RNN computation for small batch sizes. After separating RNN computations into GPU-efficient and GPU-inefficient tasks, we design special FPGA computation units that accelerate the GPU-inefficient RNN tasks. FARNN off-loads the GPU-inefficient tasks to the FPGA. We evaluate FARNN with synthetic RNN layers of various configurations on the Xilinx UltraScale+ FPGA and the NVIDIA P100 GPU in addition to evaluating it with real RNN applications. The evaluation result indicates that FARNN outperforms the P100 GPU platform for RNN training by up to 4.2 \times {} with small batch sizes, long input sequences, and many RNN cells per layer.
+SECTION 1Introduction
+Recurrent neural network (RNN) is a type of deep neural network (DNN) that is specialized for time-series data such as video processing [1], natural language processing [2], [3], [4], [5], or traffic prediction [6], [7]. Widely adopted RNNs include Long Short-Term Memory (LSTM)[8], [9], Gated Recurrent Unit (GRU)[10], and their variants [4], [11], [12]. Attention-based neural networks, such as Transformer [13] and BERT [14], are also popular in sequential data processing, but RNNs provide better flexibility, such as continuous processing of data streams [5].
+
+Input data to an RNN are separated in time steps. They are a time series of data elements, such as a sequence of words in a sentence or a sequence of video frames. An RNN block is a unit of computation that is responsible for processing a time step in an RNN layer. An RNN block receives two types of inputs: the input from the previous layer and the RNN state from the previous time step. The RNN state is recurrently fed to the RNN block through the time.
+
+Basically, an RNN block is a parameterized neural network that performs multiply-accumulate operations. The main difference between RNN layers and other DNN layers is that an RNN layer uses the recurrent state as a part of its input. However, the training process of an RNN is similar to that of other DNNs. It has the typical four steps of training: forward propagation (FW), backward propagation (BW), gradient computation (GC), and weight update (WU).
+
+Since each time step depends on the previous time step, RNN computations have to be performed by one time-step at a time. This can be a significant performance bottleneck for a long input sequence. Consequently, a large mini-batch size on GPU-based platforms increases their computation throughput and avoids low GPU utilization. However, creating a large mini-batch may not be an ideal solution for all situations for the following reasons:
+
+A training step could be conducted with a limited datasets (e.g., reinforcement learning [15]).
+
+The size of the mini-batch processed by a device is often limited by the available device memory size when training a large DNN model [16]. The device memory is also consumed by other DNN layers, which often require a larger memory space than the RNN layers [17]. In such a case, a mini-batch with a larger batch size (i.e., global batch size) may be further sliced into smaller chunks (i.e., device-batch or micro-batch) to fit within the device memory. As the DNN models get wider and deeper, the size of the computation batch per device becomes smaller, even down to one [18].
+
+Not all datasets have the same sequence length. If a mini-batch consists of data elements with different sequence lengths, wasteful padding needs to be applied to shorter data elements.
+
+DNN training can be distributed to edge computing nodes for data privacy and low communication overhead (e.g., federated learning [19], [20]). FARNN can be applied to server-class edge computation nodes.
+
+Retraining a DNN for personalization is another case for small-batch RNN computations. Due to privacy concerns, retraining a DNN with personal data has been performed on mobile devices [21]. However, many approaches have been suggested to preserve privacy, such as de-identification of training data [22] or trusted execution environment on GPUs [23] and FPGAs [24]. With such measures, personalized training can be done on server-class platforms.
+
+The need for an efficient RNN training platform for small batch sizes is manifested in the cuDNN library, which is the most widely-use DNN library for NVIDIA GPUs [25]. The cuDNN library is also providing special modes (persistent kernel modes) for small-batch RNN training tasks. These cuDNN operation modes are being used by popular DNN frameworks, such as TensorFlow and PyTorch.
+
+In this paper, we propose FARNN, a novel hybrid accelerator platform that combines a GPU and an FPGA to accelerate small-batch RNN training processes. We separate RNN computations into subtasks to distinguish GPU-efficient and GPU-inefficient computations. FARNN accelerates the RNN computation by off-loading the GPU-inefficient subtasks to the FPGA. On the FPGA side, we provide specially designed computation units that are fully optimized for the GPU-inefficient RNN subtasks.
+
+FARNN can accelerate the RNN training processes of real RNN applications compared to the high-end GPU platforms. When compared to the NVIDIA Tesla P100 GPU platform that uses the same TSMC 16nm process as the tested FPGAs, FARNN reduces the computation time of Deep Speech 2 [2] by 52% with the batch size of two. When applied to the multi-layer LSTM network of RNN-T [5] that has a recurrent projection, FARNN reduces the computation time of the LSTM layers by up to 4.2×, resulting in a 48% reduction of the total computation time. For RNN-T, FARNN outperforms the P100 GPU platform up to the batch size of eight.
+
+Major contributions of FARNN are as follows:
+
+As far as we know, FARNN is the first FPGA-GPU hybrid RNN training platform that outperforms a high-end GPU-based platform for small batch sizes.
+
+We separate RNN computations into GPU-efficient and GPU-inefficient subtasks. Based on the characteristics of GPU-inefficient subtasks, we present the design of dedicated computation units for the GPU-inefficient subtasks in the FPGA side. Moreover, we show how to exploit the parallelism between the GPU-efficient and GPU-inefficient subtasks.
+
+We present an efficient communication mechanism between the GPU and the FPGA through the PCIe bus in order to control the computation and communication overlap for both the GPU side and the FPGA side.
+
+We evaluate FARNN with synthetic RNN layers of various configurations on the Xilinx UltraScale+ FPGA and the NVIDIA P100 GPU. Moreover, we evaluate FARNN with two real RNN applications, Deep Speech 2[2] and RNN-T[5]. We also project FARNN's performance on future technology generations.
+
+The rest of this paper is organized as follows: Section 2 introduces related work on RNN accelerators and hybrid platforms. Section 3 describes the basic RNN inference and training computations. In Section 4, we discuss the characteristics of the RNN computation tasks and divide them into subtasks to identify computations that have to be off-loaded to FPGA. Section 5 describes the FPGA computation units. Finally, Section 6 evaluates the performance and efficiency of FARNN and Section 8 presents the conclusions of the paper.
+
+SECTION 2Related Work
+There exist various hardware accelerators for DNN computations [26], [27], [28], [29], [30], [31], [32], [33], [34], [35], [36], [37], [38], [39], [40]. Several ASIC- or FPGA-based RNN accelerators are proposed as well [41], [42], [43], [44], [45], [46], [47], [48]. However, most of the existing RNN accelerators target inference computations only. ESE [44] increase computation efficiency through weight pruning. E-RNN [45] and C-LSTM [48] use block-circulant matrix structures to reduce the number of weight parameters and associated computation loads. The Brainwave NPU neural processing unit presents a cloud-scale inference system that enables low-latency inference computations using 8-bit floating-point computations [41].
+
+Recently, various hybrid architectures for computation acceleration is being introduced. FPGA-GPU hybrid platforms have been studied for DNN acceleration [49], [50], [51], [52], but previous work utilized the FPGA platform for inference tasks only. CPU-GPU hybrid platforms are widely adopted to accelerate various tasks including machine learning, big data, and cryptography systems [53], [54], [55], [56]. HyGCN [57] combines two different custom architectures in a single chip to accelerate two distinctive computation tasks in graph convolutional neural networks. Poly [58] proposes an FPGA-GPU heterogeneous platform for OpenCL workloads.
+
+There are two major differences between the existing DNN accelerators and FARNN. One is that FARNN is an FPGA-GPU hybrid platform that combines commodity hardware platforms, while other hybrid platforms are based on customized ASICs. The other difference is that FARNN handles RNN training. Unlike FARNN, inference-only platforms can adopt aggressive optimization techniques, such as weight pruning or low-precision computations, to increase computation efficiency. However, DNN training requires high-precision values to successfully and accurately complete the training.
+
+Moreover, RNNs are more sensitive to the arithmetic precision because the errors can be accumulated through the time steps. FARNN uses full-size weight matrices without pruning, and its computation units in the FPGA utilize 32-bit floating-point arithmetic (FP32).
+
+SECTION 3Background
+We describe generic principles of how RNNs work using an LSTM-based RNN[8], [9] as an example. The principles can be applied to GRU-based RNNs[10] as well.
+
+An RNN layer consists of a time series of RNN blocks (Fig. 1a). Fig. 1b shows the internal structure of the LSTM block. At time step t, an LSTM block receives an input vector xt from the previous DNN layer. There are two recurrent state vectors, ct and ht. Each element in ct is referred to as an RNN cell, and it represents the memory content that is carried over the time steps. ht goes to the next DNN layer as the output vector yt of the time step t, and it also goes to the LSTM block of the next time step.
+
+
+Fig. 1.
+Structure of an RNN.
+
+Show All
+
+Using the vector ht−1 from the previous time step t−1 and the input vector xt from the previous layer, the LSTM block at time step t computes four gate values: forget (ft), input (it), new (c′t), and output (ot). They are computed as follows:
+ft=it=c′t=ot= σ(Wf×xt+Rf×ht−1+bWf+bRf), σ(Wi×xt+Ri×ht−1+bWi+bRi),tanh(Wc′×xt+Rc′×ht−1+bWc′+bRc′), σ(Wo×xt+Ro×ht−1+bWo+bRo),(1)
+View Sourcewhere σ and tanh represent the sigmoid function and the hyperbolic tangent function, respectively. W and R are the input weight matrix and recurrent weight matrix, respectively, and bW and bR are bias vectors. Hereinafter, we refer to the weight and bias parameters of an RNN layer as weights.
+
+The gate values modify the RNN cell values (i.e., ct) and produce a new output vector (i.e., ht) of the layer through element-wise operations as follows:
+ct=ft⊙ct−1+it⊙c′t,ht=ot⊙tanh(ct),(2)
+View Sourcewhere ⊙ represents element-wise multiplication.
+
+At each time step of the backward propargation, an RNN block takes the gradients of the output (δyt) and the states (δht and δct) to calculate the gradients of the previous states (δht−1 and δct−1) and the input (δxt). The operations are either element-wise operations or matrix-vector multiplications that can be decomposed as follows:
+δh^t=δht+δyt,δc^t=δct+δtanh(ct)⊙ot⊙δh^t,
+View Source
+δotδc′tδitδftδct−1=tanh(ct)⊙δh^t,δo∗t=δσ(ot)⊙δot,=it⊙δc^t,δc′∗t=δtanh(c′t)⊙δc′t,=c′t⊙δc^t,δi∗t=δσ(it)⊙δit,=ct−1⊙δc^t,δf∗t=δσ(ft)⊙δft,=ft⊙δc^t,
+View Source
+δht−1=∑k=f,i,c′,oRTk×δk∗t,δxt=∑k=f,i,c′,oWTk×δk∗t.(3)
+View Source
+
+SECTION 4Subtasks of RNN Computation
+We distinguish the RNN training process into subtasks to identify which part of the RNN computation is beneficial to performance when off-loaded to FPGA for acceleration. The DNN training process consists of four main computation steps: forward propagation (FW), backward propagation (BW), gradient computation (GC), and weight update (WU).
+
+4.1 Forward Propagation (FW)
+The RNN FW step consists of three distinctive subtasks. Two of them are matrix-vector multiplication (MVM) tasks. One MVM task applies the input weight matrices (W) to the input vector of an RNN layer at each time step (xt), and we refer to this task as the I-MVM task. The other MVM task applies the recurrent weight matrices (R) to the recurrent state vector ht, and we refer to this task as the R-MVM task. The third task, activation task, performs element-wise operations on vectors for the RNN gate activation functions. The RNN gate structure in Fig. 1b distinguishes the I-MVM and R-MVM tasks, shown in green and blue colors, respectively. Black-colored boxes in Fig. 1b represent element-wise operations that belong to the activation task.
+
+The I-MVM task partially calculates the RNN gate values, which have to be combined with the R-MVM task's result to obtain the RNN gate values as described by Equation (1). The input to the I-MVM task does not depend on the previous time step in the same RNN layer. Thus, all I-MVM tasks of the entire sequence can be simultaneously performed. A GPU platform may achieve a high computation throughput for such a computation task that has a high degree of parallelism.
+
+On the contrary, the R-MVM task needs the result of the previous time step. If the computation cannot form a large batch, a GPU platform cannot utilize its abundant computing resources, resulting in poor performance. Fig. 2 compares the GPU computation throughput for different RNN training subtasks measured on the NVIDIA P100 GPU in terms of the tera floating-point operations per second (TFLOPS). The throughput is measured using an LSTM layer with 1,024 cells and an input sequence length of 576, which is the average input length of the Deep Speech 2 training. The I-MVM task shows a high computation throughput even with small batch sizes, comparable to the theoretical peak of the P100 GPU (9.3 TFLOPS). In contrast, the R-MVM task shows poor throughput. For example, when the batch size is one, the R-MVM task utilizes less than 2% of the peak TFLOPS. Based on this observation, FARNN off-loads the R-MVM task to the FPGA side where we provide a dedicated computation pipeline optimized for such recurrent computations.
+
+
+Fig. 2.
+GPU computation throughput comparison of RNN training subtasks on NVIDIA P100.
+
+Show All
+
+After the MVM tasks are completed, the RNN block executes the activation task that performs element-wise computation between the gate vectors and the RNN state vectors (black-colored boxes in Fig. 1b). Because the activation task requires the results of the MVM tasks, it has to be performed after the R-MVM task at each time step. Thus, it is natural to include the activation task in the FPGA computation pipeline along with the R-MVM task.
+
+To delegate the R-MVM and activation tasks to the FPGA, the GPU needs to transfer the recurrent weight matrices and the result of the I-MVM task to the FPGA side. In return, the off-loaded computation on the FPGA needs to send the computed RNN output vectors back to the GPU.
+
+4.2 Backward Propagation (BW)
+The BW step also has the following three distinctive computation subtasks, each of which corresponds to a subtask of the FW step: BW I-MVM, BW R-MVM, and BW activation.
+
+The BW activation task and the BW R-MVM task calculates the gradients of the RNN state vectors ct−1 and ht−1 according to Equation (3). The calculated gradient vectors are recurrently fed to the previous time step. Similar to the FW step, these two tasks are off-loaded to the FPGA side.
+
+The BW I-MVM task is responsible for calculating the gradients of RNN input vectors. The input to the BW I-MVM task is a set of gradients (i.e., δf∗t, δi∗t, δc′∗t, and δo∗t), and these gradient vectors become available after the BW activation task completes. FARNN performs the BW I-MVM task on the GPU in a large computation batch
+
+Off-loading the BW activation task and the BW R-MVM task requires the transfer of the following data elements from the GPU to the FPGA: recurrent weight matrices (R) and gradients of the RNN outputs (δyt). In return, the FPGA transfers the results of the off-loaded BW R-MVM task and the BW activation task. The transferred results become the input to the BW I-MVM task and the GC step on the GPU.
+
+4.3 Gradient Computation (GC) and Weight Update (WU)
+The GC step calculates the gradients of the weight matrices using the MVM task output gradients as follows:
+δWk=∑t=1Txt⊗δk∗t,δRk=∑t=1Tht−1⊗δk∗t,k=f,i,c′,o,
+View Sourcewhere T is the length of the input sequence.
+
+After the BW step completes, all required vectors are ready and delivered to the GPU side from the FPGA. The GC step needs to perform only vector outer product operations between multiple independent vectors. This computation step perfectly suits to the GPU architecture, and we implement this step using the NVIDIA cuDNN library [25].
+
+The training process for the given input completes with the WU step. The WU step applies the calculated gradients to the corresponding weight parameters. The WU step is performed on the GPU along with the GC step.
+
+Table 1 summarizes the subtask division and the required data transfers between the FPGA and the GPU discussed in this section. The basic goal of FARNN's FPGA-GPU task division is delegating the GPU-inefficient R-MVM tasks to FPGA. Along with the FW and BW R-MVM tasks, computation tasks in between the R-MVM time steps are also off-loaded to FPGA. Those tasks include the FW and BW activation tasks and the projection.
+
+TABLE 1 Task Subdivision of RNN Training
+
+SECTION 5FPGA Computation Units
+We design dedicated computation units in FPGA to handle the delegated GPU-inefficient tasks. The highlights of the FARNN architecture are as follows:
+
+RNN-optimized structures: FARNN consists of basic computation units called processing elements (PEs), each of which contains a weight memory that locally stores a large portion of the weight matrix. This enables the recurrent weight matrix (R) can be stored near the multiply-accumulate (MAC) computation units and the repeated vector-matrix multiplications through the RNN time steps are performed continuously without reloading the weight parameters from the global or off-chip memory.
+
+Scalable PE chains: The PEs are connected in a chained fashion, which means there is no global control or datapath. This enables a flexible scaling to larger FPGA devices while maintaining a high clock frequency.
+
+Latency hiding: FARNN employs various techniques to further reduce the computation latency for processing the delegated computation tasks, including computation overlapping and FPGA-optimized data layout.
+
+Fig. 3 shows the FPGA architecture for FARNN. The matrix-vector multiplication unit (MVM unit) multiplies a vector with a (weight) matrix and produces a result vector. The MVM unit is optimized for repeatedly using the same matrix for multiple vectors that arrive sequentially. FARNN has four MVM units for each of the four LSTM gates (three MVM units when configured for GRU). An MVM unit is used for both FW and BW R-MVM tasks.
+
+
+Fig. 3.
+FPGA architecture of FARNN platform.
+
+Show All
+
+The activation units perform the element-wise vector operations for FW and BW activation tasks. Because the operators required for FW and BW activation tasks are not identical, it would be inefficient to share the same components for both tasks. Consequently, FARNN uses a separate computation pipeline for each of FW and BW activation tasks.
+
+During FW, the FPGA computation pipeline creates a loop that connects the MVM units with the FW activation unit (Fig. 3a). Similarly, the pipeline switches the MVM units to the BW activation unit during BW (Fig. 3b). A loop of the pipeline corresponds to a single time step in RNN.
+
+5.1 Matrix-Vector Multiplication (MVM) Unit
+FARNN pins the weight matrices of an RNN layer in on-chip memory through the entire sequence of FW or BW to reduce the overhead of off-chip data traffic. The FPGA fabric is ideal for such a configuration because FPGAs provide a large amount of on-chip memory, and the on-chip memory modules are distributed all over the FPGA fabric.
+
+5.1.1 Processing Elements
+The basic building block of an MVM unit is called processing element (PE), and it consists of a multiplier, an accumulator, and an on-chip memory space that stores a column of the weight matrix as in the weight-stationary dataflow [28] (Fig. 4a).
+
+
+Fig. 4.
+PE chains in FARNN's MVM unit.
+
+Show All
+
+During the MVM task, all PEs are fed with the same vector, one element per cycle. That is, if the length of the vector is N (i.e., N RNN cells), it takes N cycles to feed the PEs. When the vector elements are arriving at each PE, the PE performs multiply-accumulate (MAC) operations. Because each PE holds a different column of the weight matrix, the result of the accumulation corresponds to a single element in the result vector. The result vector is delivered to the FW or BW activation unit, and the result of the activation unit becomes the next input vector to the MVM unit.
+
+5.1.2 Chained PE Interconnect
+Even though the floating-point IP cores support a high clock frequency on FPGA (more than 500 MHz depending on the operation type), many FPGA-based designs are limited to a lower clock frequency due to the delay from the complex interconnect between the components.
+
+In FARNN, PEs are connected in a chain to simplify the interconnect while providing a high computation capacity (Fig. 4a). Each PE has one input channel and one output channel connected to its predecessor. These two channels are sufficient to handle all three types of data transfers required between PEs: weight load, input vector feed, and result vector collection. This chained PE structure also supports flexible scaling. FARNN connects as many PEs as the FPGA resource permits (L PEs per chain).
+
+During the MAC operation, the same input vector is broadcasted to all PEs. When a vector element is delivered to a PE, the PE also relays the element to the next PE down the chain (Fig. 4c). A PE receives an input element one cycle after its predecessor PE receives the element. After completing the MAC operation, the result value is returned to the previous PE through the output channel, which will relay to the result value to the head of the chain recursively.
+
+PEs need to receive and store their parts of the weight matrix parameters for the MVM task. Unlike the MAC operation, weight parameters are not broadcasted to multiple PEs because the parameters are unique to each PE. To load the parameters rapidly, we create multiple chains that can accept input elements separately (Fig. 4b). The chains are connected to different parts of the off-chip data port that transfers the parameters from the GPU to the FPGA. The number of PE chains (W) is determined by the width of the off-chip data port to fully utilize the off-chip bandwidth. In FARNN, the PCI-Express (PCIe) module provides a 512-bit data interface, and W is set to 512 bit / 32 bit = 16 chains. With this configuration, FARNN can load the weight matrix parameters into the PEs at the same rate as the parameters are delivered through the PCIe interface.
+
+Thanks to the chain-fashioned interconnect, FARNN achieves 400 MHz clock frequency on the Xilinx UltraScale+ FPGA, which is close to the maximum clock frequency supported by the IP cores on the FPGA fabric. This clock frequency is much higher than the existing FPGA-based RNN platforms. For example, ESE[44], E-RNN[45], and C-LSTM[48] achieve 200 MHZ clock frequency with fixed-point arithmetic, and Brainwave[41] operates at 300 MHz for 8-bit computations.
+
+The flexible chained PE interconnect also enables scaling over multi-die FPGAs. A single Xilinx UltraScale+ FPGA device may consists of multiple FPGA dies called Super Logic Regions (SLRs). The computation units in FARNN can utilize the FPGA resources across the SLR dies under a high clock frequency thanks to the chained PE interconnect. In contrast, an accelerator architecture limited in scalability may not achieve a latency improvement on a larger FPGA fabric. For example, a DPU engine in the Xilinx Vitis AI platform does not scale over an SLR die boundary [59], and a larger FPGA with more SLR dies only improve the throughput while the latency improvement is limited.
+
+5.1.3 Vector Slices
+A single round of MAC operations (i.e., input vector feed and result collection through the PE chains) produces W×L result values. For RNN layers that have more RNN cells than W×L, an MVM task involves multiple rounds of MAC operations. The result vector is divided into multiple slices, each corresponds to the output of one round of MAC operations. In such a case, a PE is responsible for multiple elements in the result vector, and the weight memory of each PE stores multiple weight columns.
+
+For example, if the number of RNN cells is 1,024 and an MVM unit has 256 PEs, the result vector is divided into four slices. Each PE stores four columns of the weight matrix (i.e., total 4×1,024 weight elements) in its on-chip memory.
+
+If an RNN layer has more than one vector slice, the computations of the MVM task and the activation task can be overlapped as in Fig. 5. As soon as an MVM result slice is produced, the activation unit can start processing the partial result because the activation task performs element-wise operations. The computation time of the activation task can be hidden if the pipeline latency of the activation task is shorter than one round of MAC operations. In FARNN, the longest pipeline latency is 204 cycles for the forward propagation of an LSTM activation, which can be hidden for RNN layers that requires multiple rounds of MAC operations.
+
+
+Fig. 5.
+An example timeline of the MVM and activation task overlapping when the number of vector slices is three.
+
+Show All
+
+Some combinations of RNN sizes and PE counts may result in inefficient PE utilization. For example, if an RNN has 1,024 cells and there are 768 PEs per MVM unit, the MVM task needs two rounds of MAC operations to complete a time step, but only 256 PEs are utilized during the second round. In this setup, one MVM task would take 2×1,024=2,048 cycles. FARNN mitigates this issue by splitting a cell over multiple PEs when there are many idle PEs. If a cell is split over two cells, an output value is accumulated over N2 cycles on two PEs, and the previous case can be finished in 1.5×1,024=1,536 cycles.
+
+Since FARNN has more than 256 PEs per MVM unit, an RNN layer requires multiple rounds of MAC operations if it has more than 256 RNN cells. Consequently, the MVM task takes more than 256 cycles to compute a slice for those cases. Therefore, for RNN layers that have more than 256 RNN cells, the activation pipeline latency can be hidden, and the PE array computation throughput determines the performance of FARNN.
+
+5.1.4 Weight Matrix Layout
+BW uses transposed weight matrices as described by Equation (3). FARNN does not handle the weight transformation on the FPGA for the following reasons:
+
+In FARNN, weight matrices are distributed over the weight memory in PEs. Transposing the weight parameters in-place between the PEs would require additional connections between the PEs (e.g., inter-chain connections across the PE chains). That would make the FPGA routing complicated and result in slower performance.
+
+The on-chip memory on the FPGA may not be large enough to hold weight matrices of multiple RNN layers. Between the forward and backward propagation steps, FARNN has to handle other RNN layers if the DNN has multiple RNN layers.
+
+Instead, FARNN simply reloads the transposed weight matrices from the GPU for BW. The GPU is in charge of performing the transformation of the weight layout.
+
+5.2 Activation Unit
+During FW, the results from the MVM units are added to the results of the I-MVM task that are transferred from the GPU. Then, gate activation functions are applied to the results of the addition. The four types of gate values are applied to the previous RNN state according to Equation (2) and produce a new RNN state. FARNN implements such an activation pipeline by connecting primitive computing units in a stream.
+
+The required floating-point compute units include addition, subtraction, multiplication, sigmoid, and tanh. The sigmoid and tanh functions can be decomposed into a combination of basic floating-point operations as follows: σ(x)=exex+1, tanh(x)=e2x−1e2x+1.
+
+The BW activation task backpropagates the gradients to obtain the gradient vectors that correspond to the MVM task outputs. In Fig. 3b, δf∗t, δi∗t, δc′∗t, and δo∗t represent the output gradients of the MVM tasks. Because the same set of gradient vectors are used as input for the BW I-MVM task on the GPU as well, the results of the BW activation task are transferred to the GPU side.
+
+The BW R-MVM task uses the four MVM units to produce partial gradients of the RNN state (δh1t−1 to δh4t−1 in Fig. 3b), and the sum of these partial gradients finally becomes the gradient vector of the RNN state (δht−1).
+
+The computation in the BW activation unit is composed of addition, multiplication, and obtaining the derivatives of sigmoid and tanh functions. The derivatives of these two functions can be simply computed using the following equations: δσ(x)=σ(x)(1−σ(x)), δtanh(x)=1−tanh2(x).
+
+The BW activation task requires gate output values (i.e., ft, it, c′t, and ot) produced during FW. Instead of recomputing these vectors, FARNN saves these vectors during FW (Fig. 3a) and reloads for BW (Fig. 3b). FARNN uses external DRAM on the FPGA side to save these vectors.
+
+5.3 Computation-Communication Overlap
+The FARNN subtasks are statically distributed and scheduled to the FPGA and GPU since the computation steps during a DNN training is fixed. The computation tasks on FPGA are triggered autonomously by the GPU to FPGA data transfer task. As soon as the required I-MVM task results are transferred from the GPU through DMA, the FPGA computations begin immediately without the host intervention to reduce the computation latency.
+
+FARNN schedules GPU computation tasks to be overlapped with FPGA tasks or data transfers to further enhance the training performance (Fig. 6). During FW, FARNN overlaps the I-MVM task on the GPU with the weight matrix transfer to the GPU. BW has more opportunities for overlapping because GC and WU tasks are also running on the GPU side. Note that the overlapped computations on the GPU are handling the previous layer that has just completed the backward propagation. This overlap can benefit from a DNN configuration that has multiple layers of RNNs.
+
+
+Fig. 6.
+Timeline of computation tasks and data transfers.
+
+Show All
+
+Because the FPGA tasks need the weight matrices to begin the computation of each layer, the weight matrix transfer can be a performance bottleneck. The transfer overhead can be amortized on longer RNN input sequences or larger batches (Sections 6.2.2 and 6.2.3).
+
+During the computation, per time-step results (e.g., I-MVM task results, output vectors, or output gradients) are transferred between the GPU and the FPGA. Per time-step transfers are not performance bottlenecks since they require much lower transfer rate (e.g., 0.11 GB/s for 1,024-cell LSTM) compared to the peak PCIe bandwidth.
+
+During FW, the results of the I-MVM task (i.e., fit, iit, c′it, and oit) are also transferred from the GPU to the FPGA in the time sequence order. Each time step of the activation task on the FPGA begins its computation as soon as the required vectors from the GPU arrives. The results from the FPGA side (i.e., the RNN output vectors) are also transferred to the GPU as the computation time steps progress.
+
+The completion of the data transfer from the FPGA to the GPU indicates the end of the forward propagation through the sequence. The host (i.e., the CPU) does not need to intervene while such recurrent computations are performed.
+
+5.4 DMA Between the FPGA and the GPU
+The performance of a heterogeneous platform that is connected through an external interconnect can be limited by the data transfer time. FARNN maximizes its performance by directly tranferring data between FPGA and GPU [60]. NVIDIA GPUs that support GPUDirect [61] allow peer-to-peer communication between PCIe devices. Using the GPUDirect API, FARNN pins the pages of the target data object in the GPU platform. The DMA module [62] in the FPGA initiates PCIe transfers to access the pinned memory.
+
+SECTION 6Evaluation
+We analyze FARNN's performance characteristics using a set of synthetic benchmarks. We also evaluate FARNN's performance benefits on real-world RNN applications, Deep Speech 2 [2], [3] and RNN-T [5].
+
+6.1 Environment
+We evaluate FARNN using a combination of an NVIDIA P100 GPU and a Xilinx UltraScale+ VU9P FPGA. In this evaluation, we choose the P100 GPU as the counterpart of the UltraScale+ FPGA because both devices are manufactured using the same TSMC 16nm process.
+
+One of the benefits of FARNN's chained PE structure is that it supports flexible scaling. Depending on the available FPGA resources, FARNN's performance can be scaled by changing the number of PEs per chain. A larger number of PEs shortens the computation time of R-MVM tasks by reducing the number of MVM task rounds (Section 5.1.3). Based on this observation, we also project the performance of FARNN on a larger FPGA. The biggest FPGA in the UltraScale+ series is VU13P. We perform an FPGA implementation (synthesis, placement, and routing) that targets the VU13P device to determine the longest possible PE chain length without sacrificing the clock frequency. We simulate the performance of FARNN on VU13P by adding dummy PEs on our VU9P evaluation platform. Although these dummy PEs would not perform correct computations, it provides cycle-accurate performance measurements.
+
+Table 2 summarizes the number of PEs on VU9P (FARNN-9P) and VU13P (FARNN-13P) for LSTM and GRU implementations, respectively. Note that the LSTM versions have a shorter PE chain length than that of the GRU versions because LSTM requires more MVM units (four).
+
+TABLE 2 FPGA Resource Usage of FARNN on Xilinx UltraScale+ VU9P and VU13P Devices
+
+Thanks to the memory-rich FPGA fabric, the high-capacity weight memory is possible. In our FARNN implementation on Xilinx FPGAs, two PEs share a single on-chip memory (UltraRAM) module, providing up to 4K weight parameter storage per PE. To support larger RNN blocks, a PE can be paired with more on-chip memory modules. On VU9P, LSTM layers that have more than 1,024 cells use a configuration that each PE's weight memory capacity is increased to 8K parameters at the cost of reduced total PE count (768). With such high-capacity weight memory configurations, the computing resources (LUTs and DSP blocks) and the distributed FPGA on-chip memory blocks (URAM blocks) on the FPGA are almost equally utilized.
+
+Computation tasks on the GPU are implemented using the cuBLAS and cuDNN libraries. The I-MVM tasks, which are essentially matrix multiplications, are implemented using cuBLAS. The gradient computation task is performed by the cuDNN functions for convolution layers.
+
+We evaluate the performance gain of FARNN against a GPU-only platform that uses the same NVIDIA P100 GPU. The GPU-only platform uses the highly-tuned RNN functions of the cuDNN library. The cuDNN RNN routines can be configured to use one of the three RNN computation algorithms. The standard algorithm executes the RNN computation as a sequence of operations. The other two options, persistent static and persistent dynamic, use the persistent kernel approach that stores the RNN weights in the GPU shared memory or registers throughout the computation.
+
+We measure the performance of the GPU-only platform using the persistent dynamic (cuDNN-PD) mode, which generally has the best performance for small-batch RNN computations on GPU. We use the execution time of cuDNN-Std to normalize the execution time measurements in our evaluation.
+
+6.2 Synthetic Benchmarks
+We first evaluate the performance of FARNN using various synthetic RNN setups. Figs. 7, 8, and 9 show the execution time reduction achieved by FARNN over the baseline cuDNN-Std with various RNN settings. The stacked bar graphs show the breakdown of the RNN training tasks. Since FARNN overlaps the GPU and FPGA tasks, the execution times of BW, GC, and WU tasks are combined into the same group.
+
+
+Fig. 7.
+Training performance comparison with varying number of RNN cells per layer. (RNN layers = 5, input sequence length = 1600, batch size = 1).
+
+Show All
+
+
+Fig. 8.
+Training performance comparison with varying RNN input sequence lengths. (RNN layers = 5, LSTM cells = 1024, GRU cells = 1280, batch size = 1).
+
+Show All
+
+
+Fig. 9.
+Training performance comparison with varying computation batch sizes. (RNN layers = 5, input sequence length = 1600, LSTM cells = 1024, GRU cells = 1280).
+
+Show All
+
+6.2.1 Effect of RNN Cell Counts
+Fig. 7 compares the execution time with different RNN cell counts while keeping other parameters the same. Both FARNN and cuDNN-PD significantly reduce the execution time over cuDNN-Std, but the reduction by cuDNN-PD diminishes as the RNN size increases. When the size of the RNN parameters exceeds the GPU's shared memory capacity, the performance of cuDNN-PD degrades due to the increased global memory accesses (more than an order of magnitude increase). An FPGA is an ideal platform for off-loading such a computation task because the FPGA fabric offers a large amount of on-chip memory. For example, VU9P offers more than 40MB of on-chip memory that can hold larger weight matrices than those of P100.
+
+When the RNN has 1,024 LSTM cells per layer, FARNN-9P and FARNN-13P archive 52% and 61% execution-time reductions over cuDNN-PD, respectively. With 1,280 GRU cells per layer, which has a similar weight capacity as 1,024 LSTM cells, FARNN-9P and FARNN-13P outperform cuDNN-PD by 32% and 50%, respectively.
+
+6.2.2 Effect of Input Sequence Lengths
+Fig. 8 shows how performance is affected by the length of the input data sequence (i.e., the number of RNN time steps). As aforementioned in Section 5.3, FARNN works faster with longer input sequences, resulting in significantly reduced execution time compared to cuDNN-Std and cuDNN-PD. For example, when the input length is 100 time-steps per sequence, FARNN has no significant performance benefit over the cuDNN-Std baseline. However, FARNN for LSTM is 3.6× faster than cuDNN-Std when the sequence length is 1,600. To off-load RNN training subtasks to the FPGA, FARNN needs to transfer weight matrices from the GPU to the FPGA. This transfer overhead occurs once on every layer during forward propagation or backward propagation. Thus, the data transfer overhead is amortized with longer data sequences.
+
+6.2.3 Effect of Batch Sizes
+Both cuDNN-PD and FARNN primarily focus on the small-batch performance of RNN training, and their performance gain diminishes on larger batch sizes (Fig. 9). For example, with the batch size of four, the baseline cuDNN-Std outperforms both cuDNN-PD and FARNN-9P.
+
+The execution time of cuDNN-PD increases almost linearly as the batch size increases. In contrast, the execution time increase can be sub-linear on FARNN. When the batch size increases from one to four, the execution time of FARNN increases only by 3.4×. Weight matrices transferred to the FPGA are shared across the batch, and thereby reducing the impact of the transfer overhead. For example, the achieved computation throughput of the LSTM training compared to the peak throughput is 82.8%, 88.0%, and 92.5% for the batch size of one, two, and four, respectively. The peak throughput is the performance when the GPU and FPGA computing resources are fully utilized for the I-MVM and R-MVM tasks, respectively.
+
+6.2.4 FARNN Configurations
+Fig. 10 compares the performance of FARNN configurations that use different FPGA-GPU computation off-loading strategies. The figure compares the LSTM training time normalized to FARNN-9P. The FARNN-AllFPGA configuration performs all FW and BW tasks on FPGA, including the I-MVM tasks. The GC and WU tasks are still performed on GPU. FARNN-AllFPGA doubles the training time compared to FARNN because I-MVM tasks cannot exploit the computation capacity of the GPUs.
+
+
+Fig. 10.
+Training performance comparison with different FPGA-GPU computation off-loading strategies. (RNN layers = 5, input sequence length = 800, batch size = 1).
+
+Show All
+
+The FARNN-NoOverlap configuration does not employ the computation-communication overlapping. In FARNN-NoOverlap, GPU ↔ FPGA data transfer, FW, BW, GC, and WU tasks are executed sequentially. The computation overlapping in FARNN improves the performance over FARNN-NoOverlap by more than 20% on average.
+
+6.3 Computation Accuracy
+FARNN uses FP32 operations (i.e., no reduced precision) throughout the computations. We compared the computation results of FARNN with those from the GPU-based platform and validated that besides the small numerical differences induced by the different ordering of floating-point operations, FARNN produces the same results for all computation tasks.
+
+6.4 Real-World Application 1: Deep Speech 2
+Deep Speech 2 [2], [3] uses a DNN that has multiple layers of RNNs. When using the LibriSpeech dataset [63] as the training input, the average RNN sequence length is 548.
+
+We test the best-performing RNN setup in Deep Speech 2, which has 7 bidirectional GRU layers with 1,280 cells (DS2 GRU). We also evaluate a Deep Speech 2 configuration that uses LSTM (DS2 LSTM) as well. For DS2 LSTM, we use 1,024 cells per layer, which has a similar total parameter size as the GRU model.
+
+Fig. 11 presents the performance of FARNN for Deep Speech 2. Note that the reported execution time accounts for the entire DNN, including convolutional and fully-connected layers that are not affected by FARNN (represented in the ‘Others’ portion at the bottom of the graphs). With the batch size of two, FARNN-13P achieves 52% and 43% execution time reductions for DS2 LSTM and DS2 GRU, respectively.
+
+
+Fig. 11.
+Deep Speech 2 training performance comparison.
+
+Show All
+
+FARNN and cuDNN-PD targets accelerating small-batch computations, and their performance gain against cuDNN-Std decreases as the batch size increases. However, FARNN can outperform both cuDNN-PD and cuDNN-Std up to the batch size of four. The weight transfer overheard from the GPU to the FPGA is amortized with larger batch sizes and longer input sequences. On both FARNN and cuDNN-PD, a mini-batch RNN computation needs extra padding to equalize the input length. For example, when training Deep Speech 2 with four input instances per batch, the added padding increases the average input sequence length by more than 30% on average. Thus, FARNN maintains its performance advantage on larger batch sizes.
+
+6.5 Real-World Application 2: RNN-T
+RNN-T[5] is a speech recognition model that targets mobile applications. RNN-T consists of two multi-layer RNNs: the prediction network and the encoder network. In this evaluation, we use FARNN for the encoder network, which accounts for more than 65% of the total training time on the baseline GPU-only platform. The encoder network has eight unidirectional LSTM layers with 2,048 cells and a recurrent projection size of 640.
+
+The recurrent projection is an additional matrix multiplication step that reduces the output vector dimension between each time step. Because the recurrent projection has to be computed in between the time steps, the matrix multiplication is handled by the FPGA, reusing the MVM units. The cuDNN library does not support the persistent kernel mode when the recurrent projection is used. Therefore, for RNN-T, the GPU-only platform is evaluated using the cuDNN-Std setting. We do not evaluate a GRU version of RNN-T because cuDNN does not support the recurrent projection with GRU cells.
+
+Fig. 12 compares the training time for RNN-T. The ‘Others’ portion at the bottom of the bars corresponds to the prediction network and other non-RNN layers of RNN-T. When the batch size is one, the resulting speedup for the encoder network over cuDNN-Std is 2.7× and 4.2× on FARNN-9P and FARNN-13P, respectively. The total training time, including the training time for other parts of the model, also gets reduced by 40% on FARNN-9P and 48% on FARNN-13P. FARNN maintains its performance advantage up to the batch size of 4 and 8 on VU9P and VU13P, respectively.
+
+
+Fig. 12.
+RNN-T training performance comparison.
+
+Show All
+
+We also evaluate DS2 and RNN-T on a CPU-only platform and Google's TPU platform, which are practically used for DNN training tasks. For the CPU-only platform, we evaluated the applications on a 16-core Xeon 6130 using Intel DNNL. For the TPU platform, we used a Google TPU v3 instance with TensorFlow 2.5. However, these platforms are much slower than the evaluated platforms for small-batch RNN training tasks. For example, for DS2 LSTM, the CPU-only platform and the TPU platform are slower than cuDNN-Std for 6× and 5×, respectively.
+
+6.6 Energy Efficiency
+FARNN inherently draws more power compared to the GPU-only platform due to the additional FPGA. However, combined with the performance gain, FARNN can improve energy efficiency. Fig. 13 shows the average power and energy consumption measured during an epoch of RNN training. Power consumption is measured using an external power meter. We separately measure the system idle power without any GPU or FPGA accelerator platform installed. We exclude this idle power from the FARNN and the GPU-only platform's power consumption to emphasize the power penalty of FARNN over the GPU-only setup. The numbers in Fig. 13 are normalized to the GPU-only setup.
+
+
+Fig. 13.
+FARNN-9P power and energy consumption.
+
+Show All
+
+For DS2 LSTM with the batch size of one, FARNN draws 27% more power than GPU-only, but the total energy consumption is lower by 13%. The higher performance also contributes to the better energy-delay product (EDP) metric. For RNN-T training with the batch sizes of one and two, FARNN-VU9P reduces the EDP by 60% and 55%, respectively. For larger batch sizes, the energy efficiency of FARNN degrades mainly due to the decreased performance improvement. For example, FARNN-9P does not show a significant performance improvement over cuDNN-Std for DS2 GRU when batch size is four, but the FARNN draws more power.
+
+Fig. 13 does not include the power efficiency measurements of FARNN-VU13P configuration because it is simulated with dummy PEs, but FARNN-VU13P's higher performance will benefit the energy consumption and EDP.
+
+6.7 PCIe Lane Usage
+On a system with many accelerator cards, PCIe lanes are valuable assets. If each of the FPGA and GPU cards in FARNN uses 16 PCIe lanes (x16), FARNN occupies two-thirds of PCIe lanes of a single-socket Xeon 6130 CPU.
+
+We also tested a configuration that restricts each card to use 8 PCIe lanes only. In this setup, FARNN uses the same number of PCIe lanes as a single GPU setup, but the performance impact is limited to the weight matrix transfer only. For example, this setup increases the training time of DS2 LSTM by 6% only, which is still 39% better than GPU-only which uses a full x16 slot.
+
+6.8 FARNN on Newer Technology Generations
+We evaluated FARNN using the P100 GPU because it uses the same TSMC 16nm process as the Xilinx UltraScale+ FPGAs. For a fair comparison against a newer GPU (e.g., NVIDIA V100), a newer generation FPGA is required. Unfortunately, not all FPGA and GPU generations become available synchronously. Currently, the next generation Xilinx FPGAs (Versal family) are not fully released yet. Instead, we project the expected performance of FARNN on future platforms. We conservatively estimate the expected performance of FARNN with the future Versal FPGA (FARNN-VS) as follows:
+
+FARNN-VS's performance is simulated by doubling the number of (dummy) PEs from that of FARNN-13P. Versal 1802 FPGA is reported to double the logic and on-chip memory capacity from the current generation VU13P FPGA, and its FLOPS is 3× higher [64].
+
+FARNN-VS is still paired with the P100 GPU for the performance estimation, not V100. This gives an advantage to the V100-only platform.
+
+FARNN components other than the MVM units are not changed from FARNN-VU13P. (i.e., activation units, PCIe interface, and DDR controllers.
+
+The measured time includes the ‘Others’ part that are not affected by FARNN.
+
+The FPGA-GPU transfer overhead does not account for the faster PCIe 4.0 interface supported by the new FPGAs.
+
+Fig. 14 compares the projected performance of FARNN on Versal 1802 (FARNN-VS) against the V100 GPU when training Deep Speech 2 and RNN-T. The Tensor Cores in V100 would not be activated for batch sizes smaller than eight. Even with such a conservative projection, FARNN-VS is expected to outperforms V100 in many cases, by up to 45%. The estimated performance projects that FARNN can enhance its performance gain on future platforms as well.
+
+
+Fig. 14.
+FARNN performance projection on newer technology generations.
+
+Show All
+
+SECTION 7Comparison to Other FPGA-GPU Hybrid Architectures for DNN Training
+We compare FARNN to existing FPGA-GPU hybrid architectures for DNN training Table 3. Lit et al., proposed a combination of FPGA and GPU to provide an efficient solution for DNN usage scenario [65]. However, in [65], DNN training is served solely by the GPU platform and the FPGA platform is always used for inference computation only. Although the hybrid platform achieved a significant speedup over GPU for inference tasks, the tested model is a small DNN model (LeNet-5).
+
+TABLE 3 FPGA-GPU Hybrid Architectures for DNN Training
+
+He et al. proposed a hybrid DNN training platform called Hype-training that combines a GPU and multiple FPGAs [66]. Hype-training targets CNNs and Transformer models, and our FARNN targets RNN models. The main optimization target of Hype-training is improving energy efficiency rather than increasing the training performance. Therefore, even with multiple FPGAs (three FPGAs per GPU), the performance improvement is restricted. The maximum performance gain of Hype-training is up to 25% while our FARNN achieves up to 4.2× performance improvement over the GPU-only platform.
+
+SECTION 8Conclusion
+In this paper, we present a novel hybrid approach, called FARNN, that combines an FPGA and a GPU to optimize different parts of RNN computation. FARNN is the first hybrid RNN platform that accelerates RNN training for small batch sizes. We demonstrate the FARNN architecture using two representative types of RNNs: LSTM and GRU. We evaluate FARNN on the Xilinx UltraScale+ FPGA and the NVIDIA P100 GPU using two real RNN applications, Deep Speech 2 and RNN-T, as well as synthetic RNN layers of various configurations. The evaluation result indicates that it outperforms GPU-based platforms for small batch sizes, long input sequences, and many RNN cells per layer. Especially, FARNN is highly effective for training RNNs that have a relatively large number of parameters such as LSTM.

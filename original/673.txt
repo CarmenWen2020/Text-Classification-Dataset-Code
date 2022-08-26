@@ -1,0 +1,682 @@
+Abstract
+Nowadays, GPU accelerators are commonly used to speed up general-purpose computing tasks on a variety of hardware. However, due to the diversity of GPU architectures and processed data, optimization of codes for a particular type of hardware and specific data characteristics can be extremely challenging. The autotuning of performance-relevant source-code parameters allows for automatic optimization of applications and keeps their performance portable. Although the autotuning process typically results in code speed-up, searching the tuning space can bring unacceptable overhead if (i) the tuning space is vast and full of poorly-performing implementations, or (ii) the autotuning process has to be repeated frequently because of changes in processed data or migration to different hardware.
+
+In this paper, we introduce a novel method for searching generic tuning spaces. The tuning spaces can contain tuning parameters changing any user-defined property of the source code. The method takes advantage of collecting hardware performance counters (also known as profiling counters) during empirical tuning. Those counters are used to navigate the searching process towards faster implementations. The method requires the tuning space to be sampled on any GPU. It builds a problem-specific model, which can be used during autotuning on various, even previously unseen inputs or GPUs. Using a set of five benchmarks, we experimentally demonstrate that our method can speed up autotuning when an application needs to be ported to different hardware or when it needs to process data with different characteristics. We also compared our method to state of the art and show that our method is superior in terms of the number of searching steps and typically outperforms other searches in terms of convergence time.
+
+Keywords
+Auto-tuning
+Search method
+Performance counters
+Cuda
+
+1. Introduction
+In the recent decade, GPU accelerators have been used to speed up non-graphical applications on multiple classes of devices – from portable devices to supercomputers. Different models of GPU hardware vary significantly in terms of their architecture, even when manufactured by the same vendor. For example, there are eight generations of NVIDIA CUDA GPUs available, differing in the number of cores per multiprocessors, the presence of read/write L1 cache, the number of registers and more. Moreover, each generation contains a broad range of GPU models with different floating-point performance and memory bandwidth. As the hardware characteristics heavily influence the performance of a given GPU kernel, its code needs to be adapted for each GPU model to achieve optimal performance – otherwise, performance portability is not ensured [20], [25], [27]. Furthermore, kernels' performance is also sensitive to input size, structure, or application settings, so a code optimized for a certain input characteristics may run sub-optimally when those change [15], [24], [36].
+
+Autotuning is a method which allows codes to be automatically adjusted to given hardware and input [5]. During GPU kernel development, programmers define tuning parameters – the properties of the code which influence application performance. Each tuning parameter can take one of a pre-defined set of discrete values. The cross product of tuning parameters (potentially pruned by a priori known constraints) forms a tuning space. One point in tuning space, which defines how the computational kernel is created and executed, is called a tuning configuration. An autotuning framework searches the tuning space for a tuning configuration that minimizes a tuning objective, usually runtime or power consumption [5].
+
+Autotuning spaces have several properties that make their efficient search difficult. These discrete optimization spaces with many dimensions are known to be non-convex, non-linear and with low locality [6]. The time needed to perform a tuning space search can limit the practical usage of autotuning. This happens especially in two cases: (i) when the tuning space is vast, and most of its configurations perform poorly, thus the search takes long; (ii) when the performance depends significantly on input characteristics (e.g., size), which often change, thus the search needs to happen often.
+
+Methods for searching tuning spaces view their objective as a function of tuning parameters. Multiple methods for tuning specific optimization exist [9], [8], [42], [23], some of them leveraging performance counters [39], [35], [7], [30], [43]. Those methods are designed for fixed types of optimizations (i.e., tuning parameters) and can tune those parameters for unseen applications on the seen hardware. It is possible because they use a model for concrete optimization, so the model can be constructed using a base of many applications implementing the same type of optimization.
+
+In contrast, generic tuning spaces can contain any optimization the programmer implements, so the model cannot be constructed this way. State-of-the-art methods for searching generic tuning spaces (i.e., including any tuning parameters) are based on mathematical optimization [6], [40], or they use a surrogate performance/power model built from a sample of the tuning space [18], [28], [10], [11]. Because the function relating tuning parameters with the tuning objective differs with hardware and input, those methods require the autotuning to be repeated from scratch when hardware or input changes.
+
+The essential contribution of this paper is the introduction of a novel generic tuning space search method that breaks the aforementioned relation. Once the tuning space is partially explored for some hardware and input, the portable model makes it possible to speed up tuning when input or hardware changes. Our method mimics the iterative optimization performed by developers. Developers use profilers to collect performance counters and identify bottlenecks (overloaded processor subsystems) on multiple levels of hardware hierarchy. They also understand how the properties of their code (i.e., tuning parameters) are related to performance counters. They iteratively detect bottlenecks and modify the code to reduce stress on the bottlenecks until they reach sufficient code performance. Our method aims to do the same. It requires a training phase, wherein the model is trained to capture how tuning parameters influence performance counters (machine-learning based analogy to a developer's understanding of the relationship). During autotuning, the method iteratively profiles the code and acquires performance counters, analyzes bottlenecks and determines which performance counters should be changed to soften the bottlenecks using an expert system (analogy to a developer's work with a profiling tool). Then, it uses the model to determine which tuning configurations change performance counters in the required way. Finally, it selects the next tuning configuration to profile (analogy to a developer's modification of the code).
+
+The strength of our method is its ability to build a model using a particular GPU and input, and use this model to speed up autotuning of a kernel running on a different GPU or processing different input. This is possible because the method builds the model of relations between tuning parameters and performance counters and searches for the performance gain based on the performance counters, instead of relating tuning parameters directly to the performance, as is done in [6], [40], [18], [28], [10], [11]. We distinguish two types of performance counters: the counters measuring stress of a processor subsystem, called 
+, and counters measuring amount of operations on a processor subsystem, called 
+ (assignment of selected NVIDIA GPU performance counters between those sets is shown in Table 1). Compared to the performance itself, the tuning parameters affect performance counters 
+ in a more straightforward and stable way. This is illustrated in Fig. 1 for the Coulomb sum benchmark (described in the next section of this paper). In this example, the relation of the depicted tuning parameter to kernel runtime changes significantly with different input and hardware, whereas the relation between the tuning parameter and normalized values of performance counters 
+ remains stable.1 As we show in this paper, the stability of the relation between tuning parameters and performance counters when changing hardware or input makes it possible to train and use models created from historical tuning data to speed up tuning space search with various benchmarks.
+
+
+Table 1. List of performance couters and their abbreviations for GPUs. For counters implemented for Volta generation and newer, the conversion ratio (if any) is written next to the counter.
+
+Counter (prior Volta)	Counter (Volta and newer)	Abbr.	Type
+dram_read_transactions	dram__sectors_read.sum	DRAM_RT	Ops.
+dram_write_transactions	dram__sectors_write.sum	DRAM_WT	Ops.
+l2_read_transactions	lts__t_sectors_op_read.sum	L2_RT	Ops.
+l2_write_transactions	lts__t_sectors_op_write.sum	L2_WT	Ops.
+tex_cache_transactions	l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum	TEX_RWT	Ops.
+local_memory_overhead	l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum	LOC_O	Ops.
+shared_load_transactions	l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum	SHR_LT	Ops.
+shared_store_transactions	l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum	SHR_WT	Ops.
+inst_fp_32	smsp__sass_thread_inst_executed_op_fp32_pred_on.sum	INST_F32	Ops.
+inst_fp_64	smsp__sass_thread_inst_executed_op_fp64_pred_on.sum	INST_F64	Ops.
+inst_integer	smsp__sass_thread_inst_executed_op_integer_pred_on.sum	INST_INT	Ops.
+inst_misc	smsp__sass_thread_inst_executed_op_misc_pred_on.sum	INST_MISC	Ops.
+inst_compute_ld_st	smsp__sass_thread_inst_executed_op_memory_pred_on.sum	INST_LDST	Ops.
+inst_control	smsp__sass_thread_inst_executed_op_control_pred_on.sum	INST_CONT	Ops.
+inst_bit_convert	smsp__sass_thread_inst_executed_op_conversion_pred_on.sum	INST_BCONV	Ops.
+inst_executed	smsp__inst_executed.sum	INST_EXE	Ops.
+issue_slot_utilization	smsp__issue_active.avg.pct_of_peak_sustained_active	INST_ISSUE_U	Ops.
+dram_utilization	dram__throughput.avg.pct_of_peak_sustained_elapsed :10	DRAM_U	Stress
+l2_utilization	lts__t_sectors.avg.pct_of_peak_sustained_elapsed	L2_U	Stress
+tex_utilization	l1tex__t_requests_pipe_lsu_mem_global_op_ld.avg.pct_of_peak_sustained_active :10	TEX_U	Stress
+shared_utilization	l1tex__data_pipe_lsu_wavefronts_mem_shared.avg.pct_of_peak_sustained_elapsed :10	SHR_U	Stress
+sm_efficiency	smsp__cycles_active.avg.pct_of_peak_sustained_elapsed	SM_E	Stress
+warp_execution_efficiency	smsp__thread_inst_executed_per_inst_executed.ratio ⋅100:32	WARP_E	Stress
+warp_nonpred_execution_efficiency	smsp__thread_inst_executed_per_inst_executed.pct	WARP_NP_E	Stress
+Fig. 1
+Download : Download high-res image (204KB)
+Download : Download full-size image
+Fig. 1. Dependence between a tuning parameter and various properties of the kernel, shown on Coulomb summation [13] running with large gridbox on GeForce GTX 750 and with small gridbox on GeForce GTX 1070. The x-axis shows a tuning parameter changing thread coarsening. The y-axis shows normalized values of selected properties: kernel runtime, L2 cache read transactions, texture cache read transactions and 32-bit floating-point operations. (For interpretation of the colors in the figure(s), the reader is referred to the web version of this article.)
+
+The evaluation is performed on a benchmark set of five kernels taken from [25], [27]. The obtained result shows that measuring the performance counters and using a model created from historical tuning data can bias the search process towards faster convergence. The proposed profile-based searcher systematically outperforms random search using a model created on different GPU, different input, or smaller tuning space. The proposed searcher also outperforms Basin Hopping implemented in Kernel Tuner [40] and regression-tree model implemented in Starchart [18] in most cases.
+
+The paper makes the following major contributions:
+
+•
+Using hardware performance counters to navigate searching of tuning space. The proposed profile-based searcher is agnostic to the type of tuning parameters included in the tuning space (both their number and the code properties they tune). To the best of our knowledge, this is the first generic autotuning searcher using performance counters to speed up tuning space searching convergence with arbitrary tuning parameters that are unknown at the time of the searcher design.
+
+•
+Comprehensive evaluation of the proposed profile-based searcher. The proposed searcher is tested in multiple scenarios, including performance portability across various hardware, input, and tuning spaces, using five benchmarks and four GPU architectures. We have also compared our searcher to an optimization-based searcher [40] and a model-based searcher [18], showing that the proposed searcher converges faster to the near-optimal configuration in most cases.
+
+•
+Integration of the searcher into a real-world tuning framework. The proposed profile-based searcher is implemented within Kernel Tuning Toolkit (KTT) [27]. Therefore, it is possible to measure the real speed of searching convergence. Moreover, the tuning framework with the searcher and experimental data [12] is freely available to the community.2
+
+The rest of the paper is organized as follows. In Section 2, an example of manual tuning using performance counters is given. This example serves to illustrate the process which our framework intends to automate. The proposed search method is described in Section 3. Section 4 evaluates the proposed searcher and compares it to alternative approaches. The related work is described in Section 5. We conclude and outline the future work in Section 6.
+
+2. Example of manual tuning space search
+In this section, we demonstrate a manual approach to tuning space search using hardware performance counters. This example aims to ease the understanding of the concepts behind our proposed automatic searcher described in the next section.
+
+2.1. Direct Coulomb summation
+We use a simplified version of the 3D implementation of Direct Coulomb Summation introduced in [13] as an example. With Direct Coulomb Summation, the electrostatic potential around a molecule is computed on a regular grid. For each grid point 
+, we compute:(1)
+ 
+ 
+ where n is the number of atoms, 
+ is the charge of j-th atom, 
+ is the Euclidean distance between atom j and grid point i, and 
+ is vacuum permittivity.
+
+Listing 1 shows the source code of the simplified Direct Coulomb Summation kernel. The input of the kernel consists of atomInfo, containing atom coordinates and charges in a vector (x, y, z represent coordinates of the atom, w represents charge divided by 
+), numberOfAtoms represents the number of atoms in atomInfo, gridSpacing is the size of a grid cell, gridSize is the number of grid cells in each dimension and energyGrid contains output potential energy grid.
+
+Listing 1
+Download : Download high-res image (197KB)
+Download : Download full-size image
+Listing 1. Direct Coulomb Summation kernel.
+
+In our implementation, one GPU thread computes one or more grid points, determined by the value of Z_ITERATIONS, which is the only tuning parameter in this example. For each grid point, Equation (1) is computed. The code is expected to be compute-bound for two reasons: (i) for each atom's data loaded into the registers, we can compute values of multiple grid points, and (ii) all the threads within a warp load the same atom at the same time, so the code can benefit from good cache locality.
+
+The code is autotuned by the KTT framework [27]. KTT passes the tuning parameter via preprocessor macro Z_ITERATIONS. For the sake of simplicity, we do not optimize thread block size in this example. When tuning the code, we will assign values from the set  to the tuning parameter.
+
+2.2. Understanding the effect of the tuning parameter
+Higher values of Z_ITERATIONS improve data locality in registers: once atom coordinates and charge are read (lines 27-30), they are used multiple times in the loop beginning at line 32. Moreover, this parameter reduces invariant computation of ⁎⁎. However, a value of Z_ITERATIONS that is too high reduces strong scaling (the kernel is executed by a lower amount of threads) and increases register consumption, which can lead to lower GPU occupancy or usage of slow local memory for register spilling. Knowing and understanding how tuning parameters relate to performance counters is part of a developer's expertise.
+
+When profiling the code, the developer can set the value of the tuning parameter by observing hardware performance counters. In this example, several counters are highly relevant (some of them shown in Fig. 1):
+
+•
+utilization of floating point (FP) units: if high, Z_ITERATIONS should be set to a higher value (to reduce the number of FP operations by computing dX * dX + dY * dY fewer times);
+
+•
+utilization of texture or L2 cache: if high (and not caused by register spilling), Z_ITERATIONS should be set to a higher value (to improve cache locality);
+
+•
+GPU occupancy: if low, Z_ITERATIONS should be set to a lower value (to improve strong scaling);
+
+•
+the amount of local memory: if high, Z_ITERATIONS should be set to a lower value in case utilization of any part of the memory subsystem is also high (to decrease bandwidth introduced by register spills).
+
+Knowing and understanding how performance counters relate to bottlenecks is also part of a developer's expertise.
+
+In this simple example, we only search a one-dimensional tuning space. However, the rules mentioned here also apply with multiple tuning parameters: in such a case, the resulting kernel runtime and performance counter values are determined by a mixed effect of all tuning parameters, but Z_ITERATIONS still affects performance counters in the same way.
+
+2.3. Tuning space search
+Let us test our kernel using GeForce GTX 1070 with a grid of  points and 64 atoms. The kernel should be compute-bound; therefore, we expect to have high utilization of FP units when tuned. Lets' set Z_ITERATIONS to 1. When profiled, the kernel runtime is 10,475 μs. Performance counters point to a clear bottleneck in the texture cache (utilization level 9 out of 10), whereas FP instruction units are not highly loaded (utilization level 3 out of 10). Therefore, we raise the value of Z_ITERATIONS to 32 to improve register locality. Now, the performance improves significantly: the kernel is executed in 1,531 μs. The performance counters show the following: texture cache utilization dropped from 9 to 3, FP utilization is 8, reported GPU occupancy is 0.6 (out of 1.0). We can try to increase occupancy to reduce pipeline and memory latencies. We set Z_ITERATIONS to 8 and get a slightly better runtime of 1,497 μs. The GPU occupancy is now 0.98, FP utilization is 0.9 and texture cache utilization is 9. The texture cache utilization can be lowered by setting Z_ITERATIONS to 16; however, this change does not lead to performance improvement; therefore, we can consider the kernel to be tuned.
+
+Now, consider a change of the input data: using the same GPU, we will compute a grid of  points and 4096 atoms. The previously tuned implementation, setting Z_ITERATIONS to 8, yields a runtime of 394 μs. Occupancy of this implementation is 0.11. Some speedup can be reached by increasing occupancy, so we need to explore values lower than 8 for Z_ITERATIONS. When set to 4, the runtime is improved to 260 μs. Occupancy is improved to 0.17, and we can already see the bottleneck on texture cache (utilization level 8), which suggests we should not decrease Z_ITERATIONS further. When we try to set Z_ITERATIONS to 2, the runtime increases to 428 μs. Although occupancy is improved to 0.32, the implementation is limited by the texture cache, which now reports utilization level 9. Therefore, we consider tuning to be finished, considering 4 to be the best value for Z_ITERATIONS.
+
+2.4. Take-away from the example
+In this section, we showed how tuning is performed rationally by an expert programmer, who understands the relation between tuning parameters and performance counters, as well as the relation between performance counters and bottlenecks. The programmer profiles the tuned code and analyzes the observed bottlenecks. Then, they determine the direction of change of the tuning parameter based on an expected effect on performance counters. In the next section, we describe how to automatize the entire process.
+
+3. Proposed search method
+In this section, we describe the basic idea and assumptions of the proposed profile-based search method, and then we focus on the details of our current implementation.
+
+3.1. On profiling counters
+The tuning parameters (TPs) are tuned in order to optimize the code by balancing the usage of different processor subsystems. They change the properties of the code, thus lowering the stress on one processor subsystem and increasing the stress on another one.3 For example, thread coarsening tuning mentioned in the previous section decreases the number of arithmetic operations and memory footprint (decreases the stress on floating-point units and memory subsystem), whereas it increases register consumption and decreases parallelism (increases stress on the latency-hiding mechanism and strong scaling). Another example would be employing the shared memory for a variable, which decreases the amount of global memory accesses but increases shared memory accesses (decreasing stress on L2 cache and global memory while increasing stress on shared memory).
+
+The profiling counters (PCs) capture the workload of different hardware subsystems. Although each vendor implements their own PCs, we can distinguish two fundamentally different categories of PCs: (i) the counters measuring the stress on a processor subsystem, called 
+, and (ii) the counters measuring the number of operations performed, or the amount of resources used on the subsystem, called 
+. For example, 
+ can contain PCs measuring the relative utilization of floating-point units or global memory bandwidth, whereas 
+ can contain the number of floating-point instructions or memory instructions.
+
+The value of a profiling counter  depends, in general, on all values of tuning parameters in TP, the input  and the GPU hardware . We can formalize this relation by defining the function f:(2) For simplicity, we assume that the compiler version or switches stay the same. The dependence of the function f on I and GPU differs when we distinguish between 
+ and 
+. The value of 
+ is strongly dependent on the GPU model and input: for example, when a GPU with a higher flop-to-word ratio is used, the utilization of floating-point units can be lower as the profiled kernel becomes memory-bound. On the other hand, the amount of floating-point instructions, measured by a profiling counter of type 
+, depends on the GPU model weakly (it can be affected by the GPU instruction set, but not greatly). Therefore, we can define function g:(3) as an approximation of f independent on GPU hardware:(4) Moreover, the partial derivative of the function g w.r.t. input is not changed significantly:(5)
+ 
+ 
+ considering inputs 
+ and 
+ of different sizes. In other words, when a variation in the value of a tuning parameter changes the number of operations performed on a particular processor subsystem, it does it independently on the input size. For example, thread coarsening decreases the number of floating-point operations in some ratio, although the actual amount of floating-point operations is determined by the input size.
+
+Approximating f by g suffers some imprecision in 
+ related to cache and memory subsystem. Since different GPU architectures have different cache sizes, the threshold of cache capacity-misses differs across GPU architectures. Therefore, TP controlling cache blocking will start to increase the amount of operations on different cache levels at a different value of TP. However, this imprecision should only be observed within a small range of TP values, which causes the cache footprint to be close to the GPU cache capacity. This effect can be seen in our example shown in Fig. 1, where the amount of floating-point instructions and texture cache transactions is similar on both experiments shown in the Fig. 1, whereas the L2 cache workload is changed by the tuning parameter more significantly when solving a larger gridbox on GTX 1070.
+
+This observation on the relationship between TPs, input size, hardware model, and PCs is essential for the proposed searcher. The searcher can use a model of the stable relationship between TPs and 
+ created on any GPU and input, and navigate tuning space searching according to the actually measured 
+ and 
+.
+
+3.2. Basic idea
+Our search method aims to mimic the process of the developer when optimizing performance. Similarly to the developer, the method profiles the tuned code, analyzes observed bottlenecks and decides how to change the tuning parameters to suppress them.
+
+We capture the developer's expertise regarding how TPs relate to PCs in a model, and we capture how performance counters relate to bottlenecks in an expert system. The model describes the relation between TPs and 
+, which remains stable with respect to GPU hardware and input changes, so the model does not need to be re-trained. We can view the model as a component that allows the searcher to understand how changing the tuning parameters decreases or increases the stress on a processor subsystem (but cannot predict how stressed the subsystem would be: this is measured by 
+ during tuning). When any tuning configuration is executed, performance counters from both 
+ and 
+ are measured. The expert system then identifies bottlenecks: it deduces which subsystems are overloaded with the current combination of tuning configuration, input and GPU.
+
+As the model knows the relation between TPs and 
+, the searcher can select a tuning configuration which decreases the stress on the overloaded subsystems (by decreasing the number of operations on those subsystems measured by 
+). This workflow can be seen in our example manual search, described in Section 2.3 – the developer measured the actual utilization of texture cache, floating-point units, and GPU occupancy (measured by counters from 
+). Then, they changed thread coarsening in order to decrease the amount of texture memory operations, floating-point operations, or to increase parallelism (measured by counters from 
+).
+
+Summarizing, we formulate three assumptions, which can be empirically tested:
+
+1.
+it is possible to determine the computational bottlenecks from the values of performance counters (both 
+ and 
+);
+
+2.
+it is possible to determine which 
+ need to be changed to suppress the bottlenecks;
+
+3.
+the relation between TP and 
+ is sufficiently portable across different GPUs and problem inputs.
+
+The first and second assumptions are based on knowledge of how performance counters work. If something seriously hinders the performance, performance counters should be able to reflect that in some manner (the first assumption). When the bottleneck is known, it is possible to determine which 
+ reflects it and therefore, which type of operations should be reduced to improve the performance. We aim to mirror this process by creating an expert system for bottleneck analysis using available documentation and our expertise – details are in Section 3.5. We evaluate these two assumptions experimentally in Section 4.3.
+
+The third assumption has been discussed in Section 3.1. We further evaluate the third assumption experimentally in Section 4.4 and Section 4.5.
+
+Overall, if all of our assumptions are true, it is possible to mimic the process of a developer's performance optimization during autotuning using the following steps:
+
+•
+start with a certain tuning configuration;
+
+•
+measure PCs of the tuned kernel, e.g., the amount of local memory used;
+
+•
+determine the bottlenecks using the expert system, e.g., the bandwidth on multiple levels of the memory hierarchy is high;
+
+•
+determine the desired change in PCs (denoted as ΔPC from now on), with the expert system, e.g., lower the amount of local memory used;
+
+•
+evaluate which tuning configurations change PCs in the desired way using the model, e.g., those which have lower Z_ITERATIONS than the profiled configuration;
+
+•
+select the next tuning configuration.
+
+We replace the selection of the next tuning configuration, usually done by the developer, with a step of random search biased by a score determining the likelihood of changing PCs in the required direction.
+To sum up, we move from given values of TPs (defining a tuning configuration) through PCs (performance counters) to bottlenecks, and then from bottlenecks through ΔPC (changes to performance counters) back to the new set of TP (new tuning configuration).
+
+3.3. The architecture
+During the training phase, two components are used. KTT is responsible for executing tuning and gathering PCs on a sample or a complete tuning space. Then, a model is built from the tuning data using any of the methods described in Section 3.4. Both components are problem- and GPU-independent. The raw tuning data are problem-, GPU- and input-dependent. The model is still problem-dependent (different problems can have completely different TP), but, according to the third hypothesis, it is independent on GPU model and input.
+
+During the autotuning for GPU and input of our interest, KTT is used to collect 
+ and 
+. Then, the component called bottleneck analysis analyzes 
+ to determine bottlenecks. It also uses 
+ to distinguish the source of the bottleneck more precisely (e.g., if global memory bandwidth is the bottleneck, it uses the number of memory transactions to recognize how much the bottleneck is caused by memory reads or stores). The ΔPC computation component determines the required change of 
+. The bottleneck analysis and ΔPC computation components are GPU-dependent, because performance counters have been changed or extended several times as GPUs have evolved. Therefore, those components contain explicit support for different sets of performance counters. It is important to note that the bottleneck component analyzes the bottlenecks of the GPU architecture which is used for autotuning, whereas changes of 
+ are computed for the GPU architecture the model was built on during the training phase. Therefore, we can use one model to steer autotuning on multiple architectures.4 When the required changes of 
+ are determined, the component called configurations scoring computes the scores of the tuning configurations. It uses the model to predict 
+ according to TP and set higher scores to configurations which are predicted to change 
+ in the required way. With the scores set, the searching step component performs a step by selecting the next configuration for KTT to benchmark and profile.
+
+3.4. Modeling relation between tuning parameters and performance counters
+In this section, we describe the models for how TPs relate to PCs. These models are created during the training phase (see the left part of Fig. 2), i.e., before autotuning. The training phase is broken into two components. KTT autotuning samples the entire or partial tuning space, and it stores the resulting TPs, PCs, and runtimes. Those data are then processed by the model creation component, which uses a ML method to create a model of relations between TPs and 
+. During autotuning, we use the model to evaluate which tuning configurations change PCs in the desired way (i.e., from ΔPC to TPs), as described in detail in section 3.6.
+
+3.4.1. Least-square regression non-linear models
+We model the relation between TPs and PCs through non-linear regression models. As an input, we take the whole or a part of the tuning space that has been evaluated and profiled – for each tuning configuration, performance counters are measured. We split the tuning space into subspaces determined by the values of binary tuning parameters (e.g., in a tuning space with three binary parameters, we split into 
+ subspaces). For each subspace, we select datapoints for training in a deliberate way – for each non-binary parameter, we choose two or three values to keep the total number of value combinations relatively low, but to make the sampling of the subspace rather even despite constraints. The model for each profiling counter includes the main effects of each non-binary tuning parameter, their interactions (even those of a high order) and their influences of quadratic nature. We applied the least-square regression method to compute the coefficients. Therefore, as an output, we end up with several models for each profiling counter, where the values of binary tuning parameters determine the applicability of the model. The predictions themselves can be computed using the values of non-binary tuning parameters.
+
+For example, consider adding a parameter controlling the use of constant memory for atoms in the example described in Section 2. Such a parameter is binary (one if constant memory is used and zero if it is not). Therefore, two models are created to capture relations between PCs and Z_ITERATIONS for using and not using constant memory.
+
+3.4.2. Decision tree
+Decision tree builds regression or classification models in the form of a tree structure. It breaks down a dataset into smaller and smaller subsets while at the same time an associated decision tree is incrementally developed. The final result is a tree with decision nodes and leaf nodes. A decision node has two or more branches, each representing values for the attribute tested (TPs in our case). Leaf node represents a decision on the numerical target (values of PCs). The topmost decision node in a tree corresponds to the best predictor called the root node. Decision trees can handle both categorical and numerical data.
+
+The core algorithm for building decision trees called ID3 [29] employs a top-down, greedy search through the space of possible branches with no backtracking. The ID3 algorithm can be used to construct a decision tree for regression by replacing Information Gain with Standard Deviation Reduction. The decision of making strategic splits affects a tree's accuracy heavily. The decision criteria are different for classification and regression trees. Regression trees usually use mean squared error (MSE) to decide to split a node into two or more sub-nodes.
+
+We generate a set of candidate trees. The randomly selected 50% of the explored tuning space is used for training, and the rest is used for testing. We also alter parent nodes of the trees. We compute MAE (Mean Absolute Error) and RMSE (Root Mean Square Error) for those trees, and select the one with the lowest MAE – in case of a tie, we select the one with lower RMSE). The selected tree is then used to predict PCs for unknown configurations.
+
+3.5. Bottleneck detection and reaction
+In this section, we describe how we get from PCs to bottlenecks and from bottlenecks to ΔPC. This part is performed by expert systems which read performance counters, analytically determine bottlenecks, and create a vector of required changes of 
+.
+
+The components described in this section do two steps – the first component takes performance counters measured on an actually executed kernel and computes bottlenecks. The second component takes bottlenecks and computes changes in performance counters for the architecture of the model. Therefore, the components have to know the PCs of the currently executed kernel, the architecture of the GPU where the kernel was executed, and the architecture of the GPU the model was created for.
+
+Since the performance counters changed completely for Volta generation and newer, the components are implemented for multiple sets of counters. The implementation is limited by our understanding of NVIDIA GPU's performance counters, and we believe there is still room for improvement if the counters were documented in greater detail, or if the entire expert system was replaced by a machine learning model. We have developed the expert system using NVIDIA CUPTI documentation for CUDA 10.0. To improve our understanding of the counters' values, we have also used some benchmarks available in KTT. However, to avoid overfitting the expert system to our benchmarks, we have only used three benchmarks for its development (Coulomb sum, n-body and Matrix transposition), while the rest of the benchmarks have been used for evaluation of our searcher after it was developed.
+
+3.5.1. Bottleneck analysis
+The bottleneck analysis uses a set of performance counters described in Table 1. We use abbreviations of those counters in the following text and formulas. The table also shows the equivalency of old (i.e., on GPUs prior to Volta) and new (i.e., on Volta and newer) counters; applied adjustments or rescalings (e.g., the old version of counters measures rank in , whereas the new version measures percentage in ); and classification of counters into 
+ or 
+. Note that the equivalence of new and old performance counters is not completely documented, so we compute it according to our understanding of what counters measure. Also note that we have assigned INST_ISSUE_U into 
+, because it quantifies the ratio of instruction cycles which cannot be used to issue instructions (for instance, due to synchronizations).
+
+Bottlenecks are represented by a vector 
+, where 
+. A zero value of the bottleneck means that the component is not stressed, while the value 1 represents the component being on the theoretical peak of its performance. Bottlenecks are divided into several categories, representing stress on various memory types, instructions and utilization of GPU parallelism.
+
+The memory subsystems bottleneck analysis is computed in the same way for global memory, shared memory and L2 cache. The utilization of the memory, reported by performance counter DRAM_U, is scaled into  and weighted by the ratio of read and write transactions. Equation (6) shows the computation of the bottleneck for global memory read, Equation (7) shows the computation of the bottleneck for global memory write. For shared memory and L2 cache, the computation is analogous, using SHR_LT, SHR_WT, SHR_U and L2_RT, L2_WT, L2_U, respectively.(6)
+ 
+ 
+(7)
+ 
+ 
+
+To compute the utilization of texture (data) cache, we only scale the counter TEX_U to interval , as the cache is read-only and therefore there are no write transactions.
+
+The situation is more complicated with local memory. To the best of our knowledge, the LOC_O performance counter gives us a relative number of local memory data transfers. Therefore, even high local memory overhead does not imply the local memory is a real bottleneck if no memory subsystem is overloaded. Consequently, we weight local memory overhead by the maximal utilization of memories in the way: global, L2 and texture, see Equation (8).(8)
+ 
+ 
+ 
+ 
+
+Special performance counters measure the utilization of instructions. However, we found those counters not to be very reliable, or we do not fully understand what they measure (for example, the matrix transposition example, which uses no floating point computations, reports high utilization of FP32 units in some configurations). Therefore, we derive the utilization from the overall amount of instructions. First, we compute the 
+ value using Equation (9), which computes the number of instructions (INST_EXE computes at the warp level; therefore, it has to be multiplied by 32), corrected by the efficiency of instruction execution (i.e., how many threads in the warp perform useful work).(9)
+ 
+ 
+
+Then, we compute the utilization of the issue slot. For GPUs prior to Volta, we use 
+ 
+. For Volta and newer, as those GPUs allow us to issue integer and floating-point instructions separately, we compute 
+ 
+. Therefore, the component considers full utilization of one instruction path as perfect utilization and cannot optimize toward better utilization of dual-issue in the current implementation. The utilization of FP32 units is computed using Equation (10). An analogous computation is performed for INST_F64, INST_INT, INST_MISC, INST_LDST, INST_CONT and INST_BCONV.(10)
+ 
+
+Finally, the bottleneck formed by the insufficient instruction issue utilization is computed. First, we compute maximal utilization across all types of instructions:(11)
+ 
+ 
+ Then, the bottleneck of instruction issue is computed using Equation (12).(12)
+ 
+
+Insufficient parallelism is computed as(13)
+ 
+
+An additional bottleneck of insufficient parallelism is computed from the number of CUDA threads and the number of CUDA cores, as shown in Equation (14). It is an empirical computation, requiring five threads per CUDA core to set the parallelism bottleneck to zero. However, we have found it useful to add this bottleneck alongside 
+, as it captures the cases where all SMs are occupied, but the actual occupancy is low due to small number of threads running per SM.(14)
+
+3.5.2. ΔPC computation
+When the bottleneck vector is computed, it is passed to the component responsible for computing required changes to PCs. The required changes are represented as the vector 
+, where 
+. The 
+ vector contains the required changes to the performance counters 
+. A negative value means that the counter value should be decreased, while a positive value means that the counter should be increased – zero means no change is required.
+
+There is one additional parameter for 
+ computation: inst_reaction. It determines the threshold of instruction-related bottleneck values, which triggers the changes of 
+. The motivation behind the introduction of  parameter is as follows. The instructions have very low latency (compared to the memory subsystem). Therefore, they do not form a serious bottleneck unless there is high stress on the component performing the instructions. In case of no significant bottleneck for the kernel, the low bottlenecks related to instructions are ignored, and the memory is optimized, which should decrease latency and introduce a new bottleneck, either instruction- or memory-related. In our implementation, the inst_reaction is set to 0.7. If user sets that the instruction-bound problem is optimized, inst_reaction is set to 0.5, which slightly improves results for compute-bound problems as the reaction on appearing instructions-related bottleneck is faster.
+
+The changes of PCs related to the memory subsystems are computed straightforwardly: their value is set as the inverse value of the corresponding bottleneck, for example, 
+.
+
+The instruction-related PCs are set only if the corresponding bottleneck value exceeds , as shown in Equation 15. An analogous computation is performed for all instruction-related bottlenecks including 
+.(15)
+ 
+
+The parallelism-related bottlenecks are applied straightforwardly, without inverting the bottleneck value: 
+ and 
+. Note that 
+ is not a true hardware performance counter, but represents the number of threads reported by KTT, which is added to the set of performance counters.
+
+3.6. Configurations scoring
+Let 
+ be the configuration which has been empirically profiled during autotuning. Let ΔPC be the required changes of PCs to soften bottlenecks (see Section 3.5.2) of the configuration 
+. To score an unexplored tuning configuration 
+, we need to estimate whether the configuration 
+ changes PCs (compared to 
+) in a direction defined by 
+.
+
+Since autotuning can be executed on a different GPU and different input, we cannot directly compare estimated PCs of 
+ to measured PCs of 
+. Instead, we use a model described in Section 3.4 to estimate PCs of both configurations: let 
+ be PCs of 
+ estimated by the model and 
+ be PCs of 
+ estimated by the model. The score s of the configuration 
+ is computed using Equation (16).(16) 
+ 
+ 
+ where 
+ is the set of profiling counters with non-zero predictions for profiled and candidate configurations: 
+ and where 
+ means performance counter p.
+
+We compute all scores 
+ for configurations of our interest. Then, the score values are further processed. The lowest and highest score are stored in 
+ and 
+, respectively. The score for each configuration is normalized into interval  as follows:(17)
+ 
+ 
+
+The normalized score is used to bias the probability of selecting that configuration. Equation (17) ensures strong preference of high scores (positive scores are amplified into  by normalization). However, it also allows for the selection of negative scores, albeit with very low probability. If the score before normalization is below cutoff threshold γ (defined as −0.25 in our implementation), the normalized score is set to 0.0001. Negative scores greater than γ are scaled similarly to the positive scores. Setting non-zero probability for negative scores is important in situations where all unexplored configurations seem worse than 
+, which either indicates that the tuning has reached the optimum, or that it got stuck in a local optimum due to inaccuracy in the model or in the expert system decision.
+
+3.7. Searching step
+Our current implementation uses weighted random search, where the random selection is biased towards configurations which should soften bottlenecks found within the last profiled configuration. It is the most straightforward approach, which allows for direct comparison to (unweighted) random search. However, we believe that more sophisticated searching methods could be implemented in the future.
+
+The complete workflow of the search is described by Algorithm 1. The algorithm takes several variables as input: TS is a tuning space (i.e., an array containing all tuning configurations), M is a model of the relation between TPs and PCs, n is the number of steps performed without collecting performance counters and i is the number of iterations for collecting performance counters (i.e., the number of empirical tests is ). Note that CUDA kernels are executed faster when no performance counters are collected. Therefore, executing runs without collecting performance counters helps to find a fast kernel more quickly, although with the cost of performing more empirical search steps. The default value of n is set to 5 in our implementation.
+
+Algorithm 1
+Download : Download high-res image (116KB)
+Download : Download full-size image
+Algorithm 1. Searching tuning space with performance counters.
+
+Algorithm 1 uses the following components. In Line 3, the empirical evaluation of kernel 
+ is performed and its runtime and PCs are stored into t, 
+ and 
+. Then, bottlenecks are determined and stored in b in line 4. After bottleneck detection, the searcher computes a reaction to the bottlenecks in line 5. The reaction is stored in the form of the required change of performance counters 
+. In the current implementation, the algorithm scores all tuning configurations according to the required change of performance counters: it uses model M to determine if a tuning configuration changes performance counters in a direction required by 
+, see line 9.5 With the scored tuning space, the algorithm selects n kernels to benchmark without gathering performance counters. In the loop starting at line 16, the algorithm selects a configuration with a probability weighted by the score obtained in line 9. Then, the benchmarking of the selected configuration is performed. The fastest observed configuration is used for the next profiling run (performed in line 3).
+
+3.8. Implementation
+The main part of the proposed profile-based searcher is implemented in Python in its current version. As KTT is implemented in C++, there is a simple stub searcher code in KTT, which communicates with the main part of the searcher via files and sockets. The reason for Python implementation is easier experimenting with the searcher code as well as a broad range of easy-to-use machine learning algorithms. Nevertheless, such implementation has also a disadvantage in code performance. It is possible to rewrite the searcher code into C++ in the future.
+
+The searcher consists of two parts: an application building the model and a plugin into KTT, which implements the proposed searcher method. The searcher is available in profile-searcher directory in KTT.6
+
+3.9. Limitations of the current implementation
+Although the proposed profile-based searcher is fully capable of searching the tuning space, biasing the search towards faster implementations, there are still many open research topics which can lead to the improvement of the searcher.
+
+3.9.1. Using local search method
+Currently, our implementation biases a simple random searcher. Although a random searcher is very robust, it is a global search method, which cannot speed up its convergence by following the gradient of the optimized function. Our searcher allows us to estimate which configurations should improve performance. This estimation could be used as an estimation of the gradient of the performance function, and thus a gradient-based searching method could be used. As shown in [40], local searching methods can be successful, especially in combination with a global searching method, which allows them to overcome local optima.
+
+3.9.2. Improving model of TPs-PCs relations
+Currently, the relations of TPs to PCs are always modeled for the GPU where the model was constructed. Although it is sufficient to steer the tuning space search, it cannot precisely model the effect of cache capacity misses. We believe that it is possible to create a model which can correct cache-related PCs according to detected caching capabilities of the GPU used for autotuning.
+
+3.9.3. Improving bottleneck analysis and reaction
+Our current expert system for bottleneck analysis and computation of the required changes of PCs works with a subset of PCs which are available on GPUs. For example, PCs related to execution stall reasons are not used at all. Although it is not easy to construct an expert system which would interpret all PCs, it could be possible to replace the expert system with a machine learning model which could overcome our limited understanding of PCs interpretation. To construct the model, we can use multiple benchmarks and GPUs available. Moreover, each benchmark consists of a high number of tuning configurations; therefore, it is not too difficult to generate a high volume of training and testing data.
+
+The runtime of kernel profiling is determined by the type and amount of gathered hardware performance counters. Together with improving bottleneck analysis and reaction system, we could test if some counters are mostly redundant and reduce their amount, similarly to [1].
+
+4. Evaluation
+In this section, we evaluate our proposed profile-based searcher. First, we describe the methodology of the benchmarks and the testbed setup. Then, we evaluate how random step biasing influences the searcher performance when using a model created for the same setup, for a different GPU or for a different input. We also evaluate the convergence time of the proposed method. Finally, we compare our method with model-based tuning using Starchart [18] and with optimization-based tuning using Kernel Tuner [40].
+
+4.1. Methodology
+We have performed two types of evaluation:
+
+•
+measuring the number of empirical tests of kernels (i.e., searcher steps);
+
+•
+measuring tuning convergence in time.
+
+The empirical test means that the kernel is compiled and executed in the selected tuning configuration. The number of empirical tests allows us to directly compare the efficiency of the proposed profile-based search method: how many empirical tests it needs to perform in order to converge to a certain efficiency of the kernel. On the other hand, the GPU kernel runs slower when being profiled as it gathers PCs. Therefore, even reducing the number of empirical tests does not ensure faster tuning convergence of the proposed searcher. Therefore, we have also tested tuning convergence speed. In our evaluations, we often aim to find a well-performing configuration. We define a well-performing configuration as a configuration which creates a kernel with runtime within 1.1× of the best kernel runtime (found by exhaustive search).
+
+Since the tuning space search is a stochastic process, it has to be repeated many times to get results which are free from random fluctuations. As it would be incredibly demanding to actually run and profile kernels during autotuning, we have created a program bypassing that – instead of running kernels many times, it performs an exhaustive exploration of the entire tuning space and saves the tuning results (kernel runtimes and PCs). Then we can perform autotuning space search faster, i.e. simply load the kernel runtimes and PCs from files and provide them to the searcher instead of actually running the kernel and profiling it. This allows us to repeat tuning 1000× for any combination of benchmark, hardware used to create the model, and hardware used for autotuning. We only used this simulated autotuning to evaluate the number of searcher steps.
+
+While we were evaluating tuning convergence time, we always performed empirical testing, i.e., we actually ran and profiled the kernels and measured the time. Therefore, we executed those tests 100× due to much higher time demands.
+
+4.2. Testbed setup
+To test the searcher proposed in this paper, we used benchmarks listed in Table 2. Those benchmarks have been introduced in [27], where more details about their implementation and optimizations are discussed. We have rewritten these benchmarks into CUDA to allow their profiling on NVIDIA GPUs. We removed the values of some tuning parameters as they are not supported on CUDA (large built-in vector variables, explicit cache prefetching), or are not implemented in CUDA KTT backend (working with constant memory). However, our benchmarks are still able to reach near-peak performance on GPUs, similarly to [27].7 Therefore, we consider their tuning spaces sufficient for evaluation of the tuning space searcher. We have also implemented two versions of tuning space for GEMM – the reduced space is taken from CLBlast [24] (denoted as GEMM) and the full space is taken from CLTune [25] (denoted as GEMM full). This smaller size of GEMM space allows us to explore the entire tuning space in reasonable time, thus it is more practical for most of the experiments.
+
+
+Table 2. A list of the benchmarks and the size and dimensionality (i.e., the number of tuning parameters) of their tuning spaces.
+
+Benchmark	dimensions	configurations
+Convolution	10	3,928
+Coulomb 3D	7	210
+GEMM	10	5,788
+GEMM full	14	205,216
+Transpose	8	1,784
+N-body	7	3,134
+Note that expert programmers have designed the tuning spaces to be reasonably small (without obviously slow configurations, e.g., resulting in sub-warp block sizes) [27]. Such search spaces should not include a vast amount of poorly-performing tuning configurations and therefore should not discriminate simple search methods, such as random search.
+
+The benchmarks have been executed using four GPUs of different architectures, listed in Table 3. All benchmarks have been executed with Kernel Tuning Toolkit 1.3 equipped with the profile-based searcher.8
+
+
+Table 3. GPU devices used in our benchmarks.
+
+Device	Architecture	Released
+GeForce GTX 680	Kepler	2012
+GeForce GTX 750	Maxwell	2014
+GeForce GTX 1070	Pascal	2016
+GeForce RTX 2080	Turing	2018
+4.3. Speedup allowed by the performance counters biasing
+In the first experiment, we have measured the improvement given by biasing random search according to the required changes of PCs, computed by bottleneck analysis and reaction subsystems. In other words, we experimentally evaluated the first two assumptions mentioned in Section 3.2. To do so, we needed to eliminate any effect of the model imprecision. Therefore, we have performed exhaustive exploration of PCs of the benchmarks' complete tuning spaces and then, during autotuning, we read the previously measured PCs of tuning configurations instead of predicting them with the model.
+
+The average number of empirical tests required by random search to find a well-performing configuration is shown in Table 4. The resulting improvement of the proposed searcher over random search is shown in Table 5. The table shows improvement in terms of the average number of empirical search steps required to find a well-performing configuration. The average is obtained from 1,000 runs of the searcher.
+
+
+Table 4. Average number of empirical tests required for random search to find a well-performing configuration.
+
+GTX 680	GTX 750	GTX 1070	RTX 2080
+Coulomb sum	19	21	34	16
+Matrix trans.	192	24	10	47
+GEMM	146	248	450	260
+n-body	27	10	37	39
+Convolution	327	702	349	568
+
+Table 5. Improvement (in terms of the number of empirical tests) of proposed searcher over random search. The PCs from the same architecture are used.
+
+GTX 680	GTX 750	GTX 1070	RTX 2080
+Coulomb sum	3.8×	5.25×	5.67×	3.2×
+Matrix trans.	3.62×	2.0×	1.43×	1.12×
+GEMM	5.41×	7.75×	8.88×	10.83×
+n-body	1.93×	2.5×	2.85×	3.25×
+Convolution	8.18×	10.32×	15.86×	14.56×
+As we can see in Table 5, the proposed searcher improves the number of empirical tests in all cases. The most significant improvement can be seen with the GEMM and Convolution benchmarks. Their tuning spaces are more complicated to search (see Table 4), so the improvement given by the biased random selection is more visible.
+
+4.4. Portability across hardware
+In this section, we have evaluated the portability of the model. We created the model on specific hardware and input and used it to bias tuning space search on different hardware.9 Therefore, we have experimentally tested the third assumption given in Section 3.2. The model was created using decision trees described in Section 3.4. Similarly to the experiment above, we have measured the improvement over the random search in terms of the number of iterations (i.e., empirical tests) required to reach a well-performing configuration. The results were averaged over 1,000 executions.
+
+The performance portability results of Coulomb sum, Matrix transposition, GEMM, n-body and Convolution benchmarks are given in Table 6. The table shows the speedup of the proposed searcher for all combinations of a GPU used to build the model and a GPU used for autotuning.
+
+
+Table 6. Improvement (in terms of the number of empirical tests) of proposed searcher over random search. Rows show GPUs used for benchmark execution, columns show GPUs used to create the model of TPs and PCs relations.
+
+
+
+It can be seen that the model portability is good in most of the examples. In some cases, using a model built on a different GPU is even better than using the model created on the same GPU that was used for autotuning (e.g., GEMM benchmark executed on RTX 2080 converges faster with the model created from GTX 1070 data). However, we consider this to be a somewhat random artefact where inaccuracies in the model compensate for inaccuracies in the expert system biasing the search.
+
+Note that the decision tree predictions have been used instead of the exact reading of PCs even in cases when the same GPU was used for both model building and autotuning. Therefore, the values on diagonals of tables within Table 6 do not copy values from Table 5. For example, the GEMM benchmark, when executed on RTX 2080, gets a speedup of 10.83× with the exact PCs from RTX 2080, whereas the decision tree model from the same GPU limits its speedup to 9.63×.
+
+4.5. Portability across inputs
+We further investigated the performance portability for the case of varying input. In our example, we used the GEMM benchmark with significantly varying input matrices:
+
+•
+multiplication of square matrices of size : this is a typical example of matrix multiplication, which is compute-bound on GPUs;
+
+•
+multiplication of square matrices of size : in this case, small matrices do not allow us to utilize the entire GPU easily: the code is rather latency- or strong-scaling bound;
+
+•
+multiplication of highly rectangular matrices (a matrix of size  multiplied by a matrix of size  and a matrix of size  multiplied by a matrix of size ): in this case, matrix multiplication is memory-bound (because of low arithmetic intensity).
+
+We performed the experiment on GTX 1070 with decision tree-based model, which was also built on GTX 1070, but on different inputs. The results of the experiment are shown in Table 7. As can be seen, using a different input size typically slightly decreases the speedup. However, the reduction of the number of empirical tests is still significant: for example, autotuning of the compute-bound multiplication of large matrices can be improved more than 6× even if using a model trained on the memory-bound GEMM instance. The improvement with small or highly-rectangular matrices is lower because searching their tuning spaces requires a lower number of searcher steps.
+
+Table 7. Improvement (in terms of the number of empirical tests) of proposed searcher over random search with the GEMM benchmark. Rows show the sizes used for benchmark execution, columns show the sizes used to create the model of TP and PC relations.
+
+2048 × 2048	128 × 128	16 × 4096	4096 × 16
+2048 × 2048	8.61×	6.04×	6.45×	4.98×
+128 × 128	2.92×	3.17×	2.71×	1.72×
+16 × 4096	3.23×	3.09×	3.22×	2.73×
+4096 × 16	1.5×	1.93×	1.93×	1.93×
+4.6. Real-time tuning
+In this section, we compare the convergence of the proposed profile-based searcher with the convergence of random search in time. Our motivation for this comparison is that random search can converge faster despite requiring more empirical tests because random search has two advantages over the profile-based searcher: it does not collect performance counters (collecting performance counters hinders the kernel execution speed), and it has minimal computational overhead (no model is evaluated). On the other hand, the proposed searcher navigates the search towards faster implementations; therefore, omits evaluation of very slow configurations. Whereas the collection of performance counters is slow especially with slow-running kernels (the kernel runtime dominates over the time of kernel compilation, data copying and selection of new configuration to test), the overhead of the searcher is more significant with vast tuning spaces.
+
+4.6.1. Experiment setup
+To test the convergence time of the searchers, we have used a machine equipped with NVIDIA GeForce RTX 2080, Intel Core i7-8700, 32 GB RAM, Ubuntu 18.04.3, NVIDIA driver 418.39 and CUDA 10.1. Each benchmark has been executed a hundred times. The model has been created using data obtained with GeForce GTX 1070. Therefore, our test simulates a situation when the user acquires a brand new GPU and has autotuning data from an older GPU.
+
+We have performed autotuning with persistent data on GPU and no comparison to the reference computation. Such a setting is typical for dynamic autotuning. It improves the results of the random searcher, as there is no overhead of data movement and comparison, which could hide the slower execution of kernels while gathering performance counters. On the other hand, we have selected the size of the kernels' inputs such that the GPU is fully occupied, but the kernels are not running longer than necessary (we consider 1-10 milliseconds as a suitable kernel runtime for our experiments). This choice, on the other hand, improves the results of the proposed searcher, because profiled kernels do not run for too long. In two experiments, we switch on the comparison to the reference kernel and use larger kernel input to demonstrate the described effects.
+
+In this evaluation, we show the searcher's convergence as a graph of the average kernel runtime at each second of autotuning. When a long-running kernel is selected in the first iteration of the search, the benchmark has no finished kernel for several seconds after its execution (this is especially the case when gathering performance counters). We decided to draw the graph from the time when all 100 experiments have at least one finished kernel and therefore its time is known. Such a solution prevents the results of the proposed searcher from being artificially improved, e.g., by only plotting the runtime of the finished (and thus fast) kernels during the first seconds of measurements.
+
+4.6.2. Results
+The GEMM and Convolution benchmarks are the most difficult cases to autotune (see Table 4). Therefore, improving the speed of convergence is more important for those benchmarks. The GEMM benchmark was run using square matrices of size , the Convolution benchmark using a 2D array of size . The comparison of their convergence can be seen in Fig. 3 and Fig. 4, respectively. In both cases, the proposed searcher brings significant convergence speedup.
+
+Fig. 3
+Download : Download high-res image (197KB)
+Download : Download full-size image
+Fig. 3. Convergence of GEMM, 2048 × 2048 × 2048, GTX 2080, model from GTX 1070. The solid line shows the average, the transparent area shows the standard deviation.
+
+Fig. 4
+Download : Download high-res image (180KB)
+Download : Download full-size image
+Fig. 4. Convergence of Convolution, 4096 × 4096, GTX 2080, model from GTX 1070. The solid line shows the average, the transparent area shows the standard deviation.
+
+The Matrix transposition benchmark was tested with matrix size . Although the proposed searcher requires fewer empirical tests, the convergence in time is not significantly faster comparing to the random searcher – see Fig. 5. We also tested another scenario: the tuning was set to check results against the reference implementation, which is common during offline tuning. In such a case, the matrices are copied into host memory and checked against the reference, which adds a constant overhead for each empirical test. In this case, the overhead of gathering performance counters is less visible, and the proposed searcher converges significantly faster (Fig. 5).
+
+Fig. 5
+Download : Download high-res image (154KB)
+Download : Download full-size image
+Fig. 5. Convergence of Matrix transposition, 8192 × 8192, GTX 2080, model from GTX 1070. Left: tuning configured to not check kernel results. Right: tuning configured to check kernel results. The solid line shows the average, the transparent area shows the standard deviation.
+
+The n-body benchmark was tested with 16,384 bodies. Although the overall number of searcher iterations is not high even for the random search, the proposed searcher converges significantly faster – see Fig. 6. We also tested a situation with tuning executed on a much bigger problem instance of 131,072 bodies (note that n-body is in 
+, where n is the number of bodies). In such a setup, kernels run much longer and profiling overhead included in the proposed searcher makes it slower than random searcher (see Fig. 6).
+
+Fig. 6
+Download : Download high-res image (172KB)
+Download : Download full-size image
+Fig. 6. Convergence of n-body on GTX 2080, model from GTX 1070. Left: tuning with 16,384 bodies. Right: tuning with 131,072 bodies. The solid line shows the average, the transparent area shows the standard deviation.
+
+The Coulomb sum benchmark uses a grid of  cells and 256 atoms. It converges very quickly, even with the random searcher. Fig. 7 shows that the proposed searcher needs some time for initial profiling. Then, it converges very quickly, whereas random searcher matches its performance after 20 seconds of tuning. However, both searchers converge close to the optimum in less than 5 seconds. Therefore, the choice of the searcher is not important here.
+
+Fig. 7
+Download : Download high-res image (120KB)
+Download : Download full-size image
+Fig. 7. Convergence of Coulomb Sum, grid 256 × 256 × 256, 256 atoms, GTX 2080, model from GTX 1070. The solid line shows the average, the transparent area shows the standard deviation.
+
+The setup of this experiment also allows us to benchmark the GEMM full benchmark. As we have not performed exhaustive search of GEMM full, the model was created from the tuning space of the GEMM benchmark, measured on GeForce GTX 1070. Note that the GEMM benchmark does not cover the tuning space of the GEMM full benchmark completely – it lacks four tuning parameters and uses less then 3% of GEMM full configurations. However, Fig. 8 shows that the proposed searcher converges much faster than random searcher with the GEMM full benchmark: the proposed searcher requires 61 seconds to match the same results as the random searcher reaches after 300 seconds. This result can be further improved by optimizing the implementation of the proposed searcher: with the GEMM full tuning space, it requires significant time to score tuning configurations, resulting in 3× longer time per empirical test.
+
+Fig. 8
+Download : Download high-res image (198KB)
+Download : Download full-size image
+Fig. 8. Convergence of GEMM full, 2048 × 2048 × 2048, GTX 2080, model from GEMM on GTX 1070. The solid line shows the average, the transparent area shows the standard deviation.
+
+4.7. Comparison to basin hopping
+So far, we have compared our proposed profile-based searcher to random search. However, the Basin Hopping optimization has recently been shown to perform better than many other optimization methods [40]. Therefore, we also compare our searcher (with the settings described in Section 4.6) to the Basin Hopping searcher implemented in Kernel Tuner [40].
+
+4.7.1. Experiment setup
+We used the same machine as for KTT (see Section 4.6) to test Kernel Tuner. We have re-implemented KTT examples for Kernel Tuner and autotuned them with Basin Hopping optimization in default settings.10
+
+During the testing of Kernel Tuner, we have observed that it works slower than KTT, even when the random searcher is used. We suppose that the source of its slower speed is twofold. First, Kernel Tuner is implemented in Python, whereas KTT is a C++ native application. Second, Kernel Tuner executes each kernel three times to get a better timing precision. Although KTT only executes each kernel once, it gives more consistent results: when executed multiple times, the KTT timing is more stable than performance times reported by Kernel Tuner. We suppose this is caused by the overhead of the python-based Kernel Tuner implementation. We also found that the measurement of Kernel Tuner systematically reports slightly higher kernel runtimes compared to KTT. Therefore, we have normalized performance times to be comparable: we have done an exhaustive search of the tuning space and multiplied the times reported by Kernel Tuner by the ratio of the best time measured by KTT and the best time measured by Kernel Tuner. Therefore, both tuning systems converge at the same kernel times in our figures.
+
+As the comparison of timing is affected by the slower execution of Kernel Tuner, we have also compared the number of searcher steps here. The number of steps allows us to deduce how well Basin Hopping navigates the tuning space compared to random search and the proposed search based on performance counters, without the handicap of slower Kernel Tuner execution.
+
+4.7.2. Results
+Fig. 9 shows a comparison of the proposed searcher implemented in KTT and Basin Hopping implemented in Kernel Tuner with Coulomb sum benchmark. Comparing convergence times, the proposed searcher converges faster during the first 10 seconds. After 10 seconds, it is slightly outperformed by Basin Hopping. When we compare the number of empirical tests, the proposed searcher behaves similarly to Basin Hopping.
+
+Fig. 9
+Download : Download high-res image (181KB)
+Download : Download full-size image
+Fig. 9. Convergence of the Coulomb sum benchmark using KTT and Kernel Tuner. Left: convergence speed in time. Right: comparison of iterations (empirical tests). The solid line shows the average, transparent area shows the standard deviation.
+
+The GEMM benchmark is compared in Fig. 10. It can be seen that the Basin Hopping optimization implemented in Kernel Tuner converges more slowly than random searcher during the first 70 seconds and then it outperforms random search slightly. However, the reason for such a result of Basin Hopping is related to the slower execution in Kernel Tuner. When we compare the number of empirical tests, Basin Hopping converges to the optimum much faster than random searcher after the first 200 iterations. The proposed profile-based searcher uses significantly fewer empirical tests than both Random and Basin Hopping and outperforms them in both the number of empirical tests and the convergence time.
+
+Fig. 10
+Download : Download high-res image (217KB)
+Download : Download full-size image
+Fig. 10. Convergence of the GEMM benchmark using KTT and Kernel Tuner. Left: convergence speed in time. Right: comparison of iterations (empirical tests). The solid line shows the average, the transparent area shows the standard deviation.
+
+With the Matrix transposition benchmark, the slowdown of Kernel Tuner is more visible, see Fig. 11. Kernel Tuner requires about 16 seconds to start tuning, probably because of complicated constraints pruning the tuning space. After initialization, it converges quickly, but cannot outperform random or proposed searcher. When we compare the number of empirical tests, Basin Hopping again converges near the optimum much faster than the random searcher. However, the proposed profile-based searcher uses significantly fewer empirical tests.
+
+Fig. 11
+Download : Download high-res image (221KB)
+Download : Download full-size image
+Fig. 11. Convergence of the Matrix transposition benchmark using KTT and Kernel Tuner. Left: convergence speed in time. Right: comparison of iterations (empirical tests). The solid line shows the average, transparent area shows the standard deviation.
+
+With the n-body benchmark, the Basin Hopping method does not converge well, see Fig. 12. Comparing both convergence time and number of empirical tests, it performs worse than random searcher and the proposed searcher.
+
+Fig. 12
+Download : Download high-res image (220KB)
+Download : Download full-size image
+Fig. 12. Convergence of the n-body benchmark using KTT and Kernel Tuner. Left: convergence speed in time. Right: comparison of iterations (empirical tests). The solid line shows the average, transparent area shows the standard deviation.
+
+Similarly to n-body, the Basin Hopping method converges slowly in the Convolution benchmark, see Fig. 13. Comparing the number of empirical tests, it works similarly to the random searcher. However, it converges much slower when real-time tuning is measured.
+
+Fig. 13
+Download : Download high-res image (220KB)
+Download : Download full-size image
+Fig. 13. Convergence of the Convolution benchmark using KTT and Kernel Tuner. Left: convergence speed in time. Right: comparison of iterations (empirical tests). The solid line shows the average, transparent area shows the standard deviation.
+
+Both the Matrix transposition and Convolution benchmarks reduce tuning space significantly using pre-defined constraints. When tuning space (created as the cross product of pre-defined tuning parameter values) is pruned by constraints, only 1.55% of configurations remain with Matrix transposition, and 0.025% of configurations remain with Convolution. We speculate that this may cause a significant delay at the start of tuning (16 seconds with Matrix transposition and 45 seconds with Convolution). In contrast, 41.7% of configurations remain after constraint application with Coulomb sum, 33.3% with n-body and 22.1% with GEMM. Although this issue could be solved by optimizing the Kernel Tuner code, the comparison of empirical tests still shows Basin Hopping needs more empirical tests than the proposed searcher.
+
+4.8. Comparison to regression trees
+To compare our approach to regression trees, we employed Starchart [18], which trains regression trees to predict the outcome variable (usually performance or consumed power) based on the values of tuning parameters. With the trained tree, one can predict the outcome for the entire space and find the configurations with the best predicted outcomes.
+
+4.8.1. Experiment setup
+In their evaluation, Starchart authors started the training with 20 datapoints and added more iteratively until prediction accuracy, measured as the median relative prediction error, got below 15%, or a maximum of 200 training datapoints was reached. Prediction accuracy was evaluated on 200 validation datapoints. Both training and validation datapoints were selected by uniform random sampling. It is worth noting that the tuning spaces used to evaluate Starchart in [18] were often very large as they contained entire ranges of values instead of only a few meaningful ones, e.g., 32-1024 instead of just 32, 64, 128, 256, 512 and 1024 as block sizes.
+
+We evaluate the accuracy of the approach as follows:
+
+•
+we randomly select 200 tuning configurations as a testing set;
+
+•
+we perform training by measuring additional tuning configurations until median relative prediction error gets below 15%;
+
+•
+we measure how many configurations, sorted by best predicted kernel time, need to be examined to find one that is actually good.
+
+In the last step of the protocol, we take the whole tuning space, calculate the predictions and sort them from the best to the worst. In this order, we go one by one and examine whether the configuration is actually well-performing, i.e., within 110% of the best kernel time.
+We have evaluated five benchmarks (coulomb, gemm-reduced, conv, mtran, nbody) using GeForce RTX 2080. Because Starchart is not a tuning toolkit, we cannot directly compare tuning speed in time. Therefore, we compare the number of empirical tests here.
+
+4.8.2. Results
+We performed the comparison of Starchart and random searcher for GeForce GTX 1070 and for GeForce RTX 2080 in Table 8. The tables show the number of tuning steps required to build a model and to perform a search until a well-performing configuration is found. The values for random searcher are taken from Table 4. As can be seen, including the model build phase, Starchart performs worse than the random searcher, excepting the Convolution benchmark on GeForce RTX 2080. We believe that a well-designed tuning space, which does not contain a vast amount of poorly-performing tuning configurations, cannot be easily tuned with surrogate models created as part of the tuning process itself.
+
+
+Table 8. Results of autotuning using Starchart compared to the random searcher, using GeForce GTX 1070 and GeForce RTX 2080. All columns show the number of empirical tuning steps. The model build column shows steps required for model training and testing, tuning shows steps required for tuning before a well-performing configuration is found, and random shows the number of steps required by random searcher (taken from Table 4).
+
+
+
+Although Starchart is not designed to ensure model portability (i.e., using the model trained on a different GPU), we have performed a test when a regression tree from a different GPU is used. The idea behind this experiment is that if performance portability is good for some of the well-performing configurations (i.e., there are configurations which perform well on both GPUs), the regression tree trained on a different GPU can be used successfully. We build the regression tree on GeForce GTX 1070 and use it to navigate searching on GeForce RTX 2080. We have compared the Starchart results to our searcher using a model from GeForce GTX 1070 to navigate tuning on GeForce RTX 2080. The comparison is given in Table 9. In this scenario, Starchart can compete with the proposed searcher in case the regression tree can describe the tuning space well, and some of the well-performing configurations of the GPU used for model build are also well-performing on the GPU used for autotuning. However, our model does not have such a restriction. The proposed searcher also seems to be more robust: there are no long tuning times as with the Starchart and GEMM example (on both GeForce GTX 1070 and RTX 2080) and Convolution (on GeForce GTX 1070).
+
+
+Table 9. Results of autotuning using Starchart compared to the proposed searcher, using GeForce RTX 2080 and models trained on GeForce GTX 1070. Both columns show the number of empirical tuning steps.
+
+SC@1070	proposed@1070
+Coulomb sum	3	5
+Matrix trans.	42	18
+GEMM	564	16
+n-body	17	6
+Convolution	9	26
+5. Related work
+Tuning space search methods can be divided into three categories: (i) model-free methods, which are viewing tuning space search as a mathematical optimization problem and empirically search for the best configuration; (ii) model-based methods, which use a performance or power model to select the best configuration from the tuning space directly; (iii) hybrid methods, which combine empirical search with a model.
+
+In this section, we compare our approach with the state-of-the-art methods in tuning space search, and also with methods using historical profiling data and performance counters for code optimization.
+
+5.1. Model-free methods
+The model-free methods based on optimization are used in the majority of code optimization parameter autotuning frameworks [2], [14], [25], [31], [40]. As tuning spaces are not continuous, contain boolean tuning variables and are non-linear and non-convex, searching tuning spaces is challenging. Therefore, in some experiments, the random search seems more reliable than more sophisticated search methods [33], [25]. On the other hand, some authors show improvement over random search. In [6], the Nelder-Mead method has been successfully adapted to non-continuous tuning spaces. More recently, it has been shown that the combination of global and local search has the potential to outperform random search [40] systematically. The difference between model-free optimization-based searching and our method is that optimization has to be executed from scratch when hardware or a performance-relevant input parameter changes, whereas our method uses a model portable across different GPUs and inputs. In this paper, we compare the results of our searcher to [40]. We confirmed result from [40] showing that Basin Hopping coupled with local search is superior to random search. We also show that our searcher outperforms Basin Hopping in both number of empirical tests and convergence time.
+
+5.2. Model-based methods
+The model-based methods need to use a model which can be evaluated faster than empirical testing. Therefore, simulators such as GPGPU-Sim [4] are not practical for this purpose. Multiple models for analysis and performance prediction of CUDA or OpenCL code have been developed [16], [3], [44], [34], [17], [21]. However, the construction of those models often needs manual effort, which makes them impractical for autotuning. Moreover, independent studies reveal high inaccuracies in their ability to predict performance on some problems [38], [22], so it is questionable whether they can be used to select good tuning configurations from a vast tuning space. On the other hand, the model-based tools seem to have promising results if only one tuning parameter is searched. For example, it has been shown that a model can replace empirical tuning to select a well-performing work-group size (thread block in CUDA terminology) [9], [8], [42], thread-coarsening factor [9] or code variant [23]. In our work, we focus on the optimization of many tuning parameters together.
+
+5.3. Hybrid methods
+Hybrid methods introduce a surrogate model which is not intended to find the best tuning configuration directly, but rather to prune or bias empirical searching. In [10], a machine learning model is built from a sample of tuning space, and only the tuning configurations with the best predicted performance are empirically tested. The authors show that their method can outperform the random search. Regression trees have been used to speed up autotuning in multiple studies [11], [18], [28]. The regression trees are built from a representative sample of the tuning space, and their precision can be improved during search [11]. All the papers evaluate their approach using rather vast tuning spaces, e.g., testing all integer thread block sizes in the interval , instead of using more rational sizes 
+. Therefore, the regression trees can be built from a tiny fraction of the tuning space. With rationally constructed tuning spaces, such as those presented in [25], [27], a large portion of tuning space has to be used for tree construction, as we show experimentally in Section 4.8. As the models have to be re-trained when hardware or performance-relevant input characteristics change, they are not practical when a large portion of tuning space is needed for training. In contrast, our approach allows for the use of a model trained on different hardware or input.
+
+5.4. Methods using historical data
+Only a few works use historical autotuning data (e.g., obtained on different hardware) to improve autotuning convergence speed. In [23], authors predict the best code variant of a kernel for unseen GPU by using data obtained on a set of explored GPUs. The difference in our work is that we focus on searching a multi-dimensional tuning space, and only one GPU is sufficient for empirical exploration with our model. The historical data observed on one CPU architecture are used to bias a multi-dimensional search on a different CPU architecture in [32]. Their approach works well if the fast implementations on both architectures are correlated. Our approach does not require such a correlation. A model which automatically selects a tuning configuration for a specific application input is presented in [37]. It is trained on different inputs and then generalizes how to select the right tuning configuration for the used input. Compared to our model, it does not need to repeat empirical search when the input changes. On the other hand, our model does not need to be trained on multiple inputs and GPUs. In our previous work [26], we used data measured on one hardware to prune dimensions on different hardware. While this approach works well for speeding up exhaustive search, it brings no advantage when coupled with a searcher based on mathematical optimization.
+
+5.5. Methods using performance counters
+The typical usage of hardware performance counters is to profile a kernel for manual inspection of bottlenecks. However, there are several works which use performance counters to navigate optimization automatically.
+
+In [19], [41], performance counters are used to approximate the performance and scaling of a known implementation on unseen GPUs. In contrast, our work focuses on navigating tuning space search, i.e., changing the implementation to maximize its performance.
+
+In [23], authors use performance counters to detect relevant features for their code variant selection model. Their model is trained on multiple code variants (alternative functionally equivalent implementations) and multiple GPUs. It predicts the fastest code variant on unseen GPU. They optimize one-dimensional tuning space and require multiple GPU architectures for training, whereas our approach allows searching many-dimensional tuning spaces after training on one GPU.
+
+CPU performance counters have been used to select a well-performing combination of the number of OpenMP threads and scheduling strategy [39], power-efficient process scheduling [35], a well-performing combination of compiler optimization switches [7], a well-performing combination of activated or deactivated prefetchers [30], and well-performing settings of stream configuration on Xeon Phi [43]. The main difference between the approach presented in this paper is that we can tune any user-defined optimization (transformation of the source code), whereas the aformentioned works are developed to perform a specific type of optimization (e.g., setting OpenMP scheduling strategy and number of threads). With fixed optimizations, end-to-end learning is possible: the input of the machine-learning algorithm is a vector of tuning parameters' values, performance counters, and runtimes obtained from multiple applications, each running at different processors with various inputs. The output can be predicted runtime, or the predicted values of the best tuning parameters. Our method allows each tuned application to use original tuning parameters, so such a training set cannot be constructed. Therefore, we combine the machine learning model (created for each tuned application separately) with the expert system, navigating tuning space search according to predicted 
+ instead of predicted runtimes or best tuning parameters' values.
+
+6. Conclusion and future work
+In this paper, we have introduced a novel tuning space searcher, which uses hardware performance counters to speed up the searching process. The proposed profile-based searcher builds a model of relations between tuning parameters and performance counters using any GPU and input, and uses this model to navigate searching on an unseen GPU or input. We have experimentally shown that the performance counters can significantly reduce the number of empirical tests that have to be performed in autotuning. We have also shown that the real-time convergence of the proposed searcher is typically superior to random searcher or state-of-the-art optimization-based Basin Hopping searcher implemented in Kernel Tuner [40]. The proposed searcher is implemented in Kernel Tuning Toolkit [27], and therefore it can be used for both offline and dynamic autotuning.
+
+Although the searcher was designed for CUDA-enabled GPUs, we believe that a similar searcher can be developed for GPUs of different vendors or even different processor architectures, such as CPUs.
+
+In future work, we plan to improve the searcher performance. As discussed in Section 3.9, some components of the proposed profile-based searcher can be replaced by a more sophisticated implementation. We plan to experiment with (potentially gradient-based) local search methods, predict performance counters for the hardware used for autotuning and replace the system for bottleneck analysis and reaction with a machine-learning model.
+
+Apart from improving the proposed searcher, we plan to investigate other possibilities to leverage hardware performance counters. First, we plan to extend our system to predict how well-tuned the actual configuration of a kernel is. Such a prediction allows us to stop the tuning at the right time, as well as predict how much performance can be gained by autotuning (which is especially important during dynamic autotuning, when the tuning time is limited). Second, we plan to use the vast amount of tuning data for studying the behavior and efficiency of different HW architectures and code optimization strategies.
+
+The source code of Kernel Tuning Toolkit, the proposed profile-based searcher, and profiled data conducted for this study are available to the community. Therefore, it is easy to replicate results from this study, test the searcher with different benchmarks, or modify or extend our searcher implementation.

@@ -1,0 +1,801 @@
+Abstract
+We consider the design and analysis of quorum systems over erasure coded warm data (with low frequency of writes and accesses in general) to guarantee sequential consistency under a fail-stop model while supporting atomic read-modify-write operations by multiple clients. We propose a definition of asymmetric quorum systems that suit the framework of coded data by explicitly exploiting the structural properties of code and instantiate it over distinct families of coding strategies: maximum distance separable (MDS) codes and codes with locality, and we indicate a mechanism for synchronizing stale nodes using differential updates, which again exploits the code structures. The proposed quorum system's behavior is analyzed theoretically, exploring several aspects: viability of quorums under node unavailability; contention of resources between read and write operations; and quorum load. We complement these theoretical exploration with simulation based experiments to quantify the behavior of the proposed mechanism. The overall study demonstrates the feasibility and practicality of quorums over codes under practicable assumptions for achieving a stringent form of consistency, specifically, sequential consistency, while the stored data is being mutated by potentially multiple processes that might read and then modify the existing data. We achieve this in-place, without having to resort to store multiple versions of the data.
+
+
+Keywords
+Erasure codes
+Quorums
+Read-modify-write
+Sequential consistency 
+
+1. Introduction
+We consider data center storage systems, storing fixed sized blocks of data, where erasure coding is applied to realize storage space and cost efficient redundancy for fault-tolerance and data durability. In that context, we address the issue of managing mutating data, and propose a quorum based mechanism to achieve consistency while supporting atomic ‘read-modify-write’ operations.
+
+Assuming fixed sized data blocks places this work under the block storage abstraction umbrella [2], [43], which decouples the actual data storage from traditional file systems considerations such as directory structure, access control, or the physical placement of the data. In such systems, a large file may be split and spread across multiple fixed-size blocks (e.g., the ‘chunks’ of Google File System [21]), or multiple smaller files may be put together in a given block (e.g., the ‘volumes’ of Facebook's Haystack [7], which are formed by grouping multiple Binary Large Objects (BLOBs) of arbitrary sizes together). An overlying (software defined) orchestrator determines how the blocks are stored, indexed, accessed and manipulated, taking care of meta-information, placements of blocks, semantics, and providing file system abstraction to upper layer applications. Block storage is often used as the storage substrate for performance sensitive applications such as databases, which require transactional guarantees, while supporting data access, modifications and storage persistence.
+
+Even though data centers have reasonably stable environments, failure of individual components cannot be avoided [16], [20], [22], [30], [49]. E.g., [20] reported between 2-10% annualized failure rates for disk drives, and frequent but short duration outage events (more than 90% of these were for less than 10 minutes) in individual storage system components. Data is thus stored in a redundant manner to ensure both availability and durability in the event of failures. Traditionally, redundancy has been achieved using replication, for which there are mature data management techniques supporting a wide range of applications, for diverse consistency requirements, under a variety of environments. We refer to [12] for a collection of surveys on the various facets of replication management.
+
+Replication however inflicts prohibitive storage costs for humongous volumes of data. Thus, despite early inhibitions in deploying erasure codes in data centers just over a decade back [52], erasure coded storage systems have now proliferated across data centers and cloud service backends, e.g., Windows Azure Storage [28], Facebook's f4 [38], Google's redesigned file system Colossus [20], Baidu's Atlas [34] to mention some prominent examples. The basic principle behind erasure coding involves storing linear combinations of data pieces rather than replicating them, in order to reduce the storage overhead while maintaining fault tolerance (see [40] for an overview on coding for distributed storage systems). Typical erasure code deployments reduce the storage overhead to  the volume of raw data to be stored [20], [38], providing superior fault-tolerance, and for significantly lower overhead than a typical 3-way replication, but at the cost of a more complex system design. Currently, erasure coding is predominantly used for static data which is infrequently accessed (e.g., archived data) or dynamic data that changes infrequently (‘warm’ data) with support for limited update semantics, e.g., Facebook's f4 [38] accommodates deletion of BLOBs from an archived volume, which is achieved by overwriting corresponding stored bits (see also Section 6 for an overview of related works on coding for mutable content). For frequently modified data, replication and/or a temporarily replicated copy disentangled from the persistent coding based storage is expected to remain the de facto form of redundancy. Nevertheless, support for arbitrary manipulation and mutation of erasure coded data while enabling sophisticated update semantics such as atomic read-modify-write operations by multiple reader and writer clients, together with consistency guarantees, hold the promise to extend the usage of erasure coding for a significantly wider variety of applications where the frequency of changes may be moderate (and/or the performance requirements allow it).
+
+The motivation of this work is thus to establish a proof-of-concept for a level of strict consistency that will in turn support a wide range of applications that involve mutating data, while relying on erasure codes for redundancy in data center networked distributed storage set-ups (the exact system model and assumptions are found in Section 2).
+
+To that end, we target our solution with the following considerations: (i) Data is stored using erasure coding based redundancy in a generally stable environment, where failure of some components is nevertheless a norm. (ii) Write requests are infrequent, yet multiple processes may concurrently attempt to modify data. (iii) Overlying applications however need atomic read-modify-write semantics and reasonably strict (sequential) consistency, and can retain the same consistency guarantee and continue to operate even in the presence of small or moderate levels of failures of individual storage components in the system. (iv) The solution is modular and relies on practicable assumptions. Specifically, we implicitly rely on a timed asynchronous model [14] which uses time-outs as a proxy for failure detection. This is required for an explicit assumption we make on the presence of a distributed locks service such as [9], [33]. On the other hand, we do not assume any network level primitives in themselves to provide atomicity. Our work is not in itself aimed to provide transactional semantics [51], but the atomic read-modify-write operations that we achieve with the proposed quorums over coded data is an essential primitive for the upper layer to be able to do so.
+
+1.1. Consistency and quorums
+Consider a data object x with a value denoted as 
+ at any given time instance t. If two, and more generally multiple, processes attempt to update its value 
+ concurrently, one possibility is that they each do so by computing 
+ and 
+. In that case, if every process in the overall system concurs on a unique globally agreed sequence of values for x — either 
+ or 
+ — a form of sequential consistency would be achieved. However, in this case, both the second as well as the third values depend on the first value, and in particular, the third value does not depend on the second value. This guarantee is often referred to as atomic multi-reader multi-writer (MRMW) register in the literature. Such atomic MRMW abstraction can be emulated variously, for example, by allowing the processes to write concurrently, store the versions and determine a posteriori an ordering, for example, using a consensus algorithm. While this operation semantics serves a wide range of applications, it is inadequate for achieving database like transactional semantics [51].
+
+A stronger form of atomic read-modify-write semantics would in contrast achieve a sequence of globally agreed changes ensuring that the third value is determined based on the second value in the sequence, and as such — either of 
+ or 
+ — would be desirable valid sequences of outcome. This naturally requires that the operation creating the third value in the sequence is blocked from doing so until the previous operation is completed. The work presented in this paper looks at how to achieve this stricter write semantics for erasure coded data, and we propose doing so using quorums and locks.
+
+In the context of a replication based storage system, where every block is stored multiple times for fault-tolerance, several distinct mechanisms for ensuring consistency exist, e.g., designating one replica as a primary which coordinates the sequence of operations and communicate with the other replicas, and alternatively, a quorum based mechanism which uses votes and locks among the replicas to determine the completion and exclusivity of operations. Consider that each instance of the block (or replica in short) is associated with a read lock and a write lock. A read lock is not exclusive, and multiple processes can simultaneously acquire read locks on a given replica. In contrast, a write lock is exclusive: only a single process can acquire a write lock on a given replica at a time, and it also precludes a read lock (and vice-versa) on the same replica.
+
+While this locking mechanism in its own can be effectively used to achieve consistency when each object has a single instance in the system, in the presence of replication, a more nuanced, voting based (quorum) mechanism is applied. Quorums for replicated storage have been researched for several decades (see the book [47] for a reference), and numerous variants meeting different consistency and performance objectives exist. Quorum systems have also been explored in other contexts than data storage applications, which require mutual exclusion of resources, e.g. systems based on message passing abstraction [39] and auditing of large-scale decentralized systems [5].
+
+Formally [47], when storing n replicas (we label them by ), a quorum system  is a non-empty set of subsets of , where for all 
+, 
+. To distinguish read and write operations, the notion of an asymmetric quorum system is further used [47]. An asymmetric quorum system 
+ is a pair of non-empty sets of subsets of  representing respectively read quorums and write quorums satisfying the following asymmetric intersection property: for all 
+, 
+, 
+. Additionally, the usual property of quorums that write quorums should not be disjoint also applies, i.e. 
+, 
+ when 
+.
+
+1.2. Paper organization and contributions
+The approach of this work is to define and investigate quorums over erasure coded data, leveraging the structural property and in/dependence among the data and parity symbols of an erasure code both to design efficient incorporation of changes, as well as to identify suitable membership constraints for the quorums, in order to provide sequential consistency guarantee for data that is potentially manipulated by multiple processes (clients) and where the data mutation needs to support atomic read-modify-write operational semantics, but without any native network level support for such atomic operations.
+
+We make the system model and its corresponding assumptions precise in Section 2, while also recalling some salient properties of erasure codes, in particular those relevant for distributed storage systems. Section 3 contains the core definitions: that of write quorum, read quorum, and what we call computed read quorum, to capture the property that coded data enables degraded read operations by reconstructing data blocks. These quorums are instantiated in two families of codes: maximum distance separable (MDS) codes and codes with locality. Mechanisms to propagate updates efficiently by exploiting the structural properties of (linear) codes are detailed in the second part of Section 3. We analyze the quorum system in Section 4, investigating it along three aspects: the likelihood to be able to form each kind of quorums in presence of node unavailability, the contention of resources between read and write operations (this is specific to quorums over coded data, unlike for replication, since multiple independent data blocks are entangled together through the coding process) and the load of the quorum system. A summary of our key findings from these theoretical investigations are as follows:
+
+1.
+Impact of node unavailability: We establish closed form expressions for MDS codes to determine the probability that computed read quorums and write quorums can be created for a parameterized fraction of storage nodes being unavailable. We interpret the results, particularly for the range of parameter values that represent practical deployments, and demonstrate that the proposed quorums can be formed even under significantly more adversarial settings, thus confirming their viability.
+
+2.
+Resource contention: Since erasure coding groups multiple data blocks together, it creates entanglement among them through the parity blocks. Consequently, we define a new metric to benchmark the behavior of quorums over coded data, that studies the contention of resources among read and write operations. We study two cases, (i) when all storage nodes are available, and (ii) when some storage nodes may be unavailable, and computed read quorums are invoked. We again establish closed form expressions for MDS codes to determine the probability of servicing a write operation in a given round of operation, and the estimated fraction of read operations that cannot be serviced within a given round. The analytical results indicate that high level of concurrency among reads and write operations involving distinct data blocks within a single collection of coded blocks is achievable under a wide range of operational environments. This analysis foremost helps validate the viability of quorums despite the entanglement caused by the dependencies among the blocks. By quantifying the interference between write quorums and computed read quorums with this analysis, we can also determine the environment parameter (in terms of fraction of nodes being unavailable) beyond which the interference would render write operations unviable. We discuss mitigation, such as prioritized write operations.
+
+3.
+Quorum load: The load 
+ is defined [47] as the minimal load across every possible access strategy Z, where 
+ is the maximal load induced by the access strategy Z on any block. This is a standard metric to evaluate quorum systems to infer processing bottleneck. We establish closed form expressions for the load, parameterized in terms of the composition of the read operations being reads directly from a single node versus computed reads. We compare this with respect to a suitably scaled version of quorum load result for replicated systems, accounting for the fact that a group of coded data blocks caters to multiple data blocks, as opposed to the replicated system load determined for a single data block. Using this scaled load for replicated data as a benchmark, we observe that for certain code parameters, the load on the erasure coded system is always lower, while in others, it is also lower when the fraction of computed read operations is low (which should be the case in a stable environment). This result helps reconfirm the practicality of quorums over coded data from the perspective of processing bottleneck.
+
+The theoretical study is complemented by discrete-time simulations which are discussed in Section 5. The simulations explore the quorum performances beyond some simplifying assumptions made for the theoretical studies, and help considering together different workloads of read/write operations, prioritization of write operations, and node unavailability. Key findings from the simulations echo the findings from the analysis. In particular, we demonstrate that neither read nor write operations pile-up, and both can in fact be serviced within no upto short delay for a wide range of environment in terms of node unavailability and relative frequency of reads and writes. It also exposes the (already well understood from the quorum design) limitation of the current approach, in which, multiple concurrent writes by different processes on distinct blocks within a collection of coded blocks are not feasible. Interestingly, the processing of read operations is not hindered. We also observe that prioritized write operations reduce the latency in processing write operations, with no discernible adverse impact on read operations. We tie-up our findings from the simulations by connecting them to the above mentioned theoretical studies.
+
+In Section 6, before drawing our conclusions in Section 7, we provide an extensive discussion on related works, commenting on the design-space and properties of other works that aim to achieve various forms of consistency and write semantics over coded data, and thus we establish the gap that this work fills.
+
+In particular, the novelties and salient aspects of this work are as follows: It is (i) unique in addressing atomic read-modify-write operations over coded data, and (ii) it is also unique in explicitly exploiting the structural in/dependencies among data and parity blocks (which helps us realize quorums that are smaller than prior works that use quorums explicitly or implicitly in the context of coded data consistency). Additionally our work is among a few works that (iii) exploit these relations to determine an efficient way to disseminate and impart updates using differentials across versions, and (iv) carry-out the updates in-place instead of storing multiple/all old versions (as is the case with most other works in the literature that achieve sequential consistency), and instead our approach requires a small amount of ephemeral storage only for a short time span while the update propagation to all the involved storage nodes is ongoing.
+
+2. Assumptions and system model
+2.1. Erasure codes
+In an erasure coding based storage system, we assume that a collection of k blocks 
+ are jointly coded, to generate further  parity blocks: 
+, where 
+ are computed as linear functions of 
+, i.e., 
+, 
+, for , where 
+. The encoding is done assuming the blocks are taken from some underlying alphabet, the coefficients 
+ are chosen accordingly to obtain codes with properties of interest. When the original k data pieces are retained in the first k positions, the code is called systematic. Non-systematic codes are also possible, but for storage applications, systematic codes are usually preferred, since a read is possible with no computation. The vector 
+ is called a codeword, from a linear  code. A parity 
+ is said to be 
+-local, when 
+ depends on 
+ pieces of data. The two extreme cases are 
+, when all data pieces are used to create each parity, and 
+, when one data piece is simply replicated. The first approach of redundancy, namely replication, can be seen as a special case when : 
+. It is called an  repetition code. For every codeword x from a linear  code, its Hamming distance counts the number of its coefficients which are not zero. The minimum Hamming distance among all codewords is the minimum Hamming distance 
+ of the code. Since the difference of any two codewords is a codeword when the code is linear, a minimum Hamming distance of d tells us that every two codewords differ in at least d coefficients, therefore, as long as the number of erasures (or unavailable storage nodes) is less than d, the stored data can be recovered. Since there are k blocks of data, at most  blocks can be lost, and thus the best minimum Hamming distance is . Codes reaching this bound are called maximum distance separable (MDS) codes. MDS codes offer the best trade-off between storage overhead () and fault tolerance (minimum Hamming distance). We note that a repetition code (replication) is a trivial MDS code. While replication offers more fault tolerance for a given choice of n than any other code, it also incurs a higher storage overhead, and it is not the optimal form of redundancy vis-a-vis storage and fault-tolerance trade-off for most realistic operational environments (apart for the case of extremely high churn [35]). For storage applications which require frequent reads, it is important to be able to read the data as often as possible, even in the case of node failures. The process of reconstructing the data block 
+ from parities so it can be read in the absence of the node storing it is called degraded read. Efficient degraded read is provided by 
+-local parities, for which 
+ is typically  (or 1 for replication). We will refer to these codes as codes with locality. MDS codes typically use parities which are k-local (see [40] for more details).
+
+This leads to consider three broad categories of erasure coding strategies: replication (which can be viewed as a special instance of MDS coding), codes with locality (e.g. local reconstruction codes (LRC) as used in Windows Azure storage [28]), and MDS codes (as used in Google's Colossus file system [20]), which are illustrated next.
+
+Example 1
+
+The  repetition code: 
+: 
+ ↦ 
+. Its minimum distance is 7, all parities are 1-local, this corresponds to having 7 replicas.
+
+A  code: 
+. Its minimum distance is 3, two parities are 2-local and one is 4-local.
+
+A  MDS code: 
+: 
+ ↦ 
+, where 
+ are all obtained as linear combinations of 
+ in such a way that any 4 erasures are tolerated. Its minimum distance is 5. Its storage overhead is 7/3, all parities are 3-local.
+
+We note that a minimum distance of d allows a linear code to recover from  erasures, or alternatively 
+ 
+ errors, and combinations thereof. Reed-Solomon codes [44] which are widely used in distributed storage systems [20], [38] in fact inherently correct errors as well, which can be harnessed for Byzantine fault tolerance in storage systems.
+
+2.2. Erasure coding: granularity choices
+In order to obtain redundancy required for availability, but also for fault tolerance and load balancing, three possible broad approaches can be applied, along with hybrid strategies that combine them: (i) replication of individual blocks, (ii) erasure encoding of block parts obtained by splitting individual blocks into multiple parts, or alternatively, (iii) erasure encoding across blocks, where each whole block is treated as an abstract symbol. The second approach may lead to the creation of small ‘pieces’ that incur the overhead of managing additional meta-information, defeating the purpose of the original choice of block granularity. We thus consider a block storage system using model (iii) which is popular, e.g. [20], [28], [38]. We refer to it as (coded) collection of blocks.
+
+Moreover, we assume that data blocks may be grouped for encoding in any arbitrary manner, e.g., they may have no correlation among each other at the application layer logic, or contrarily, group related blocks together. Accordingly, the access to and modification of the individual data blocks remain independent from the perspective of the consistency management layer within the storage system (see Fig. 1 and the discussions below). As such, different blocks stored in a single storage node belong to distinct encoded groups. Any reconciliation of inconsistency across blocks, based on higher level application semantics, is consequently left to the overlying storage applications, aligned with the norm and design objective of block based storage model. But there is still a need to guarantee the consistency of the redundantly stored interdependent parity blocks themselves.
+
+Fig. 1
+Download : Download high-res image (171KB)
+Download : Download full-size image
+Fig. 1. A modular software defined block storage architecture: The proposed quorum system realizes a consistency management layer within the storage (file/volume) management software module. Overlying applications access the data either as logical data blocks or as files, where the underlying redundancy and consistency management mechanisms are abstracted away. Likewise, the underlying distributed storage layer provides access to individual data blocks, agnostic of their relationship (including replica/parity relationship). This high level system view is decoupled from the actual orchestration of the operations (to which, our quorum mechanism is agnostic), which could be centralized, similar to the first generation Google File System [21], or be decentralized, similar to Amazon's Dynamo [17] (or some hybrid architecture).
+
+2.3. Write operations and consistency semantics
+Our objective is to support atomic read-modify-write operational semantics on the data block without any hardware or network service primitives that inherently provides such an atomic operation. We however assume the availability of other network services, particularly a distributed lock [9] service. Availability of an atomic broadcast [31] service, while not essential for our approach to work, would ease the implementation of the update propagation among nodes storing a collection of coded blocks.
+
+In order to achieve the atomic read-modify-write operational semantics, and sequential consistency, we focus on preventing inconsistencies that may otherwise arise in two manners: (i) Multiple processes manipulate a specific data block concurrently, leading to inconsistent access and out of order reads and/or writes of the data; (ii) a data block is reconstructed and populated with an inconsistent value during repair because of the use of information at parity blocks that are not synchronized.
+
+Given that the choice of blocks grouped together is disentangled from application level dependencies that might exist across multiple data blocks (as discussed above in Subsection 2.2 and below in Subsection 2.4), maintaining consistency among data blocks across groups of coded data has to be achieved using extrinsic mechanisms at the file system or application layer (beyond the scope of this work). Likewise, complex transactions involving multiple operations and data blocks need to be orchestrated at the overlying application layer, which however may in turn utilize as building block our proposed mechanism.
+
+2.4. System set-up, failure model and synchronicity
+Fig. 1 provides an overview of our assumed system set-up. The architecture shows a logical rather than physical view of the system, in that multiple components and layers of the depicted system may co-locate on the same physical components, e.g., the storage nodes and client applications accessing and processing the data may run on a same set of devices, and likewise, each of these devices may also run the distributed file system orchestrating the activities. We assume a pool of storage devices, each storing multiple data blocks. Logically, the overlying (distributed) operating and file management systems belong within the same layer (see Fig. 1), whose role is (i) to decide the placement of blocks and bookkeeping of related meta-information, (ii) to determine the group of data blocks that are encoded together using erasure coding, taking as input k data blocks, and generating  parity blocks (see Subsection 2.1 for details), and (iii) to ensure physical dispersal of the resulting n data and encoded (parity) blocks belonging to a single group of encoded data; so that failure of a single storage device does not lead to correlated failures within a given group. Our approach is agnostic of the orchestration of these activities, and particularly, of the adoption choice by the file system of a centralized architecture using a master node, like the first generation of Google File System [21], of a decentralized one like Amazon's Dynamo [17], or of a hybrid architecture distributing the master node functionalities, as used in Colossus [20].
+
+We consider a fail-stop failure model for the storage nodes, whereby, when a storage node fails, its data cannot be read nor can any new data be written at that node. As such, when a node rejoins the system, it may need to rebuild its data to the latest view, e.g., using an anti-entropy mechanism, before it participates actively in the storage system. Alternatively, upon the failure of a node, data blocks stored at the node may be recreated at different nodes in the system, and these nodes join the respective erasure coded groups instead. Either way, the implication of the fail-stop model is that a storage node which is a (new) member (re-)joining an encoded group participates in serving the data only after having reconciled the content to the latest version.
+
+Note that the data can still be read by overlying applications by accessing the coded blocks as long as enough coded blocks (original data and/or parity blocks) are available. We apply a quorum based approach to guarantee consistency, which is designed to ensure that read/write operations do not conflict with each other, and that upper layer applications are able to access consistent data. This imposes the constraint that whenever a quorum needs to be built for either reading or writing data, failed nodes cannot participate in the quorum until not only they join the system anew, but they are repopulated with up-to-date content. We also implicitly assume that for the choice of quorums, the nodes are identified by the data or parity block they store, rather than their physical identifiers, and as such, it is immaterial for our discussions whether the same node rejoins or a different node with the correct data block joins the system instead. Some of these assumptions are in lines with the design of many practical storage systems, e.g., how nodes undergoing rebuilds are handled in RAID systems [48]. However, in contrast to traditional RAID systems, where multiple coded groups of data blocks are collocated, we assume a data placement where the placement of different coded groups of data blocks are independent of each other, as is typical in data centers and cloud file systems, e.g., GFS [21]. Thus, when a specific physical storage node (chunkservers in GFS parlance) fails, the blocks stored therein can be recreated at different physical storage nodes. The proposed quorum mechanism over coded data works at the granularity of specific (coded) collection of blocks, irrespective of how and when the blocks in the affected physical storage nodes are rebuilt. In the rest of the paper, we will continue to refer to storage nodes and data blocks interchangeably, but we would like to point the reader's attention to this subtle difference between the physical storage nodes that contain many (coded) blocks, versus our usage of the term ‘node’, namely the logical construct of a storage node, which contains a single block from one particular (coded) collection of blocks.
+
+2.5. Locks and liveliness
+The proposed solution is based on locks. We opted for a lock-based blocking protocol in order to support the atomic ‘read-modify-write’ operational semantics without relying on any underlying atomic primitive for such operations in a distributed set-up. If there is a network level support for such atomic operations, or alternatively, if we relax the semantics of the write operations, then forming quorums as discussed in this work can be applied without any locks. Particularly, if we consider a relaxed write semantics, we could accommodate concurrent write operations which would create and store multiple versions (similar to [11], [32], [42] discussed in related works) achieving a non-blocking algorithm allowing concurrent writes, but do so with the smaller sized quorums we achieve, while satisfying consistency guarantees equivalent to those respective works.
+
+In order to implement distributed locks optimally, one ideally needs perfect synchronization and fault-detection, which are not achievable in practice. To that end, in practice, distributed locks are designed using practicable assumptions of a timed asynchronous system, which assume bounded round-trip time, and accordingly used time-outs as proxy for failure detection. For instance, quoting from Redis Labs' description of their distributed locking service [33] “The algorithm relies on the assumption that while there is no synchronized clock across the processes, still the local time in every process flows approximately at the same rate, with an error which is small ...”.
+
+Liveliness can likely be addressed by assuming the existence of a distributed coordination [9], [29] and locking service, see for example [27], [45] for works discussing solutions for live/dead locks.
+
+We acknowledge that the imprecision of the heuristics would result in performance penalties, the extent of which we do not explore. For this work, we simply assume the existence of a reliable distributed lock service like [33]. We refer to [41] for further discussions on this issue of impact on performance.1
+
+2.6. Byzantine failures
+We do not address Byzantine failures. This is a pragmatic design choice, following the principle of separation of concerns, and taking into account that practical systems often reuse subsystems, and thus prefer a modular architecture. We view Byzantine behavior of clients as an application layer issue, disentangled from the storage layer. Within the storage layer, two principal sources of Byzantine faults exist - software artifacts or bugs [24] and corruption of the actual data [4] stored in the storage hardware. For instance, a study of cloud software [24] identified approximately 5% of the bugs affected consistency. Presence of such bugs may however cause unbounded number of Byzantine faults which any algorithmic solution in the storage layer is unable to mitigate. In all cases, such software and firmware Byzantine faults need to be addressed at their root through other approaches such as formal verification and debugging [18]. In [4], data corruption in the storage stack is studied, characterizing silent data corruptions as checksum/parity inconsistencies, as well as (file-system block) identity discrepancy. File-system block identity is handled by the file-system, other forms of silent data corruption such as checksum and parity inconsistencies are readily handled by the local RAID system of the storage appliances. Most erasure codes also have inherent error correction capabilities, and even otherwise, a small amount of meta-information, such as more sophisticated variations of check-sums as hash digest can be utilized. As such, the silent data corruption issue, while a real problem of concern, has effective existing solutions in practice.
+
+3. Quorums for erasure coded data
+Coded data combine k independent data blocks to generate redundancy. We propose next a definition of quorum that suits the presence of these k independent data blocks and the  dependent parity blocks within a given collection of erasure coded blocks. We recall that an exclusive write (respectively read) lock or vote is assumed to be associated with nodes participating in a write (respectively) read quorum.
+
+Definition 1
+
+An asymmetric quorum system 
+ for data blocks encoded using a linear  code is a pair of k families 
+ of subsets of  (we label the n data blocks by ) referring to the read quorums and write quorums for 
+,  (thus 
+ is included in 
+ and 
+) where 
+, 
+, 
+ and furthermore 
+, 
+ when 
+.
+
+3.1. Quorum constructions
+Suppose a process needs to update a single data block 
+, for some .
+
+Definition 2
+
+We define a write quorum 
+ to be a subset of nodes comprising one node storing 
+ and at least 
+ 
+ nodes storing parities.
+
+Definition 2 gives a lower bound on the size of the write quorum. In particular, in the extreme case where all the parities are involved in the quorum, in the case of replicas, this quorum is equivalent to involving all nodes. This is not desirable, and we will assume next that the write quorum contains exactly 
+ 
+ parities.
+
+Given a linear  code, the write quorum 
+ satisfies the following properties:
+
+(P1) All data blocks 
+ () but the one being updated () can be read (assuming no failure).
+
+(P2) Only one write at a time is permitted, since we have  parities, and more than half of them are needed for a write quorum.
+
+(P3) Suppose there are e failures, not involved in the write quorum which includes exactly 
+ 
+ of the parities. This means the e failures are affecting blocks among the  data blocks 
+ and the 
+ 
+ parities left. Out of the n blocks, 
+ 
+ are locked in the write quorum, and another e blocks are unavailable. The e blocks can be repaired using the code's redundancy mechanism, even while some nodes in the system are indisposed because of being in the write quorum, if 
+ 
+, that is(1)
+ 
+
+How parities participating in the quorum are actually updated and how updates are propagated to parities not involved in the write quorum are discussed in Subsection 3.2. An immediate implication of the property (P2) is that, two concurrent writes are not only prevented to occur simultaneously for a single data block (which is essential for a read-modify-write semantics), but also, even independent data blocks cannot be written to concurrently by different processes. The latter is a limitation of our proposed approach, and is rooted in the inter-dependencies among the data and the parity blocks. We want to ensure that consistency is maintained even if a degraded (computed) read by decoding needs to be carried out, which results in this concurrency bottleneck. Allowing for a compromise in consistency, or a less stringent write semantics can allow for better concurrency (see a more elaborate discussion on these issues in the related works Section 6); but designing a mechanism which achieves better concurrency without compromising the stringency of write operations and consistency semantics as achieved by the presented work is a challenging and interesting problem that we recognize. Recall that the proposed mechanism is designed specifically for warm data where write operations are expected to be infrequent, and moreover, our mechanism does not prevent a single process to concurrently write on multiple data blocks within a coded group of data blocks (see Section 3.3 for more details). As such, we deem this limitation non-critical, weighed against the core novel properties achieved.
+
+In order to define a read quorum, we first discuss how reads are processed. With replication, any replica may be read when needed. For coded data, the systematic parts are read first. However the node storing a specific data symbol 
+ may be overloaded either because of excessive accesses to other data stored in the same physical node, or because 
+ itself is a ‘hot’ data in heavy demand, concurrently accessed by many processes. When the node i is overloaded, or offline, for the purpose of redistributing the load, the system may decide to carry out a degraded read by accessing the (coded) blocks in order to reconstruct 
+. For example, computing 
+ using other data and parity blocks may take less time than waiting for 
+ to become available. There may be several subsets of 
+-local symbols allowing to retrieve 
+; since 
+ varies between 1 and k, from the point of view of reconstructing data blocks, values of 
+ as close to 1 as possible are preferred. When a client asks for a read of 
+, the system will decide whether to read 
+ directly (assuming the corresponding node is not down), for which the read quorum 
+ is needed, or to compute it from coded blocks (either because the node i is overloaded or down), for which the (computed) read quorum 
+ is required instead. Note that the (computed) read quorum is however not to be invoked when 
+ is inaccessible due to a conflicting lock. The choice of read quorum to be invoked is typically decided within the consistency management layer (shown in Fig. 1), and is not exposed to the overlying client applications.
+
+Definition 3
+
+To read 
+, , we define a read quorum 
+ to be one node storing 
+, and a (computed) read quorum 
+ to be a subset of nodes comprising parities so that at least 
+ 
+ parities are present and any further necessary (coded) blocks to compute 
+.
+
+The quorum 
+ satisfies:
+
+(P1) There cannot be a simultaneous read and write, since 
+ is locked due to either a read or a write quorum, which are mutually exclusive.
+
+(P2) 
+ is in the intersection of read and write quorums over time, therefore the latest updated value is available to be read.
+
+The quorum 
+ satisfies:
+
+(P1) There cannot be a simultaneous read and write, since we have  parities, and both a write quorum and this read quorum each requires at least 
+ 
+ parities.
+
+(P2) Since 
+, the pigeon hole principle guarantees the existence of some nodes in the intersection of the read and write quorums, therefore there is an updated node. Eventually all the parities comprising 
+ need to be up-to-date. A mechanism for this is given in Subsection 3.2.
+
+The read and write quorums from Definition 2, Definition 3 satisfy the consistency conditions (c1)-(c3): (c1) multiple processes cannot update the block 
+ simultaneously, since the write quorum requires more than half the parities, (c2) while some process is updating a block 
+, other processes cannot read the same block and vice-versa (since either 
+ itself is locked by the write process, or the coded blocks are locked with enough parities) and (c3) a read quorum always contains at least one replica which has the latest version (either 
+ itself or some parity nodes in the intersection of 
+ and 
+). These properties together yield atomic read-modify-write operational semantics by blocking concurrent writes on a given data object and sequential consistency. We elaborate more on this below, in Section 3.2.
+
+The case of MDS codes. In the case of MDS codes, (1) becomes 
+ 
+.
+
+Example 2
+
+Consider the  code 
+ where the parities are computed in such a way that the code can tolerate any 4 erasures. To read 
+, we have 
+, but for a computed read quorum for 
+, we need any  blocks, so it could be 
+, which minimizes the number of nodes in the quorum, but retrieving 
+ means solving k linear equations in k unknowns, alternatively choosing 
+ requires more nodes, but less computations: 
+ is easily retrieved from 
+ and 
+.
+
+For a write quorum, we have for example 
+. We can tolerate 
+ 
+ erasure if any data outside the quorum needs to be read, while the nodes in the write quorum are locked. Indeed, only three blocks are left, which is the minimum number needed for data recovery.
+
+The case of codes with locality. MDS codes (and thus also replication) have k-local parities. Codes with locality are harder to characterize, though they often combine 
+-local parities with some 
+ close to 1, and some close to k. We show next with an example that when this happens, different quorums may tolerate different numbers of erasures, which is lower bounded by (1): 
+ 
+.
+
+Example 3
+
+Consider the  code: 
+. Unlike the two other examples, this code has two types of parities, the 2-locals and the 4-local. The quorum 
+ uses only 2-local parities, while 
+ involves the 4-local parity. The upper bound gives . While this is true for 
+ (if 
+ or 
+ is lost in 
+, it is not possible to recover them until the ongoing write operation is concluded and the nodes in the write quorum are released), the same is not true for the other quorum 
+: in this case, the nodes with no lock are 
+. If either 
+ or 
+ (but not both) is down, the 2-local parity left is enough to recover the data. Consider the write quorum 
+ so that 
+ are unlocked. We have 
+ is {2} and for example 
+.
+
+Read-only mode. We emphasize that if multiple nodes become unavailable in the system, so that operating the quorum system becomes infeasible, the system may still be operated in a ‘read-only’ mode as long as the number of unavailable nodes is within the fault tolerance threshold of the code being employed, e.g., for MDS codes, it will be up to .
+
+Storage overhead. In a system with two replicas, if even a single failure occurs, no quorum can be formed. In contrast, a system of data/parity nodes storing  coded data with storage overhead  can operate under many different fault configurations. Since , write operations can be performed even for up to e faults in parity nodes if . If it is a MDS code, it can operate in the ‘read-only’ mode for up to any  nodes failing. Moderately small values of  such as  are also typically desired for other system design and data access considerations.
+
+3.2. Differential parity update
+The read and write quorums from Definition 2, Definition 3 guarantee the existence of some nodes in their intersection, that is at least one node which is up-to-date. For replicated systems, this updated value is propagated to the other replicas as is. Consider now the parity 
+ shown in Fig. 2 for some 
+. When the value of 
+ is updated (
+), 
+ also needs to be updated. This is done as follows: 
+, where 
+ and 
+ represent the values of 
+ before and after the write operation. We use the notation τ to represent logical timestamps, realized using a vector clock, which is a standard mechanism for capturing (partial) ordering information among events in a distributed system. The difference 
+ needs to be propagated to all the other nodes storing parities, and they can update the parities locally (using the corresponding appropriate coefficient). This idea of updating erasure coded data efficiently using differentials in itself is well understood and practiced, e.g., [1], [19], [42].
+
+Fig. 2
+Download : Download high-res image (296KB)
+Download : Download full-size image
+Fig. 2. Quorums for xi being updated twice: 
+ followed subsequently by 
+. (For interpretation of the colors in the figure(s), the reader is referred to the web version of this article.)
+
+Suppose now that 
+ is being updated twice: 
+ followed subsequently by 
+.
+
+Fig. 2 summarizes the mechanism (only relevant information is shown explicitly). The nodes participating in a write quorum for each of the write operation are indicated in color: first update 
+ is shown in blue; second update 
+ is shown in red. Nodes carrying data and parity blocks are shown in bold and (elongated) dashed boxes. Auxiliary information stored at parity nodes are indicated for some, on the upper right corner.
+
+The respective write quorums 
+ and 
+ ensure that the two write operations are mutually exclusive. As such, one of the write operations is necessarily completed before the next write operation commences, and hence an ordering of the write operations can be established naturally. Since any new version of the data can only be written after a previous write operation is completed, a new write operation will have access to the latest prior version to determine the new value to be written. Furthermore, no other concurrent write operations can occur. These two invariants together yield the atomic Read-Modify-Write operational semantic.
+
+We use the convention that 
+ is indicated for the operation that completed before the other write operation was carried out (indicated with 
+). There could be some node r storing a parity 
+ which appears in the second quorum (
+) but not the first one (
+) and is also yet to receive the differential update 
+ from the prior write operation. This creates a stored content synchronization issue at r, which ought to update its content first with 
+ (so that the value stored at it is 
+, instead of the stale value 
+) and then with 
+. The fact that some parities carry a stale value can be determined by comparing the timestamp among the parities involved in a quorum. This is illustrated in the second row of Fig. 2.
+
+To solve the synchronization issue, each parity node additionally stores temporarily the differential 
+ that it had last incorporated as an auxiliary information. Since both write quorums involve more than half of the parities, we know that there is at least one node q storing a parity 
+ () which belongs to both the write quorums. After the first write is completed and the second write quorum is gathered, this node is having the latest differential 
+. Thus nodes from 
+ (as well as any other nodes which have already received 
+ in the interim) can provide the differential to the other nodes such as 
+ that are missing the latest update (below, we discuss the issue of nodes which have lagged by more than a single update). Accordingly r can reconcile its local information (as shown in the third row of Fig. 2) before/while incorporating the changes from the new update.
+
+Subsequently, information regarding the new update 
+, specifically the differential 
+ will similarly be available from the parity storing nodes in 
+, and they will further propagate (discussed below) this differential 
+ to other parity nodes which did not participate in the latest quorum. Each node will also continue to store the latest differential (discarding the previous one, as shown in the final row of Fig. 2), so that other unupdated nodes storing stale parities may obtain them eventually.
+
+Because of the commutative nature of the differentials, the steps of reconciling the stale parity node and then incorporating the new update, though shown separately in Fig. 2 can be carried out together, or even in reverse order. Likewise, the whole argument also holds when two processes carry out updates on two different data blocks 
+ and 
+. Any parity node that is yet to receive the last update yet, but is part of the quorum used for the latest write operation can reconcile itself locally using the differential found at a node in the intersection of the current and last write quorums.
+
+We next outline some practical aspects one may consider while implementing the proposed mechanism:
+
+(i) The same argument can be applied for the parities involved in a computed read quorum - the stale parities can and should be updated before carrying out the actual read. Whether a given parity is up-to-date or not can be determined using the associated timestamp, and the latest update differential may need to be pulled from other parity nodes.
+
+(ii) We assume that, in addition to encountering the latest parity during a new write (or a computed read), the nodes storing parities broadcast or gossip the updates among each other. Gossip algorithms can spread the updates robustly and quickly even in highly unreliable environments [15], and have been deployed successfully at scale in systems like Amazon's Dynamo [17]. The gossip group sizes in our design are small, since the gossip is confined to the n nodes storing a coded collection of blocks, and once all the parities have received the update differential, it can be garbage collected. In practice, parity nodes should gossip the timestamps for/from all members regularly rather than the actual differentials (which are block sized and can be large), to determine when every member has the latest information, thus carrying out garbage collection, and likewise, pull the relevant differentials when they realize that they do not have the latest information.
+
+(iii) Since we need a separate broadcast or gossip group (for disseminating parity differentials) per group of coded collection of blocks, from a system design point of view, it makes sense to co-locate multiple groups of coded collection of blocks together, to amortize the communication within groups.
+
+(iv) The size of the latest differential is the same as the size of the parity itself. However, temporarily storing it separately will facilitate stale parities to be updated with small computational and communication cost (and barely any delay): if the differential is not used, a stale parity node π would need to foremost contact and gather information from nodes (which should themselves be up-to-date) in 
+, and then carry out a reconstruction. As a consequence of storing the differential temporarily, the effective storage overhead of a  coded group of data can temporarily go up to  instead of  (depending on the efficacy of the update propagation, and subsequent garbage collection). However, this increase will happen only for the data that do undergo any recent change, and only for a period until the update is propagated across all the nodes storing data for the affected coded group of data blocks. Furthermore, we emphasize that storing this auxiliary information is optional (and can be communicated just once and then discarded), and even in the absence of the same, stale parities can carry out reconstruction of the necessary information - albeit at the cost of larger amount of coordination, communication, computation and associated delays.
+
+(v) The above analysis relies on the presence of a node q in the intersection of two write quorums. We discuss next the likelihood that the intersection contains more than one node. There are  parities, and the number of parity nodes that were part of the first quorum is 
+. Any specific parity node is thus in 
+ with probability 
+ 
+. Consequently, if the new quorum 
+ has 
+ parity nodes as members, then the probability that y parity nodes from 
+ were also part of 
+ follows the binomial distribution:  
+ 
+ 
+ 
+. The expected value (mean), for the choice of the smallest possible write quorums in each instance, i.e., 
+ 
+ is 
+ 
+ 
+ 
+, which simplifies to 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+  This suggests that, usually, several parity nodes in a write quorum will be repeated from the precisely prior write quorum, which would thus carry the relevant update differential. Note that our analysis does not account for additional parity nodes in the quorum which would be up-to-date because of the proactive update dissemination. As such, the (in-case) stale parity nodes will have ample choices to obtain the update.
+
+(vi) There is a possibility that some nodes storing parities lag behind by more than a single update. The fact that they have lagged by more than one update can be determined based on the logical timestamp (in the same manner as for a replicated storage system). However, only the latest parity differential is retained by design in our approach. Unless one can find the intermediate differentials serendipitously, a full reconstruction of the parity (instead of applying the differential approach) will become essential for such nodes. The system will have to flag them as ineligible to participate in any write or computed read quorums until they are brought up to date.
+
+3.3. Write multiple blocks by a single process
+While the write quorum described above precludes simultaneous writes on different blocks by different processes, if a single process wants to update multiple blocks simultaneously, this can in fact be achieved. Foremost, the process already holds the necessary locks for enough parity nodes to form a suitable write quorum. As such, it would need to obtain locks for the other data blocks. Since, in our setup, other processes cannot carry out write operation simultaneously (because they cannot obtain enough locks on the parity blocks), the current process is free to obtain additional write locks on any and all the other data blocks within the group of coded blocks, subject to the usual contention with other read operations.
+
+We next extend the notion of write quorum involving μ blocks.
+
+Definition 4
+
+We define a write quorum 
+ where 
+ and  to be a subset of nodes comprising all 
+ and at least 
+ 
+ of the parities.
+
+However, in this case, the differential based update mechanism discussed above would incur correspondingly higher volume of storage (if one were to store all the differentials at all the updated parities), which may not be practical. As such, beyond disseminating the update differentials immediately during the write operation to the other parities outside the write quorum, we suggest two possible work arounds: the differentials are stored at the nodes storing the data blocks instead, so that they can be pulled by stale parities; a full recomputation for stale parities using the coding process.
+
+4. Quorum analysis
+To understand the behavior of the proposed quorum systems, we choose three view points to analyze: the likelihood to be able to form the different quorums in the presence of node failures, the contention of resources when one write and several reads concurrently would like to access the data blocks, and the load of the quorum systems, a standard metric traditionally used [47] to characterize quorums systems.
+
+4.1. Resource availability estimation
+Consider the probability ρ that a node is unavailable, either because it is offline, or it is overloaded (we assume as a baseline that the nodes' unavailabilities are independent and identical (i.i.d.)). We compute the probability that a (computed) read/write quorum can be gathered, despite possible unavailability of individual nodes, but in the absence of any contention from a conflicting write/read operation. We explore afterwards the effect of resource contention separately.
+
+Read quorum: A read quorum can be obtained if the node storing the relevant block is online, which happens with probability . If it is not available (an event of probability ρ), we can carry out a computed read, which requires at least 
+ 
+ parity nodes, and possibly some other data blocks. The probability to be able to form a computed read quorum depends on the structural properties of the code used. We will confine our analysis to the case of MDS codes (with a locality of k), which provides a worst case baseline: codes with a locality less than k are expected to have a better chance at forming a suitable computed read quorum.
+
+For MDS codes, we need to consider two regimes, depending on whether or not 
+ 
+. If  is even, this condition is equivalent to . If  is odd, we have instead .
+
+Case 1: 
+ 
+. In this case, no further data (or parity) block is needed. The probability of 
+ 
+ or more parity blocks being online is
+ 
+ 
+ 
+ The overall probability to form a suitable read quorum is thus 
+.
+
+Case 2: 
+ 
+. Then the k nodes needed for a computed read are gathered either between the parities and the remaining  data blocks (since the original data block is not unavailable), or by adding up more parities (for which we need , that is  for  even and  for  odd).
+
+Suppose η data blocks out of the remaining  are available. As long as  or more parity blocks out of the  parities are also available, a suitable computed read quorum can be formed. For 
+ 
+, the probability of having enough nodes for a computed read is:
+ 
+ 
+ 
+ 
+ If , then we need k parities, which is only possible if . The overall probability for this computed read quorum is thus 
+.
+
+Write quorum: For being able to carry out a write on a block, the node storing the block first needs to be available, an event of probability . Furthermore, at least 
+ 
+ parity nodes need to be available. This happens with a probability of 
+ 
+ 
+. The overall probability to form a write quorum is thus 
+.
+
+Fig. 3 illustrates the probabilities of being able to form computed read and write quorums respectively. These probabilities are shown on the y-axis as a function of ρ (on x-axis), the probability of a node being unavailable. Different code parameters are chosen. The compared codes have storage overhead as follows:
+
+(n,k)	n/k
+(7,3)	7/3 ≈ 2.3
+(14,5)	14/5 ≈ 2.85
+(20,10), (30,15)	2
+(15,10), (18,12)	3/2 = 1.5
+Note that while we have the same storage overhead appearing twice, the curves in the figure are distinct, which suggests that both the parameters  together influence the probabilities behavior, and not only their ratio .
+Fig. 3
+Download : Download high-res image (206KB)
+Download : Download full-size image
+Fig. 3. As a function of the probability ρ of a node being unavailable, the probability (1 − ρ(1 − Pcr,1) or 1 − ρ(1 − Pcr,2)) that a computed read quorum can be formed on the left, and the probability (1 − ρ)Pw that a write quorum can be formed.
+
+We see on the left of Fig. 3 that for ρ up to 0.1, the probabilities of computed read quorums remain above 0.95. They are particularly high for the  and  codes, which have higher storage overhead compared to the other codes. On the right of Fig. 3,  is also plotted, which shows that for ρ up to 0.1, the most influential factor is ρ itself, not the ability to form a write quorum using parities. The code performing the worst is the  code. This is likely to be explained by the number of parities involved, 4 of them, which is the smallest number of parities among the codes considered: the number of choices for parities is small and sensitive to node unavailability. Comparing the  and  codes, they have similar storage overhead, similar probabilities to form computed read quorums, but the  linear code behaves better in terms of write quorum probability.
+
+Finally, we would like to emphasize that, even though we explore a large range of ρ values till 0.2, in practice, a data-center storage system is expected to operate in a significantly stabler environment [16], with an effective ρ value many orders of magnitude smaller than 0.2. For instance, annual hard-disk failure rates of , amounting to thousands of disks, was reported in a study from Google [16]. They also reported that servers on an average crashed at least twice annually, accounting for  failure rate which amounted to at least one server failure daily. These statistics emphasize the need for fault tolerant storage solutions. But they also provide indicators for the range of environments in which the system typically operates. For instance, considering the 4% annual server failure rate mentioned above, a back-of-the-envelope estimate of  daily failure rate of an individual server can be inferred; while the ρ we used in our analysis is for a period spanning the time required to complete a single operation, and is thus expected to be even much smaller than that. The overall implication of this observation is that, by considering extremely large values of ρ we are able to indicatively capture the resilience of the system even when some of the simplifying assumptions such as independence of failures do not hold in practice, e.g., when the system is experiencing massive correlated failures.
+
+4.2. Resource contention estimation
+We next estimate the contention of resources that occur among the read/write quorums over coded data, since this determines the delay in completing said operations. Such an analysis is not meaningful for quorums over replicated data since, for a specific data object, subject to the constraints of atomic read-modify-write operations, only one kind of operation would be possible at a time in replicated systems, while distinct data objects have no inter-dependencies.
+
+Case-I (all nodes are available): In our construction, a write operation on one block, concurrent with read operations involving (some other) blocks within the coded collection of blocks, is feasible. Since we are interested in the contention between read and write quorums, to determine a baseline, we first decouple the analysis from node unavailability issues.
+
+For a tractable analysis, we make the following simplifying assumptions. While the proposed mechanism itself functions under timed-asynchronous setup, the discrete-time model and its implication on a synchronous system, and other simplifications described here solely serve the purpose of a tractable resource contention analysis. Consequently, the analysis provides insight primarily in a qualitative and indicative manner. (1) Each read or write operation takes one unit of time to complete, provided a corresponding quorum can be created. (2) At each time unit, R read operations arrive, and they involve uniformly and identically any of the k data blocks. (3) There is one write operation in the same period (this is because our quorum construction is such that at most a single write operation can be carried out at any time point, so we already know that if there are multiple writes contending for resources, at most one can be serviced). (4) Write lock on an individual data block can be acquired as fast as any individual read lock on the data block. Since normal ‘read directly from data block’ operations do not acquire locks on parity blocks, a write quorum could be formed without any further interference from read requests but for the contention on the data block itself.
+
+Later, in Section 5, we will carry out simulations which will consider more realistic settings that relax several of these assumptions, and consider pending operations being carried over and contending for resources with future operations, multiple write operations contending for resources and write operations being prioritized. We will also simulate scenarios with unavailable storage nodes.
+
+Under these assumptions, at each time round, all the read operations, and the write operation contend for necessary resources to form their respective quorums. As such, the number of read locks that have been already acquired before a write lock is being attempted is a random variable which takes a value  with equal likelihood: 
+ 
+ .
+
+The probability that a particular prior read operation was not for the same data block being attempted to be written to is 
+ 
+, and thus, the probability that none of the ψ reads were for the block to be written to is 
+ 
+.
+
+Thus, the probability that the suitable write lock can be acquired for a random write operation in presence of R read operations that read the k blocks uniformly randomly can be computed as the sum over all possible values of ψ, the number of read locks that have been obtained before the write lock is requested for, of the product of the probability 
+ that ψ read locks have been obtained, and the probability that none of these were a lock for the particular data block that needs to be written on, i.e., 
+ 
+, yielding: 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+. The explicit value of the summation is computed by noting that it is a geometric sequence.
+
+Likewise, a read operation may encounter a conflict with probability 
+ 
+ provided a contemporaneous write operation formed a quorum before it, but otherwise, it encounters no conflict. As such, the expected fraction of conflicted read operations which may not be serviced in a given round can be determined as follows. Conflict is to be considered for only the  read operations that try to obtain locks after a write operation has already obtained a lock. A contention happens if the read operation is for the same data block as the write operation, which happens with a probability . The product of these probabilities are summed over all possible values of ψ, i.e., 
+ 
+ 
+ 
+ 
+ 
+ 
+. The explicit value of the summation is computed noting that it is an arithmetic sequence.
+
+In Fig. 4, on the left, the probability of servicing a write operation, 
+ 
+ 
+, is shown as a function of R. The more read operations there are overall in a round, the larger the expected number of read operations that would acquire read locks before the write operation tries to obtain a write lock (unless write operations are prioritized), and consequently, larger is the chance that at least one of those read operations was for the same data that the write operation is for — leading to a contention. Nevertheless, we observe that even for a read demand which is up to twice the number of blocks, the likelihood of servicing a write is close to half (0.45). From our simulation experiments, discussed subsequently, we will see that most (
+-percentile) write operations are serviced within 2 rounds of delay for a wide range of workloads when all nodes are considered available, congruent to the assumptions and inference of this analysis (refer to Table 1 in Section 5 for details).
+
+Fig. 4
+Download : Download high-res image (83KB)
+Download : Download full-size image
+Fig. 4. On the left, the probability 
+ 
+ 
+ that a write lock can be acquired when R reads (shown on the x-axis) are requested. On the right, the expected fraction 
+ 
+ of conflicted read operations when there are R read requests. Three values of k are shown.
+
+
+Table 1. Delay in servicing operations (mean and standard deviation up to three significant digits, and 90th-percentile) in terms of number of simulation rounds. If an operation is serviced in the same round in which it is injected in the simulator, delay is considered to be 0. Since many write operations remain unserviced till the end of the experiments corresponding to Fig. 8 because multiple write operations may had been injected per round (our mechanism, by design can handle at most one write operation per round), statistics for write operations for these experiments were not meaningful, and have thus been indicated as N/A.
+
+Experiment	Read Ops	Write Ops
+mean	std. dev.	90th	mean	std. dev.	90th
+Fig. 7a	0.074	0.266	0	1.051	0.331	1
+Fig. 7b	0.080	0.292	0	1.867	0.368	2
+Fig. 7c	0.206	0.539	1	2.458	0.978	3
+Fig. 7d	0.222	0.526	1	2.947	1.121	3
+Fig. 7e	0.084	0.315	1	0	0	0
+Fig. 7f	0.225	0.551	1	1.979	0.777	2
+Fig. 8a	0.085	0.313	0	N/A	N/A	N/A
+Fig. 8b	0.194	0.502	1	N/A	N/A	N/A
+The right plot shows the expected fraction of unserviced read operations in a round, 
+ 
+, as a function of R. This plot exhibits an interesting dynamics among two opposing influences. The more read operations there are, the more likely that some of them cannot be serviced because the concerned data block is locked for a write operation. Yet, it is also likely that a read operation already reserved a read lock for the data item and preempted the write lock, and hence, more read operations also reinforce each others chances of obtaining read locks. These two influences together effectuate a behavior where only a small fraction of reads cannot be serviced because of conflicts, and the fraction of unserviced reads flattens. As we report in the simulations Section 5, the 
+-percentile of read operations are serviced with none up to a delay of 1 round, across a variety of workloads, and even if write operations are prioritized.
+
+Case-II (some nodes may be unavailable, and computed reads are carried out): So far, we assumed that all storage nodes were available, in which case, the read operations only lock the corresponding data block, but do not contend for parity blocks. As such, reads and writes could be carried out concurrently within the group of coded objects, as long as the data blocks involved were distinct. However, if some storage nodes are unavailable, one may choose to carry out computed reads, which involve parity nodes in the computed read quorum. In that situation, a concurrent write operation is not desirable, and our quorum mechanism ensures this mutual exclusivity. We next discuss the resulting contention of resources that a write operation will experience if a write operation is not prioritized, given that storage nodes are unavailable with a probability .
+
+The probability that a given read operation requires a computed read is simply ρ, the probability that the node storing the data block is unavailable. Thus, the probability that none of the ψ reads preceding the write operation required a computed read can be determined as 
+. Accordingly, the probability that at least one computed read is triggered is 
+. Thus, the probability that a write quorum will be blocked because of the possibility of computed read quorums being triggered (but ignoring the effect of node availability on its ability to obtain a quorum otherwise, which we already discussed earlier in Section 4.1), when there are R read operations per write operation, is the expectation, determined as: 
+ 
+ 
+. The closed-form result from the summation is computed by observing that in each of the terms in the summation, the minuend is a constant while the subtrahend forms a geometric sequence.
+
+The probability that a write quorum can be formed, in contention for resources with potential computed read operations, is then 
+ 
+. In Fig. 5 we plot this value for several choices of R and for a range of . Naturally, the more frequent the reads operations are, or more likely that storage nodes are unavailable, the more likely that some of them would trigger a computed read leading to higher contention for resources, and the lower the chance of forming a write quorum. More crucially, we observe that this probability collapses sharply as ρ increases. We would like to recall the discussion at the end of Section 4.1, noting that in practice, the system is expected to operate in a stable environment, with very small values of ρ, in which range, the probability that a write quorum is not blocked in a given round due to computed read operations is adequately high (e.g., more than 0.8 for ). Mitigation for the inadvertent situation where the system may need to operate with a high value of ρ would be to either not invoke computed reads, and/or to implement an application layer scheduling mechanism for fairer or prioritized access of resources to write operations.
+
+Fig. 5
+Download : Download high-res image (118KB)
+Download : Download full-size image
+Fig. 5. Probability that an (unprioritized) write quorum is not blocked because of contention with R read operations, in the set-up when computed reads are used when corresponding storage nodes are unavailable.
+
+4.3. Load
+An access strategy Z defines the probability 
+ of accessing a quorum  such that 
+, where 
+ is the set of all quorums, and 
+ contains both read and computed read quorums.
+
+The load of access strategy Z on a node i is 
+ 
+ 
+. The load induced by access strategy Z is the maximal load induced by Z on any block [47]: 
+. The load 
+ of a quorum system  measures the minimal access probability of the busiest node in the quorum system, and thus its quality: low loads means that even the busiest node is not heavily accessed, and is available for other tasks. A low load is thus desirable, and an access strategy ought to be chosen accordingly. As such, the load 
+ of a quorum system is the minimum load across all possible strategies Z.
+
+We can express the problem of load minimization in terms of the following primal linear program: 
+ 
+ The optimization is over a vector a size  (one probability for every quorum and L), and there are n constraints, plus one equality (without counting the variable positivity). The dual has  constraints, n variables 
+ and one variable (D) whose sign is unconstrained (corresponding to the primal equality) and is given by: 
+ 
+ 
+
+The weak duality theorem guarantees that for x a feasible solution of the primal, and y a feasible solution of the dual, we have that the objective function of the dual evaluated in 
+ is a lower bound on the objective function of the primal evaluated in x. The vector 
+ 
+ 
+ is feasible for the value of D computed next. Indeed, 
+, 
+ 
+, 
+ 
+, and we can take 
+ 
+, where 
+ are of minimal cardinality. Thus 
+ 
+, and for read quorums of size 1, this bound becomes 
+ 
+. If we use only computed read quorums, the smallest possible size for a computed read is 
+ 
+, hence
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+For symmetric quorums, we have [47] 
+ 
+, for one data block. If we were to access k different data objects stored using replication, the load would scale to 
+ 
+. This scaling is needed to allow a fair comparison, since a coded collection of blocks stores and caters to k data blocks, accordingly we compare 
+ 
+ for k blocks, to 
+ 
+ 
+ 
+ 
+ 
+ where  is the fraction of computed reads. For this load to be better than in the case of replication, we need 
+ 
+ 
+ 
+ 
+ ≈−0.0, 0.323, 0.232, 0.363, −0.4, −0.2 for , , , , , . Thus the load is always less for .
+
+Loads are plotted in Fig. 6. That the load for the proposed quorums are better for all ranges of τ for the ,  and  codes is shown on the left hand side (each continuous line is strictly lower than its corresponding dotted line). The storage overhead for these codes are respectively ≈2.3, 1.5 and 1.5. On the right, the ranges of τ for which the proposed quorums are better can be identified. For these codes, the storage overheads are respectively ≈2.85 for the  code, and 2 for the  and  codes. Three observations can be made: (i) the load increases when τ decreases, a behavior to be expected: when τ decreases, the fraction of reads which can be serviced directly from one node becomes smaller, meaning that more computed reads are invoked; (ii) how the load depends on  can be read from the bound 
+ 
+: the numerator depends on , a function of the length n, while the denominator depends on the number  of parities. Thus while both the  and the  codes have the same storage overhead, the  gives a ratio of 
+ 
+ 
+ which is larger (in fact giving a negative lower bound) than 
+ 
+ 
+ for . Finally (iii), a regime in which τ is larger suggests more reads are serviced by accessing a single storage node, and for this regime which is typical in a stable environment, the loads observed for quorums over codes are better than in replicated systems.
+
+Fig. 6
+Download : Download high-res image (75KB)
+Download : Download full-size image
+Fig. 6. Comparison between the load of the proposed quorums (continuous lines) and the minimum load of a symmetric quorum (dotted lines): on the left, for the (7,3),(15,10),(18,12) codes, on the right, for the (14,5),(20,10),(30,15) codes. The load  on the y-axis is shown as a function of τ, the fraction of reads which can be serviced directly by accessing a single node, on the x-axis.
+
+5. Simulations
+A discrete-time simulator was implemented to model the locking and quorums based access of data in a collection of coded data blocks, considering: (i) both a fixed or random number of new read/write operations per round; (ii) the possibility of nodes to be unavailable in any given round with a parameterized probability; (iii) possibility to prioritize the write operations within a discrete time round to contend for locks before the read operations.
+
+In all our experiments, if certain operations remain unserviced in a given round, they are carried over to the next round, in addition to the newly added operations. The simulator thus includes several realistic aspects ignored in the earlier theoretical analysis.
+
+While the simulator works for arbitrary code parameters, we report results for experiments with  codes, for a 1.5× storage overhead (or of 2× when the overheads from the update differentials are accounted for).
+
+In a first set of experiments we consider that each round has a fixed number of new operations, among which there is precisely one write. Furthermore, operations (both reads/writes) may be carried over from previous rounds, if they were not serviced.
+
+Fig. 7 shows the fraction of unserviced operations (normalized w.r.to number of new operations generated per round) from simulations where 10 (9 reads/1 write) and 40 (39 reads/1write) new operations were generated per time round. We also report the mean normalized values for unserviced reads and writes as a [
+] pair for each of the experiments.
+
+Fig. 7
+Download : Download high-res image (838KB)
+Download : Download full-size image
+Fig. 7. A single write operation is created per round. Rows 1 & 2: Operations are in random order. Row 3: All write operations in a round (new ones, as well as the ones pending from the past) are given priority over read operations. Mean normalized values for unserviced reads and writes are reported as a [μur,μuw] pair for each experiment.
+
+Experiments were conducted with no prioritization of operations, and for scenarios without any node unavailability, as well as when nodes could be unavailable in any given round with probability 0.1. Recall from the discussion at the end of Section 4.1 that a data center environment is much more stable than this [16], and this extremely adversarial environment is chosen as a stress-test for the proposed mechanism. In this latter scenario, some operations may not be serviced because of nodes being unavailable (in addition to operations being in conflict for resources).
+
+The heavy fluctuations in the plot suggest that while operations may take a few rounds to get serviced, they do get serviced soon enough, so that there is no pile-up. Below, we elaborate more on this by studying the delay in servicing operations, which we report in Table 1. This is particularly interesting for write-operations, which can be cleared at the rate of at most a single operation per round. Since , with 40 new operations per round, one would expect many more conflicts. While the absolute number of unserviced operations is larger per round, the fraction is in fact smaller - which highlights the benefit of servicing read operations concurrently even in presence of a write operation within the same coded system of data blocks.
+
+The expected fraction of unserviced read operations for the set of experiments when all nodes are available can be compared against the analysis reported in Fig. 4. Foremost, we observe that, said analysis only allows us to compute the mean, while the simulations determine instances of a random variable. The experiments show occurrence of spikes, indicating that within a given round, the actual instantiation of the random variable can take a value of up to an order of magnitude higher than the predicted mean. We also notice that the observed 
+ values for these experiments are almost twice that predicted in the analysis. We identify two reasons why this might be the case: (i) Consider the case when  (10 operations per round), then the smallest non-zero value possible physically, namely 1/9, for the fraction of unserviced reads, is larger than three times the analytically predicted value. If two reads are unserviced, this jumps to more than six times. So, there is a quantization effect. (ii) The simulations carry over unserviced operations to next round, which increases the level of contention. The simplistic theoretical analysis in contrast studies an individual round in isolation, and accordingly considers a fixed number of operations. It thus helps understanding the dependencies within a static time-window, but ignores the dynamics over time.
+
+In Fig. 7e & 7f we show the results if write operations are prioritized in this set-up. Giving such priority to writes has no discernible adverse impact on servicing read operations, as can be inferred by comparing against Fig. 7a & 7c the maximum and the mean of the fraction of unserviced read operations, as well as from Table 1 where we report the statistics on the delay in servicing operations. Moreover, when no node is unavailable, as expected, the single write operation is always serviced immediately in the same round, and thus there are never any pending write operations.
+
+This lack of any considerable adverse impact on read operations highlights a salient feature and strength of our proposed mechanism, and it can be readily explained by harnessing insights drawn from our prior analysis. Even if a write operation is given priority, it would hinder only those read operations that were meant for the same data block, which itself is on an average a small fraction  of all the read operations. The other read operations would be carried out concurrently unhindered. Without prioritized writes, this fraction of  read operations may still not have been carried out in the given round, if a write operation happened to have acquired the lock in the given round. Thus, the net impact of prioritized writes on read operations is expected to be bounded by 
+ 
+ 
+ 
+, where the numerator is the probability that an unprioritized write would not have been serviced anyway (refer to the analysis in Section 4.2 and Fig. 4). For the reported experiments, , , which yields a marginal expected impact of 1.87%.
+
+When nodes may be unavailable (Fig. 7f), some write operations may not be serviced, and they thus get carried over to next round, but yet again, we do not observe any massive pile-up of unserviced operations of either kind. We do notice a reduction of 
+ compared with Fig. 7c. As a caveat, we note that the magnitude of reduction is within a margin which might also be an artifact of the randomized experiments. Consistently, we also noticed reduction in the mean and 
+-percentile delay in processing write operations, which we have reported in Table 1.
+
+In Table 1, for all the simulation experiments reported in this paper, we report the mean, standard deviation and 
+-percentile statistics on the delay in terms of the number of rounds it takes for an operation to be serviced. The results are overall consistent with the insights drawn from the other figures for the simulations, and also implied by the theoretical analysis. In particular, it helps reconfirm that at an aggregated level, there is no pile-up of operations, moreover, individual operations do not linger in the system for very long, except for a scenario (discussed next) where many write operations may arrive in a single round, in which case, while the read operations still being processed, write operations pile-up. This is a direct consequence of a known constraint of our proposed mechanism, since only a single write operation within the collection of data blocks can be processed at a time.
+
+To explore the above mentioned adverse scenario, we consider a set-up where the number of read and write operations per round are chosen at random, and assumed to be from different processes. For the reported experiments, we choose each operation to be a read operation with probability 0.9, and write operation with a probability 0.1. This results in probabilistically creating multiple write operations in the same time round. Fig. 8 shows the results (the inset image shows the fraction of new read/write operations created per round). Since multiple write requests may be generated per round, but at most one can be serviced per round by our mechanism, even with priority, the number of unserviced write operations pile up (to numbers even larger than the new operations being created per round). Additionally, if nodes are occasionally unavailable (with probability 0.1 in these experiments) the effect is accentuated. However, in both these cases, we notice that the read operations are not adversely affected - in fact, they fare better than in the controlled set-up, arguably since there are actually fewer read operations per round.
+
+Fig. 8
+Download : Download high-res image (260KB)
+Download : Download full-size image
+Fig. 8. Operation composition is randomly determined, with probability of 0.1 for an operation to be write: Inset - the actual distribution of read/write operations generated per round. All (new and pending) write operations are given priority over reads. Mean normalized values for unserviced reads and writes are reported as a [μur,μuw] pair for each experiment.
+
+We next discuss related works, to put in perspective the novelties and strengths of this work vis-a-vis the existing literature.
+
+6. Related works
+The research on coding for distributed storage has been predominantly dominated by what is called the ‘repair problem’, that of designing erasure codes for which maintenance can be done efficiently, in particular, in the case of fast or proactive repairs (for lazy repairs, in which set-up several failures are allowed to accumulate before carrying out multiple repairs, MDS codes are well suited), see e.g. [36], [40] for surveys over time on the topic of repairability of erasure coded data stores. For the work presented in this paper, the most relevant research is in the realm of managing mutable data stored using erasure coding, which can be grouped among three categories: (i) efficiency and costs of propagating and computing updates, (ii) storage of multiple versions of data and (iii) consistency.
+
+6.1. Update propagation and computation efficiency
+To achieve efficient updates, [1], [19], [42] have exploited the properties of linear codes, to use only the difference between two versions of the data for updating parities. We use the same principle, however, in contrast to these prior works which disseminate the updates in a best-effort manner, we demonstrated how quorum mechanisms can enforce the update of stale nodes.
+
+6.2. Storage of multiple versions of data
+Another line of work [25], [26], [50] considers archiving the chronological versions of the data. The focus of these works is not on consistency, or how the chronology is established, but instead on how to exploit the redundancy across versions of data, to reduce the storage overhead. To that end, sparse sampling based techniques have been used in [25], [26], and information theoretic optimization has been applied in [50] to store multi-versioned data in a storage efficient manner.
+
+6.3. Consistency
+The most relevant related works are pertaining mechanisms guaranteeing consistency of mutating data stored using erasure coding. These works can be characterized across multiple aspects of their design and properties. Prominent among them being the nature of operations supported, the granularity at which coded data is managed (e.g., whether individual data blocks can be read/written to, or if it respectively needs full decoding/re-encoding), the extent of concurrency (blocking/non-blocking), the associated consistency semantics, the (a-)synchronicity of the system, the nature of faults (fail-stop/Byzantine) against which a proposed mechanism provides resilience, whether the mechanism relies on a centralized ‘primary’ or is distributed in nature, whether and how it identifies versions and if it carries out changes in-place or stores multiple or all previous versions.
+
+Table 2 provides a summary of the prominent related works covering the most pertinent aspects of the design space. In the table, we overload the column of storage to indicate two things. Foremost, we distinguish the behavior of the storage servers as passive versus active. Passive servers perform basic storage functions of storing and returning the data and returning to the clients (possibly by establishing a secure communication channel), while active clients may carry-out one or multiple other tasks such as communicate among each other (for running a consensus algorithm, or to propagate some data), or carry out certain complex computations, e.g., cryptographic computations for data validation. The algorithms designed with the former constraint are naturally applicable in a wider range of settings, in contrast, the latter enables richer functionalities leveraging active storage elements that are typical in many environments, including particularly data centers. The existing works can also be distinguished in terms of whether new versions replace older versions, or whether individual versions need to be stored separately in order to support the designed consistency. Some of the works rely on a temporary buffer, others propose mechanisms for eventual garbage collection (gc), which are also highlighted within the storage dimension in the table. As an aside, given that erasure coding is deployed to save storage space, we note that storing multiple versions for managing consistency defeats this principal purpose of deploying erasure codes, unless if upper layer applications require the chronological snapshots of changes. As indicated in the previous subsection, codes leveraging redundancies across different versions provide a better storage efficient solution [25], [26] in those situations.
+
+
+Table 2. Prominent related works. ‘Consistency’ refers to consistency guarantee achieved. ‘Synch.’ refers to synchronicity model. ‘Failure’ refers to failure model. ‘R/W’ refers to operations semantics (‘MR’ refers to multiple readers, ‘SR’/'MW' refers to single/multiple writer(s), ‘RMW’ refers to a causally dependent atomic read-modify-write semantics). ‘Storage’ refers to both: (i) storage servers being active or passive participants w.r.to their role in the consistency mechanism, (ii) whether latest data replaces older data (in-place), or if it is stored separately as a new version (‘gc’ indicates that an eventual garbage collection mechanism is also proposed, ‘buffer’ indicates that a relatively small number of older versions are retained).
+
+Ref.	Consistency	Synch.	Failure	R/W	Storage	Remarks
+QoC (this)	sequential	timed asynch	fail-stop	MRMW +RMW	active, in-place	Difference based updates. Stores prior differences till propagation completion.
+[1]	regular	timed asynch	fail-stop	MRMW	passive, in-place	Difference based updates. Reconciliation in the background, during which differential is buffered.
+[42]	sequential or regular	timed asynch	fail-stop	MRMW	active, versions (buffer)	Two algorithm variants (with single master & distributed). Difference based updates.
+[37]	unspecified (regular)	timed asynch	fail-stop	MRMW	active, in-place	Paxos for leader election.
+[32]	sequential	asynch	fail-stop	MRMW	active, versions (gc)	Uses primary + replicated cache for consistency; erasure coding in a back-end layer for durability.
+[8]	eventual or regular	asynch	fail-stop	MRSW	passive, versions	Considers cloud-of-cloud environment.
+[11]	sequential	asynch	fail-stop	MRMW	active, versions	Assumes a static set of nodes.
+[23]	sequential	asynch	byzantine	MRMW	active, versions (gc)	Extrinsic data-structures for data corruption detection, and for creating version timestamp.
+[10]	sequential	asynch	byzantine	MRMW	active, versions	Principal focus is the mitigation of byzantine clients by improving non-skipping timestamps.
+6.4. Operations and consistency semantics
+Most existing works discussed here support, like our work, a multi-reader multi-writer (atomic) register abstraction. Multi-reader single-writer is supported in [8], with limited support to multiple writers through a priori allocation of non-intersecting leases. Moreover, barring [1], [42], the other works do not consider a scenario where a write operation first needs to read the data, to determine the new value to be written. In [1], [42], like our approach, differences are used for efficient recomputation of parities instead of a re-encoding of the whole data object, and thus, they necessarily involve reading the previous value as well. In [1], the fact that differences from different data blocks within a collection of coded objects can be commutatively imparted in the parity computations is exploited to allow for better concurrency of write operations across different data blocks, but leading to a weaker - ‘regular semantics’ of consistency - ensuring that a value that was never written or had been overwritten by another write is not returned, and if there is a concurrent write with a read, or if there are multiple concurrent writes, the read may return the value of any of the writes or the previously written value; thus failing to achieve atomic read-modify-write semantics. In [42], the same approach as [1] is studied, and an additional alternate variation is explored, in which the server storing a data object is used as a master node to coordinate write operations and to store multiple versions of the data in presence of concurrent write operations. With this second variation that stores multiple versions, it does achieve sequential consistency guarantee by a posteriori imposing a global ordering among versions, but in doing so, again it does not achieve the atomic read-modify-write semantics. Since these approaches allow for the parity blocks to be in an inconsistent state, their consistency guarantees do not apply for degraded (computed) reads when the storage node storing the data itself is unavailable, in contrast to our approach.
+
+Several of the other approaches we discuss here (more details below, and in the Table 2) achieve sequential consistency likewise by creating multiple versions of the data, and defining a global ordering among the versions, rather than replacing the content in-place. This allows for the design of non-blocking algorithms, which however necessarily compromise on the read-modify-write semantics, since chronological relationship wise, some of the versions would be siblings that are based on the same prior version, and yet, they are treated as a sequence of versions. In contrast, our work stands out, and to the best of our knowledge, it is the only work which supports not only multiple writers and multiple readers, but moreover it supports atomic read-modify-write operational semantics without relying on any underlying hardware or network level write primitives, and furthermore does so by in-place overwrite of the content instead of storing many versions of the data; but instead ephemerally storing change deltas till they are gossiped across the group of storage nodes. In order to achieve this atomic read-modify-write operational semantics, we thus ensure that concurrent writes or reads are blocked until a quorum of nodes have incorporated the latest version, so that any new write operation does not do so based on value obtained from a stale read.
+
+In [32], data is stored in two layers, maintaining a whole copy of data, with which clients interact, which also acts as the master-node for determining the sequence of operations and enforcing sequential consistency, and coordinates with a back-end that uses erasure coding for redundancy. A similar idea of using a leader caching the original value, and followers storing coded shares is also explored in [37], but distinct from the well-defined master-slave architecture of [32], in [37] Paxos based coordination among the nodes is employed to determine the leader leases dynamically. The discussion on consistency in [37] is somewhat obfuscating in nature, and while in the absence of failures the approach should achieve sequential consistency, the baseline achieved appears similar to regular semantics. The protocol proposed in DepSky [8] focuses on multi-cloud storage, relies on storing various versions of the data and it aims for a range of consistency between regular semantics to eventual consistency for single-writer multiple-reader set-ups, dependent on the behavior of the participating clouds. Likewise, Giza [13] considers data stored across data centers, and stores new versions of the data coded at the granularity of individual data objects as separate instances, maintaining all the older versions unless they are explicitly deleted. Several other works consider the same approach of storing distinct versions [3], [10], [11], [23], [46] rather than carrying out updates in-place. The thrust of those works are on how to manage the logical version numbering to identify the latest version and impose some form of serialization [10], [46], heuristics on how to reduce the dependence on older versions [3] by hiding the write from other read operations until the write is complete (which means, this technique is particularly unsuitable for read-modify-write operations) or garbage collect [11], [23], [46] older versions lazily.
+
+6.5. Failure and synchronicity models
+A majority of the works assume a fail-stop model for clients and servers, and likewise, most works consider practicable variations of the timed asynchronous system model [14] where clocks are considered loosely synchronized and timeout based mechanisms are deployed, which in turn implicitly rely on upper limits for the round trip times. Our work fits in this category.
+
+Some exceptions that claim a strictly asynchronous model are [3], [10], [11], [23], [32]. While the stringency of the asynchronous model allows elegant theoretical analysis and explicit bounds for safety, these algorithms and analysis rely on a certain number of responses being actually obtained for making progress. From a practical implementation point of view they have equivalent implication as the former body of works, that consider less stringent timed asynchronous model and relies on time-outs to abort operations.
+
+Mitigation against Byzantine clients as well as Byzantine storage servers is considered in [3], [10], [23]. Resilience against such Byzantine behavior is indeed the principal emphasis and novelty of these works, and complement the treatment of the other studies discussed above and that of ours. In terms of clients' Byzantine behavior, limited kinds of Byzantine behavior are addressed, and the emphasis is on using cryptographic techniques to ensure that version numbers are generated and used in a meaningful manner, e.g., guaranteeing non-skipping timestamps [6], using hash of the latest value as part of the time-stamp. In order to thwart Byzantine storage servers, extrinsically stored meta-information, e.g., hash digest is utilized.
+
+The techniques proposed in these works [3], [10], [23] are complementary in nature w.r.to the focus of our study. Following a principle of modularity, our design is decoupled from the overlying applications and clients; and thus client behavior is both out of the scope of our work, and also in turn, any third party best-practice can be readily augmented.
+
+6.6. Quorum design
+Given the nature of redundancy in erasure coded data, quorums are explicitly or implicitly used in many of the related works. However, they approach the problem with the legacy view of replication based redundancy; as such they focus on porting algorithms that have been traditionally designed for replication. Consequently, the size of quorums used in those algorithms are not only larger than k but significantly so, e.g., [11] which considers a fail-stop model, requires quorums of size 
+ 
+. Approaches to mitigate Byzantine failures require even larger quorums — though the sizes are parameterized and are thus not explicitly specified. In contrast, our work is designed by taking into account the structural (in-)dependencies among erasure coded blocks. In particular, we note that the original (systematic) data blocks themselves can be treated to be mutually independent for read or write operations at the granularity of data blocks, but the parity blocks are dependent on multiple original data blocks; as such, we can design effective quorums that involve fewer nodes (only half the parity nodes, and the specific data block being written on), i.e., 
+ 
+ nodes for write operations assuming MDS codes (refer to Definition 2 for details). For low storage overhead codes, i.e., 
+ 
+ is small, this translates into particularly smaller quorum sizes. When the data node is available, we require read quorums of size 1. Furthermore, our approach of explicitly exploiting the structural properties of the codes also allows it to accommodate non-MDS local reconstruction codes [28]; in contrast, the design and guarantees of the other quorum based works remain untested and would likely be rendered invalid for non-MDS codes.
+
+As a final note, we highlight a qualitative difference in the underlying design philosophy across the related works. Some of the designs are meant to work stand-alone or are strongly entangled to some specific set-up, e.g., [8] for multi-cloud, [13] for data stored across multiple data-centers, [32] for a two-layer edge/data-center environment, and emphasis in some works is to address niche issues, e.g., ensuring non-skipping timestamps [11], [23], Paxos based leader election [37]. While an approach of a complete system design is suitable for building a new system from the scratch, modular designs guided by the separation of concerns allow for organic integration with existing techniques. Our work follows this modular design philosophy, and addresses a specific niche problem - namely, achieving sequential consistency for atomic read-modify-write operations over erasure coded data by designing quorum systems and efficient differentials based update management mechanism explicitly designed to exploit the structural in/dependencies among the data and parity blocks.
+
+7. Concluding remarks
+The motivation of this work was to provide a proof-of-concept demonstrating that quorums can be designed for erasure coded data, taking into account the salient structural properties of codes, in order to support a relatively stringent sequential consistency, and an atomic read-modify-write operational semantics to enable a richer and wider variety of database like transactional applications in data center networked distributed storage systems deploying erasure codes for storing the data for reliability and availability. To that end, we proposed quorum systems that can be customized to different families of erasure codes - maximum distance separable (MDS) and local reconstruction codes (LRC) - and relying only on practicable assumptions as a distributed locks service, but without any network layer atomic primitives for atomic read-modify-write operations.
+
+We explored two axes, a theoretical study, involving analyses of availability, resource contention and quorum loads, all leading to parameterized close formed expressions and a numerical one, via a discrete-time simulator. The latter allows the exploration of the quorum performance under different read/write workloads, including prioritization of write operations and node unavailability.
+
+Through this two-pronged exploration, we study the behavior of the proposed quorum based approach, and determine its strengths and limitations. Particularly, we demonstrate that in relatively stable environments (but where faults nevertheless occur) as is typical in practice, and for warm-data workload characteristics, namely, when the frequency of write operations is low, yet attempts for concurrent access are possible, the proposed mechanism is viable and can thus enforce the stringent atomic read-modify-write operation semantics and correspondingly, sequential consistency over coded data.
+
+An extensive survey of related work also established the novelties of our work: it is the only quorum scheme that explicitly takes the structural property of the codes, and thus, involves quorums of relatively smaller sizes than prior work in addition to exploiting said property to design an efficient way to propagate and impart updates using differentials; it is also the first work to support atomic read-modify-write operations. Another salient novelty of our approach is that it carries out operations in-place and yet guarantees sequential consistency, and does not need to store many (or all) prior versions to do so, but instead, it temporarily stores the update differential while the update is being propagated among the storage nodes.
+
+While multiple concurrent writes to different data objects within a single collection of coded blocks by a single process is possible in our scheme, the current rendition prevents multiple processes to do so concurrently. Weighed against the many strengths of our work, and considering the targeted workload of warm data with low update frequency, this is less critical, nevertheless, it is an interesting and open problem to support such concurrency without compromising the operational and consistency semantics. In the meanwhile the current work provides an important and practical step forward in supporting a wider range of applications (with the above specified stringent requirements) over coded data.
+

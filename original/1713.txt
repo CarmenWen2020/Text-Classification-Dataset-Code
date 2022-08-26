@@ -1,0 +1,569 @@
+For many data-parallel computing systems like Spark, a job usually consists of multiple computation stages and inter-stage communication (i.e., coflows). Many efforts have been done to schedule coflows and jobs independently. The simple combination of coflow scheduling and job scheduling, however, would prolong the average job completion time (JCT) due to the conflict. For this reason, we propose a new abstraction of scheduling unit, named coBranch, which takes the dependency between computation stages and coflows into consideration, to schedule coflows and jobs jointly. Besides, mainstream coflow schedulers are order-preserving, i.e., all coflows of a high-priority job are prioritized than those of a low-priority job. We observe that the order-preserving constraint incurs low inter-job parallelism. To overcome the problem, we employ an urgency-based mechanism to schedule coBranches, which aims to decrease the average JCT by enhancing the inter-job parallelism. We implement the urgency-based coBranch Scheduling (BS) method on Apache Spark, conduct prototype-based experiments, and evaluate the performance of our method against the shortest-job-first critical-path method and the FIFO method. Results show that our method achieves around 10 and 15 percent reduction in the average JCT, respectively. Large-scale simulations based on the Google trace show that our method performs better and reduces JCT by 23 and 35 percent, respectively.
+SECTION 1Introduction
+To ACCELERATE big data analytics, data-parallel frameworks such as Dryad [2], Hadoop [3] and Spark [4] partition large input data so that multiple computers process different data partitions concurrently. In the above frameworks, a data-parallel job usually consists of multiple computation stages. Each stage includes a batch of computation tasks [5]. The workflow of the data-parallel job is represented as a directed acyclic graph (DAG) as shown in Fig. 1. Nodes denote computation stages and stages are interconnected through directed arrows. The arrow indicates the communication between two stages, i.e., the output of upstream stages is used as the input of downstream stages. The inter-stage communication involves a group of parallel data flows, which are transferred from multiple Map tasks running on different machines to multiple Reduce tasks. Only after the Reduce task receives all data flows, it can start to be executed. Such a group of parallel data flows are called a coflow [6].
+
+
+Fig. 1.
+An example: the DAG of a data-parallel job.
+
+Show All
+
+The transmission of multiple coflows incurs considerable communication costs [7]. Previous coflow schedulers [8], [9], [10] are proposed to optimize the schedule of coflows. On the other hand, job scheduling methods calculate the execution priority of jobs to decrease the job completion time (JCT). Such two types of schedulers, job scheduling and coflow scheduling, differ in both the optimization goal and the object to be scheduled. Previous research on such two types of scheduling problems is developed independently. However, a scheduling disagreement between two types of schedulers will prolong the average JCT. For example, the job scheduler prioritizes Job2 and thus, computation resource will be allocated to Job2 with high priority. However, the coflow scheduler may not prefer to transfer coflows of Job2. As a result, computation tasks of Job2 can be executed after high-priority coflows of other jobs are transmitted. This will prolong the JCT of Job2. On the contrary, the average JCT decreases by 18.5 percent if the scheduler coordinates the transmission of coflows with the execution of jobs. More scheduling details about the motivation example are stated in Section 3.1.
+
+Mainstream coflow scheduling methods [6], [11] employ the critical-path (CP) method [12] to schedule intra-job coflows. For inter-job coflows, these above coflow schedulers are order-preserving—if a job J1 is ordered higher than another job J2, coflows in J1 must be prioritized over those in J2. However, the order-preserving constraint reduces the inter-job parallelism as demonstrated by an illustrative example in Section 4.1.
+
+In this paper, we combines both job scheduling problem and coflow scheduling problem, and formulate the coordinative scheduling problem. The coordinative scheduling problem is hard to be solved because scheduling both coflows and jobs in a fine-grained manner suffers from great complexity, which increases exponentially when the number of computation tasks in jobs and coflows increase. We propose a new abstraction, called coBranch, to coordinate coflow scheduling with job scheduling for data-parallel jobs. A coBranch comprises both computation stages and coflows on the same disjoint path of a DAG. We regard the coBranch as a basic unit to be scheduled.
+
+We observe that the variety of job DAGs is potential to enhance the inter-job parallelism. The DAG variety involves two-fold: (1) in multi-job cases, the completion time of the critical path in each job is different; (2) for different DAGs, the difference between the completion time of the longest coBranch and that of the shortest coBranch is various. Owing to such various DAGs, coBranches of different jobs exhibit diverse urgency to be scheduled. The urgency level indicates the maximum delay time of a coBranch as defined in Definition 4.2. We are inspired to leverage the urgency as a global priority to schedule coBranches of different jobs. As a result of the urgency-based scheduling mechanism, coBranches with high urgency should be prioritized although they may belong to different jobs. This effectively enhances the inter-job parallelism.
+
+To sum up, we propose an urgency-based coBranch Scheduling (BS) method to schedule coBranch. The BS method estimates the urgency of coBranches, and then calculates the scheduling preference of coBranches by packing and matching coBranches iteratively. We further employ a distributed flow scheduling method to schedule coflows in accordance with the scheduling preference of coBranches. Our method is implemented as extended modules of Apache Spark and deployed in our lab cluster that includes 30 servers. The major contributions of this paper are summarized as follows.
+
+We formulate the coordinative scheduling problem for data-parallel jobs with consideration of the dependency between the communication process and computation process.
+
+We design an urgency-based BS method, aiming to decrease the average JCT, and theoretically prove that the approximation ratio of the heuristic BS method can be 1.52 in a specific case. We propose the distributed flow scheduling method to coordinate the transmission of coflows with the execution of coBranches.
+
+We expand the BS method in the online cases. Given a batch of jobs, the online BS method does not determine the priorities of all coBranches at once but updates the time-varying urgency during the execution of jobs and continuously makes scheduling decisions.
+
+The rest of this paper is organized as follows. Section 2 provides the background of coflow scheduling and job scheduling methods for data-parallel jobs. In Section 3, we illustrate the scheduling disagreement, formulate the coordinative scheduling problem, and define the coBranch abstraction. In Section 4, we illustrate the motivation of the urgency-based scheduling mechanism, define the coBranch urgency, propose the BS method and the distributed flow scheduling method, give the theoretical performance bound and expand the BS method in online cases. Section 5 presents the implementation on Apache Spark platform. Section 6 shows the evaluation results under extensive experiments. Section 7 concludes this paper.
+
+SECTION 2Related Work
+2.1 Job Scheduling for Data-Parallel Jobs
+Prior studies [13], [14], [15] try to achieve the tradeoff between the fairness and the latency of data-parallel jobs. The dominant resource fairness [13] is designed as a generalization of max-min fairness in multiple resource cases. Jockey [14] overcomes latency which is caused by fair-sharing schedulers. Classical fair scheduling and capacity scheduling methods use the presetting queue to guarantee the fairness between multiple tenants in shared clusters [15]. The above methods focus on the fairness of resource allocation but their optimization goals are different from ours. Our work aims to accelerate data-parallel jobs by coordinating the transmission of coflows with the execution of jobs.
+
+The job scheduling methods optimize the computation process of data-parallel jobs via effective computation scheduling strategies. They involve various optimization goals like smaller JCTs, larger system throughput or higher resource utilization. The shortest-job-first (SJF) method prioritizes the job which has the shortest execution time. For specific scheduling cases, a semi-clairvoyant scheduling method is proposed for data-parallel jobs with the partial prior job information [16]. Besides, an adaptive learning technique is designed to online schedule big-data stream applications using machine learning methods [17]. Tetris [18] is proposed to schedule computation tasks with the constraint of multiple resources. GRAPHENE [19] is proposed to pack tasks with the constraint of the DAG dependencies. CARBYNE [20] minimizes the average JCT in an altruistic manner by packing tasks reversely. Nevertheless, the performance of the shortest-job-first method is the best in terms of the average JCT [20]. Hence, we adopt the SJF method as the baseline in experiments. We note that existing job scheduling methods hardly consider the transmission of coflows, which incur heavy communication overhead for data-parallel jobs. We propose the BS method to coordinately schedule the transmission of coflows with the execution of jobs, finally for decreasing the average JCT.
+
+2.2 Coflow Scheduling
+Conventional flow scheduling methods like the PDQ [21] method optimize the transmission time of a single data flow but perform badly in decreasing the transmission time of a coflow. In [22], the authors propose the coflow abstraction, aiming to schedule a group of data flows as an entirety. The smallest-effective-bottleneck-first (SEBF) method is proposed to decrease the average coflow completion time by transmitting the coflow with the smallest bottleneck (i.e., the minimum coflow completion time) [6]. Baraat [23] groups flows of a task and schedules them together in a decentralized manner. Recent coflow scheduling methods [24], [25] allocate transmission rate to coflows in a datacenter fabric, aiming to decrease the transmission completion time and improve the network throughput. Swallow [26] introduces a coflow compression mechanism to decrease the size of transmission data in data-intensive applications. Nevertheless, their motivation is different from this paper. The above methods aim to decrease the transmission time of coflows rather than the JCT.
+
+For data-parallel jobs that include multi-stage coflows, mainstream coflow scheduling methods [6], [11] employ the critical-path method to schedule multi-stage coflows. The CP method prefers to transmit coflows of the longest path in a job DAG. Varys [6] adopts the SEBF method to schedule intra-coflow data flows and proposes the CP method to handle inter-coflow dependencies. Aalo [11] employs a variant of the CP method to determine the scheduling preference of multi-stage coflows. Nevertheless, the above coflow schedulers are order-preserving. When multiple jobs are being executed concurrently, the priority of jobs determines the schedule of inter-job coflows. Owing to the order-preserving constraint, all coflows of a high-priority job are prioritized than those of a low-priority job. This incurs low inter-job parallelism. To solve the problem, we propose the urgency-based BS method to determine the priority of coBranches from different jobs. With the priority of coBranches, the distributed flow scheduling method prioritizes coflows of urgent coBranches to enhance inter-job parallelism.
+
+SECTION 3Coordinative Scheduling Problem
+In the section, we introduce the coordinative scheduling problem, define the coBranch abstraction and model the coBranch duration.
+
+3.1 Motivation of the Coordinative Scheduling Mechanism
+We use an illustrative scheduling example to reveal the disagreement between the shortest-job-first method and the smallest-effective-bottleneck-first method. The SEBF method is a coflow scheduling method which, however, does not consider the job scheduling decision. Thus, data flows are not scheduled in coordinative manner. In the illustrative example, the SJF method prefers to schedule the shortest job. However, data flows of the shortest job are delayed owing to the SEBF method. As a result, the JCT is prolonged. Besides, we illustrate a coordinative scheduling method, which decreases the JCT by coordinating the execution of jobs with the transmission of coflows.
+
+Fig. 2 illustrates the DAG of two data-parallel jobs. Let fi,k,mi,j,l denote the data flow, which is transferred from the task pi,k,m to another task pi,j,l. The two jobs, Job1 and Job2, are executed by 4 machines, M1, M2, M3 and M4 in Fig. 3. We assume that all machines are interconnected with each other via a non-blocking network fabric [27]. Thus, a data flow can be received as soon as the data flow starts to be sent. The transmission of each data flow consumes full bandwidth and in Fig. 2, the transmission time is equal to the data amount divided by the full bandwidth. It is worth noticing that the receiving time of a group of parallel data flows like f2,1,32,2,2 and f2,1,12,2,2 is the sum of their transmission time. Besides, the execution of computation tasks may depend on the transmission of coflows. For example, the computation task p2,2,1 is dependent on two data flows, f2,1,22,2,1 and f2,1,32,2,1. The two data flows are regarded as a coflow.1
+
+
+Fig. 2.
+Illustration of coflows and computation tasks in two jobs, Job1 and Job2. Each colored rectangle denotes a computation task and is labeled the execution time. Each gray edge in bold denotes a data flow and is labeled the transmission time.
+
+Show All
+
+
+Fig. 3.
+An illustrative example: a potential disagreement between the smallest-effective-bottleneck-first (SEBF) method and the shortest-job-first (SJF) method. Job1 and Job2 in Fig. 2 are executed by 4 machines from M1 to M4. Each machine runs a computation thread (abbreviated as Comp. T.) and a communication thread (abbreviated as Comm. T.). A blue arrow from data flows to a task indicates that the task is dependent on these data flows. A red arrow from a completed task to a data flow indicates that the data flow is generated from the output of the completed task. The SJF method works independently with the SEBF method. The JCT of Job1 and Job2 is 79s and 67s, respectively.
+
+Show All
+
+As shown in Fig. 2, the longest path of Job1 is p1,1,1→p1,2,2→p1,4,1. The sum of the execution time of these tasks and the transmission time of data flows on the longest path is 54s. This indicates that the completion time of Job1 is 54s at least. Similarly, the sum of the execution time of tasks and the transmission time of data flows on the longest path of Job2 is 27s. Thus, the JCT of Job2 is 27s at least. Since Job2 is shorter than Job1, the SJF method prefers to execute Job2. Thus, three tasks (i.e., p2,1,1, p2,1,2 and p2,1,3) of Job2 are executed with higher priorities on M1, M2 and M3 as shown in Figs. 3 and 4. Considering the data locality, remaining tasks of Job2, p2,2,1, p2,2,2 and p2,2,3, are still assigned to M1, M2 and M3, respectively. Since M4 is not busy, the task p1,1,2 of Job1 is assigned to M4.
+
+
+Fig. 4.
+We coordinate the communication scheduling process and computation scheduling process. The JCT of Job1 and Job2 is 79s and 40s, respectively.
+
+Show All
+
+After the task p1,1,2 is completed, a data flow f1,1,21,2,1 is transmitted from M4 to M3. The data flow f1,1,21,2,1 is regarded as a coflow that the task p1,2,1 is dependent on. Its transmission time is 27s. Besides, the machine M3 receives two data flows, f2,1,12,2,2 and f2,1,32,2,2, after p2,2,1 and p2,2,3 are completed. Only after the two data flows are received, the task p2,2,2 can be executed. Thus, the two data flows are regarded as a coflow and the minimum coflow completion time is 29s.
+
+Since f1,1,21,2,1 has smaller completion time, the SEBF method prefers to transmit f1,1,21,2,1 as shown in Fig. 3. After f1,1,21,2,1 is received, M3 starts to execute the task p1,2,1. However, the scheduling decision made by the SEBF method delays scheduling the task p2,2,2 of Job2 although p2,2,2 is given a higher priority by the SJF method. As a result, the JCT of Job2 is prolonged. The JCT of Job1 and Job2 is 79s and 67s, respectively.
+
+By contrast, Fig. 4 illustrates the coordinative scheduling mechanism. The machine M3 receives f2,1,12,2,2 and f2,1,32,2,2 with higher priorities to accelerate the execution of the task p2,2,2. Thus, Job2 is completed rapidly in Fig. 4. The JCT of Job1 and Job2 is 79s and 40s, respectively. To sum up, the coordinative scheduling mechanism decreases the JCT of Job2 by 27s (around 40 percent). In Fig. 3, the average JCT of Job1 and Job2 is 73s. As a comparison, the average JCT in Fig. 4 is 59.5s. The reduction of the average JCT is around 18.5 percent.
+
+To sum up, data flows are scheduled without considering the execution of jobs in Fig. 3. This leads to the scheduling disagreement between the job scheduling method and the coflow scheduling method, and prolongs the job completion time. To solve the problem, we propose the abstraction, coBranch, and schedule data flows according to the urgency of coBranches. In a coBranch, the priority of data flows is consistent with that of the coBranch. If computation tasks of the coBranch are scheduled with higher priorities, then the data flows that computation tasks are dependent on are preferred to transmit.
+
+3.2 Problem Formulation
+We further formalize the coordinative scheduling problem, which combines coflow scheduling and job scheduling. Given a batch of jobs {J1,…,Jn}, let si,j denote the jth stage of the ith job. Let G(si,j,si,k) denote the dependency between si,j and si,k. If G(si,j,si,k)=1, the stage si,j is dependent on si,k. Otherwise, the stage si,j is independent of si,k. Thus, the task pi,j,l can be executed only after data flows are sent from si,k. The group of data flows, which the task pi,j,l is dependent on, are regarded as a coflow, denoted by ci,j,l. Assume that both the execution time of a task and the transmission time of a data flow are known. To solve the coordinative scheduling problem, we need to determine the start time to execute a task and the start time to transmit a data flow. The objective function is as follows.
+min1n∑i=1nJCTi,(1)
+View Sourcewhere JCTi denotes the completion time of the ith job. The optimization goal is subject to the following constraints.
+JCTi=maxjTc(si,j),(2)
+View Source
+Tc(si,j)=maxlTc(pi,j,l),(3)
+View Source
+Tc(ci,j,l)=maxmTc(fi,k,mi,j,l),(4)
+View SourceRight-click on figure for MathML and additional features.
+Tc(pi,k,m)<Ts(fi,k,mi,j,l), if G(si,j,si,k)=1(5)
+View SourceRight-click on figure for MathML and additional features.
+Tc(ci,j,l)<Ts(pi,j,l), if G(si,j,si,k)=1(6)
+View Source
+X(t,pi,j,l)=1, if Ts(pi,j,l)<t<Tc(pi,j,l)(7)
+View Source
+X(t,pi,j,l)=0, if t≤Ts(pi,j,l) or t≥Tc(pi,j,l)(8)
+View Source
+∑l,j,iX(t,pi,j,l)≤NC,∀t(9)
+View Source
+Y(t,fi,k,mi,j,l)=1, if Ts(fi,k,mi,j,l)<t<Tc(fi,k,mi,j,l)(10)
+View Source
+Y(t,fi,k,mi,j,l)=0, if t≤Ts(fi,k,mi,j,l) or t≥Tc(fi,k,mi,j,l)(11)
+View Source
+∑m,jY(t,fi,k,mi,j,l)Ri,k,mi,j,l≤NB,∀t.(12)
+View Source
+
+In Constraint (2), Tc(si,j) denotes the completion time of a computation stage. Constraints (2), (3), and (4) define the JCT of the ith job, the completion time of the stage si,j, and the completion time of the coflow ci,j,l, respectively. In Constraint (5), Ts(fi,k,mi,j,l) denotes the start time of a data flow. Constraint (5) requires that the data flow fi,k,mi,j,l can start to be transmitted after its dependent task pi,k,m is completed. Constraint (6) requires that the task pi,j,l can start to be executed after its dependent coflow ci,j,l is completed. Constraints (7) and (8) restrict a time variable X(t,pi,j,l). If the task pi,j,l is being executed at the time t, we have X(t,pi,j,l)=1. Otherwise, X(t,pi,j,l)=0. Constraint (9) requires that the total number of all running tasks is, at any time t, smaller than the maximum number of CPU cores, denoted by NC. Similarly, Constraints (10) and (11) restrict a time variable Y(t,fi,k,mi,j,l). If the data flow fi,k,mi,j,l is being transmitted at the time t, we have Y(t,fi,k,mi,j,l)=1. Otherwise, Y(t,fi,k,mi,j,l)=0. In Constraint (12), Ri,k,mi,j,l denotes the transmission rate of the data flow fi,k,mi,j,l. Constraint (12) requires that the sum of transmission rate of data flows, which are sent to the task pi,j,l, is smaller than the bandwidth, denoted by NB. We regard the coordinative scheduling problem as the coflow scheduling problem with the constraint of the job scheduling problem [28], [29], [30], [31], which was proven to be NP-Hard [6], [11].
+
+3.3 coBranch Abstraction
+Our original scheme is to schedule data flows and computation tasks in a fine-grained manner. However, the complexity appears unacceptable when the number of tasks and data flows increase. For example, a job has 2 stages and each stage has 100 tasks. Each task of the downstream stage fetches data from 100 tasks of the upstream stage in the worst case. As a result, the complexity of the coordinative scheduling problem exponentially increases.
+
+We propose the coBranch as a job-level semantic, which prevents the scheduling disagreement illustrated in Fig. 3 and decreases the complexity of the coordinative scheduling problem.
+
+Definition 3.1 (coBranch).
+For any DAGs G(V,E), a coBranch consists of sequential stages and coflows, which form a disjoint path in the DAG.
+
+Fig. 5 shows an illustrative example of a job DAG that has multiple coBranches. Since intra-coBranch stages and intra-coBranch coflows must be scheduled in serials, they exhibit consistent priority. On the contrary, computation stages and coflows may belong to different coBranches in multi-job cases. Such inter-coBranch stages and inter-coBranch coflows can be scheduled in a parallel fashion and thus, they are given different priorities. We differentiate the scheduling priority of parallel coBranches to prevent that the transmission of coflows of a low-priority coBranch impedes the execution of computation stages of a high-priority coBranch.
+
+
+Fig. 5.
+An example: the DAG of a data-parallel job.
+
+Show All
+
+In Fig. 5, Stage1 and Stage2 are with the same lineage, i.e., the output of Stage1 is the input of Stage2. If we use coBranch1 as a unit for resource allocation, Stage1 and Stage2 are allocated on the same collection of machines so that the output of Stage1 is saved locally. When Stage2 starts to execute, the input data of Stage2 are straightly fetched from local machines. Thus, the coBranch abstraction is good for data locality.
+
+Algorithm 1 analyzes a DAG of a data-parallel job and constructs coBranches and coBranch synchronizations from the DAG. Given that x is a node denoting the final stage of the data-parallel job, the algorithm searches one-hop parent nodes, which x is dependent on. These parent nodes are denoted by Nd. If the number of parent nodes is one, we construct a coBranch for x, add the parent node into the coBranch, and the function Backtrack further recursively searches for dependent nodes of the parent node along directed edges. If x has more than one parent nodes, the function Synchronize constructs a coBranch synchronization for all parent nodes of the node x. This indicates that x can be executed after all parent nodes are completed. The complexity of Algorithm 1 is linearly correlated with the number of nodes.
+
+Algorithm 1. DAG Analyzing Method
+Require: One DAG G(V,E) and its final stage x.
+
+Ensure: A set of coBranches and coBranch synchronizations.
+
+Push parent nodes of x to Nd.
+
+if the number of parent nodes is one then
+
+Make a coBranch Bx.
+
+Call Backtrack(p,Bx). / * /∗ p is the parent node of x ∗/ *
+
+else
+
+Call Synchronize(x,Nd).
+
+function SynchronizeNode x, A set of nodes Nd
+
+Construct a coBranch synchronization Bx.
+
+for the ith parent node in Nd do
+
+Make a coBranch Bix in Bx.
+
+Call Backtrack(pi,Bix).
+
+/ * pi is the ith parent node */
+
+function BacktrackNode j, coBranch B
+
+Add j to B.
+
+if j is dependent on multiple nodes in V then
+
+Push parent nodes of j to Ld.
+
+Call Synchronize(j,Ld).
+
+else if j is dependent on one nodes j′ in V then
+
+Call Backtrack(j′,B).
+
+else if j is dependent on no nodes in V then
+
+return The branch B.
+
+3.4 Model of the coBranch Duration
+We calculate the average task time per computation thread to approximate the stage duration. Let Ti,j,l denote the duration of the lth task of the jth stage of the ith job. Let W denote the set of worker threads which execute all tasks of the stage si,j. Given that each thread can just execute one task once,2 the sum of the task time of the stage si,j is ∑w∈W∑l∈{1,…,L}Ti,j,l. On the average, the task time is 1|W|×∑w∈W∑l∈{1,…,L}Ti,j,l for each thread. Given that a coBranch has I stages, the coBranch duration BD is approximated by the sum of the stage duration as follows.
+BD=∑i∈{1,…,I}⎡⎣1|W|×∑w∈W∑l∈{1,…,L}Ti,j,l⎤⎦.(13)
+View Source
+
+The task duration Ti,j,l is unknow in Equation (13). We need to predict the task duration. The prediction of the task duration remains an open problem. We discuss a promising approach for the prediction. Iterative jobs such as PageRank and machine learning applications are considerable in cluster workloads and contain a significant number (up to 40 percent) [14]. For iterative jobs like KMeans and Regression, a computation task t is executed periodically. The task duration of iterative jobs is predictive when the round of iterations increases [32], [33]. Let Dit denote the task duration in the ith iteration. The task duration in different iterations forms a time series: D1t,D2t,D3t,…,Dnt when the iteration increases from 1 to n. For such a time series, the Auto-Regressive Integrated Moving Average (ARIMA) model [34] performs good prediction accuracy. The ARIMA model predicts future Di+1t over a window of iteration rounds based on observations of history task duration. It is worthy noticing that the prediction approach can be replaced with other methods in the BS method.
+
+SECTION 4Urgency-Based coBranch Scheduling Method
+Owing to the coordinative scheduling problem, we propose coBranches to avoid the scheduling disagreement. Unfortunately, an example shows that existing scheduling strategies are no longer effective to schedule coBranches (Section 4.1). We further propose an urgency-based scheduling mechanism to schedule coBranches and give the theoretical performance bound in Section 4.6.
+
+4.1 Motivation of Urgency-Based coBranch Scheduling
+The critical-path method is used in mainstream coflow scheduling methods [6], [11], aiming to handle inter-coflow dependencies. However, these methods are order-preserving. In Fig. 6, an example illustrates the drawback of the CP method with the order-preserving constraint. Two jobs are represented as DAGs with coBranches in Fig. 6a. For simplicity, we assume that the cluster resource is enough to execute three coBranches concurrently. Note that, Job1 and Job2 are submitted at 0 and 0.5 second, respectively. Partial resource, which is marked with gray color, is not available at the beginning. Owing to the order-preserving constraint, all parallel coBranches of Job1 are executed concurrently in Fig. 6b and thus, the inter-job parallelism is low.
+
+
+Fig. 6.
+Comparing the critical-path (CP) method with the heuristic method. For simplicity, we assume that the cluster resource is enough to execute three coBranches concurrently. Partial resource, which is marked with gray color, is not available at the beginning.
+
+Show All
+
+To enhance the inter-job parallelism, we propose a heuristic method to determine the global priority of each coBranch. The heuristic method judges whether parallel coBranches are urgent to prolong the JCT of a job. Fig. 6c illustrates that the heuristic method prioritizes to schedule B5 rather than B2 at 0.5 second. This is because that Job1 would not be prolonged although B2 was not executed at 0.5 second. At the 2nd second, similarly, the heuristic method prefers to execute B6. This is because that Job2 would be prolonged if B6 was not executed at the 2nd second. On the contrary, Job1 is not prolonged if B2 is not executed at the 2nd second. Thus, the heuristic method prefers to execute B6 rather than B2 at the 2nd second.
+
+To sum up, it incurs low inter-job parallelism to execute all parallel coBranches of Job1 concurrently in Fig. 6b. We propose to delay less urgent coBranches like B2 to prioritize more urgent coBranches like B6 as shown in Fig. 6c.
+
+4.2 Time-Varying coBranch Urgency
+In the above example, we note that the completion time of the critical path in each job is different. Besides, the difference between the completion time of the longest coBranch and that of other parallel coBranches is various. Owing to the variety, coBranches exhibit different levels of the urgency to be scheduled. We are inspired to design an urgency-based method, which schedules coBranches via an urgency-based metric to avoid prolonging the average JCT.
+
+To calculate the urgency of a coBranch, we use a crucial DAG structure, called the synchronization process which is defined as follows.
+
+Definition 4.1 (coBranch synchronization process).
+In a DAG, multiple parallel coBranches, which connects with the same downstream stage, form a coBranch synchronization process.
+
+The synchronization process follows the all-or-nothing rule [35]. Since the output of these coBranches is aggregated as the input of the downstream stage, the downstream stage cannot be executed until all outputs of upstream stages are collected. Thus, the synchronization process significantly impacts the JCT.
+
+A synchronization process usually includes multiple parallel coBranches. The execution time of such parallel coBranches is different. In the synchronization process, we define the urgency of coBranch as follows.
+
+Definition 4.2 (coBranch urgency).
+Given a job with one or more synchronization processes, it consists of coBranches {B1,B2,…,Bn}. The urgency of Bi is the remaining time of the ultimate synchronization process minus the duration of remaining coBranches, which starts from Bi to the ultimate synchronization process.
+
+The ultimate synchronization process is the closest one to the result computation stage. For example, in Fig. 6a, B3 and B4 compose the ultimate synchronization process of Job1. The ultimate synchronization process of Job1 should be completed at the 5th second at the soonest. We calculate the urgency of B2 at the 2nd second as follows. At the 2nd second, the remaining time of the ultimate synchronization process is 3s. In this paper, let → denote the scheduling order. Given two coBranches a and b, the denotation {a→b} means that a is scheduled prior to b. The scheduling order {B2→B4} starts from B2 to the ultimate synchronization process. The duration of {B2→B4} is 2.5 seconds. According to Definition 4.2, the urgency of B2 is 0.5 second. This indicates that the ultimate synchronization process of Job1 will not be completed at the 5th second if the start time of B2 is 0.5 second later than the current time (i.e., the 2nd second). If a coBranch is more urgent, the value of the coBranch urgency is smaller. The urgency is time-varying during the execution of jobs.
+
+4.3 Exceeding Time Minimization
+With the urgency, we determine the scheduling preference of coBranches. Intuitively, we should prefer to execute the coBranch with the highest level of the urgency. However, the most-urgent-coBranch-first method performs badly in practice. This is because the most urgent coBranch may be too long. If such a long and urgent coBranch is executed at first, less urgent coBranches are delayed and this may prolong the completion time. To solve the problem, we define the exceeding time as follows.
+
+Definition 4.3 (Exceeding time).
+Let a and b denote coBranches of the job J1 and J2, respectively. If we delay the coBranch b to execute the coBranch a, the scheduling order is {a→b}. The exceeding time of {a→b} is
+ET(a→b)={0,T(a)−U(b),  if T(a)≤U(b)  if T(a)>U(b),
+View Sourcewhere T(a) and U(b) denote the duration of the coBranch a and the urgency of the coBranch b, respectively.
+
+In Appendix A.1, which can be found on the Computer Society Digital Library at http://doi.ieeecomputersociety.org.ezproxy.auckland.ac.nz/10.1109/TC.2020.3039238, Lemma A.1 proves that the JCT is equal to the time of the critical path plus the exceeding time when resource is limited. We conclude that a bad scheduling decision incurs large exceeding time and increases the JCT. We are inspired to propose the coBranch scheduling method, which minimizes the average JCT by selecting the scheduling order that incurs the smallest exceeding time.
+
+4.4 coBranch Scheduling Method
+We overview the workflow of the coBranch scheduling method in Section 4.4.1. The BS method utilizes the urgency-based scheduling strategy to calculate the scheduling order of coBranches in Section 4.4.2.
+
+4.4.1 Overview
+Definition 4.4 (Pending coBranches).
+A pending coBranch must be unexecuted but can be immediately executed as long as the available resource is provided.
+
+Note that, a pending coBranch is not dependent on uncompleted coBranches, while a non-pending coBranch becomes pending if its dependent coBranches are completed. We note that non-pending coBranches cannot be executed until their dependent coBranches are completed. Thus, it is unnecessary to calculate the scheduling order of non-pending coBranches. On the contrary, we propose that only pending coBranches are taken as the input of the BS method. This feature effectively decreases the algorithm overhead of the BS method. Besides, the BS method is not run once for all. When new pending coBranches emerge, the BS method recalculates the scheduling preference. An important reason to do the recalculation is to update the time-varying urgency. The BS method is a dynamic scheduling method and thus, it is applicable in online scenarios.
+
+We propose the coBranch scheduling method and the distributed flow scheduling (DFS) method. The BS method calculates the scheduling priority of coBranches. Then, the DFS method schedules the data flows that are transmitted between worker nodes according to the scheduling priority of coBranches. Fig. 7 shows the workflow of the BS method. Jobs are submitted online and we identify the set of pending coBranches. We calculate the duration and urgency of pending coBranches. After packing and matching coBranches, the scheduling order of coBranches is determined. With the scheduling order, we prefer to schedule computation stages of higher-priority coBranches. The transmission of data flows is scheduled in a coordinative manner via the DFS method. Once coBranches are completed, the set of pending coBranches is updated and the BS method recalculates the scheduling preference.
+
+
+Fig. 7.
+The illustrative workflow of the BS process.
+
+Show All
+
+4.4.2 coBranch Scheduling Algorithm
+Algorithm 2 shows the main steps of the BS method. We take a set of pending coBranches and the amount of available resource as the input of the BS method. The core of the BS method is to incrementally generate a scheduling preference of pending coBranches via multiple packing and matching operations in the While loop of Algorithm 2. The BS method packs parallel pending coBranches to enhance the parallelism at first and then matches serial pending coBranches to minimize the exceeding time. We pack multiple pending coBranches into a coBranch combination if the total amount of resource (CPU cores and bandwidth) requested by the coBranch combination does not exceed the capacity of available resource. The following lemma is used to update the urgency and duration of a coBranch combination.
+
+Lemma 4.1.
+Let {a,b} denote a coBranch combination, which consists of two coBranches, a and b. Let T(a) and U(a) denote the duration and urgency of a. The urgency and duration of {a,b} is min{U(a),U(b)} and max{T(a),T(b)}, respectively.
+
+In Fig. 6a, only Job1 is submitted at the beginning and B1, B2 and B3 are pending coBranches. The amount of available resource is 2/3 and thus, at most 2 pending coBranches can be packed together. The packing operation generates three coBranch combinations {B1,B2}, {B2,B3} and {B1,B3} in Fig. 8. Their urgency and duration are calculated according to Lemma 4.1. The coBranch combinations, generated by the packing operation, are added to the set of schedulable objects, denoted by E. Then, Algorithm 2 does a matching operation to generate a scheduling order of pending coBranches.
+
+Fig. 8. - 
+The illustrative workflow of Algorithm 2 to schedule jobs in Fig. 6a. At the beginning, only Job1 is submitted. Since the amount of available resource is $2/3$2/3, the maximum number of coBranches that are packed in a coBranch combination is 2.
+Fig. 8.
+The illustrative workflow of Algorithm 2 to schedule jobs in Fig. 6a. At the beginning, only Job1 is submitted. Since the amount of available resource is 2/3, the maximum number of coBranches that are packed in a coBranch combination is 2.
+
+Show All
+
+Algorithm 2. coBranch Scheduling Method
+Require: A set of pending coBranches B, the amount of available resource RC and network bandwidth BC.
+
+Ensure: A scheduling preference P.
+
+Create a set of schedulable objects E, E=B.
+
+Pack schedulable objects to obtain coBranch combinations, BC.
+
+E=E∪BC.
+
+Create a scheduling preference P=Φ.
+
+while P is incomplete do
+
+Select the most urgent schedulable object e in E.
+
+Calculate T(e): the duration of e.
+
+for Each schedulable object o, o∈E,o≠e do
+
+Urgency(o,RC,BC). // Calculate the urgency of o
+
+Match e with o.
+
+Obtain a scheduling preference P.
+
+Record P.
+
+Select P with the shortest exceeding time.
+
+if P is complete then
+
+return P.
+
+else
+
+E=E∪P.
+
+Pack schedulable objects to obtain BC.
+
+E=E∪BC.
+
+Definition 4.5 (Matching operation).
+Let T and U denote the duration and urgency of coBranches, respectively. Given two coBranches a and b, the matching operation generates a scheduling order a→b if ET(a→b)<ET(b→a). Otherwise, b→a if ET(a→b)>ET(b→a). If ET(a→b)=ET(b→a), the matching operation prefers to schedule the most urgent coBranch, e.g., the scheduling order is b→a if U(b)<U(a).
+
+In Fig. 8, the matching operation generates multiple scheduling preferences. Algorithm 2 selects P with the shortest exceeding time. For example, the scheduling preference {B1→B2}, which has the shortest exceeding time, is picked.
+
+After a matching operation, Algorithm 2 determines whether to continue packing and matching operations repeatedly. If the scheduling preference P is complete, i.e., P includes all pending coBranches, Algorithm 2 terminates. Otherwise, P is treated as a schedulable object and added to E. In Fig. 8, the matching operation generates {B1→B2}. The scheduling preference is incomplete and Algorithm 2 adds {B1→B2} to the set of schedulable objects. Lemma 4.2 is proposed to calculate the urgency and the duration of {B1→B2} as follows.
+
+Lemma 4.2.
+Given two coBranches a and b, the duration of {a→b} is equal to T(a) plus T(b). The urgency of {a→b} is min{U(b)−T(a),U(a)}.
+
+Then, Algorithm 2 repeats the packing and matching operation to further generate a complete scheduling preference. For example, the BS method packs {B1→B2} and B3 together and generates a new scheduling order {B1→B2,B3}. The scheduling preference is complete and Algorithm 2 does not do more packing and matching operations. The scheduling preference of {B1→B2,B3} indicates that B1 and B3 are preferred to execute, and the execution of B2 follows that of B1 as shown in Fig. 6c.
+
+Note that, the scheduling preference {B1→B2,B3} is not valid anymore at 0.5 second because the resource marked with grey color becomes available in Fig. 6c. At 0.5 second, the set of pending coBranches changes and includes B2, B5 and B6. The BS method recalculates the scheduling preference. Since only 1/3 resource is available at 0.5 second, pending coBranches cannot be packed. After a matching operation, a scheduling preference B5→B2→B6 is generated. Thus, B5 is executed at 0.5 second.
+
+We estimate the complexity of Algorithm 2. Each time the While loop is executed, a new partial scheduling preference P is generated. When P includes all pending coBranches, the While loop terminates. In the worst case, all pending coBranches are added to P one by one and the maximum length of P is the number of pending coBranches. Thus, the complexity of the While loop is |B|. The complexity of the For loop is O(|E|), where |E| is the number of schedulable objects. Since schedulable objects in E consist of pending coBranches and coBranch combinations, we have |E|=|B|+|BC|. In the worst case, we have |BC|=(2|B|)=12(|B|2−|B|) if any two pending coBranches are packed. Thus, the complexity of the For loop is O(|B|2). Since Algorithm 2 includes the While loop nested with the For loop, the complexity of Algorithm 2 is O(|E||B|)≈O(|B|3). We further propose an online BS method to decrease the complexity in Section 4.7.
+
+4.5 Distributed Flow Scheduling
+We handle inter-coflow dependencies according to the priority of pending coBranches. Coflows of high-priority coBranches are prioritized. Furthermore, we design a distributed flow scheduling method to coordinate the transmission of data flows in coflows. As mentioned before, a coflow consists of a group of data flows that are transmitted concurrently. Each data flow of coflows is triggered by a data fetching request as follows. When a computation task starts to execute, it sends a data fetching request to a worker node, which stores input data. If the worker node handles the request, the worker node sends the input data to the task. This generates a data flow.
+
+Algorithm 3. Distributed Flow Scheduling Method
+require: The network timeout TOut, and the scheduling preference of coBranches P.
+
+Receive a request r.
+
+Set the waiting time, r.Wait=0.
+
+Identify the coBranch ID of the request, denoted by r.ID.
+
+Put r in the queue.
+
+for Each request r in the queue do
+
+if r.Wait>TOut then
+
+if Any communication thread is free then
+
+Reply r.
+
+Sort all requests with r.ID according to P.
+
+for Each sorted request r in the queue do
+
+if Any communication thread is free then
+
+Reply r.
+
+Since it incurs large complexity to schedule data flows via a central controller, we implement the DFS method on each worker node and schedule data flows in a distributed manner. Each modified worker node puts data fetching requests in a queue and sorts such requests by their priorities. Higher-priority requests in a queue are handled at first. Once a data fetching request is handled, a corresponding data flow is sent. Note that, the priority of a data fetching request is determined by the scheduling preference of the coBranch, which the data flow belongs to.
+
+Algorithm 3 shows the main steps of the DFS method. A worker node manages data fetching requests in the queue. Each time a data fetching request is handled, and the worker node consumes a communication thread to send a data flow. Besides, we set the network timeout, denoted by TOut. If a data fetching request waits for over the time TOut, the DFS method handles the request at first.
+
+4.6 Performance Analysis
+We analyze the performance bound of the heuristic BS method in Section 4.6.1 and discuss the performance improvement of the DFS method in Section 4.6.2.
+
+4.6.1 Approximation Ratio of the BS Method
+We explore the performance bound of the BS method as follows. Given any job set to be scheduled by the BS method, we estimate the upper bound of the JCT, denoted by T(J). Then, we estimate the lower bound of the JCT for the optimal scheduling method, denoted by T∗(J). Furthermore, we prove that the BS method is u-competitive via an inequality T(J)≤u⋅T∗(J), which should hold for any job set.
+
+Theorem 4.1.
+Given that a job set J obtains N jobs, the number of coBranches in the ith job is Mi. Let γ denote the total number of coBranches contained by all jobs, i.e., γ=∑Ni=1Mi. Let RC denote the maximum amount of available resource. Let β denote the total resource requested by all jobs. The approximation ratio of the BS method is
+u≥2(γ+1)RCN(N+1)β.(14)
+View Source
+
+For readability, we do not prove the theorem in this section. Detailed analysis and proofs can be found in Appendix A, available in the online supplemental material.
+
+Extension Results. Next, we discuss the approximation ratio of the BS method for a specific workload. The number of jobs N is 10, and the number of all coBranches γ is 250. Assume that the capacity of available resource is 3× smaller than the sum of resource requested by all jobs. We have RCβ≈1/3. The performance bound u is around 1.52. To sum up, the approximation ratio of the BS method changes with the characteristic of workloads (i.e., the number of jobs and the coBranch profiling) and the amount of cluster resource.
+
+4.6.2 Performance Improvement of the DFS Method
+We discuss the performance improvement of the DFS method from a machine-level aspect. Let PJ denote the priority of jobs. Let PC,Mj denote the scheduling order of coflows on Mj. Take Fig. 3 as an example. The priority of jobs PJ is {1:J2,2:J1}. Moreover, the priority of coflows PC,M2 is {1:CdJ2M2,2:CdJ1M2}. Let CdJ2M2 denote a coflow of Job2 on the machine M2. It has the two data flows, f2,1,12,2,3 and f2,1,22,2,3. Similarly, CdJ1M2 denotes a coflow of Job1 on the machine M2. It has the three data flows, f1,3,21,4,1, f1,2,21,4,1 and f1,2,11,4,1. Both PJ and PC,M2 prioritize J2. Thus, M2 does not suffer from the scheduling disagreement.
+
+On the contrary, a machine Mj suffers from the scheduling disagreement when PC,Mj and PJ prioritize different jobs. Take Fig. 4 as an example. Let CdJ1M3 denote a coflow of Job1 on the machine M3. It has the data flow f1,1,21,2,1. Similarly, CdJ2M3 denotes a coflow of Job2 on the machine M3. It has the two data flows, f2,1,12,2,2 and f2,1,22,2,2. The priority of coflows PC,M3 is {1:CdJ1M3,2:CdJ2M3}. Since PC,M3 prioritizes Job1 that is inconsistent with PJ, the machine M3 suffers from the scheduling disagreement.
+
+The performance improvement of the DFS method is equal to the completion time of coflows, which have inconsistent priorities with CdJiMj. In Fig. 4, although the data flow f1,1,21,2,1 has a small completion time (i.e., 27s), the DFS method does not transmit it on M3. Thus, the DFS method decreases the JCT of Job2 by 27s. The performance improvement is equal to the completion time of f1,1,21,2,1.
+
+To sum up, the performance improvement of the DFS method is not deterministic and changes with the completion time of coflows. Thus, it is hard to make a closed conclusion on the performance bound of the DFS method. Nevertheless, we note that PC,Mj and PJ prioritize different jobs more possibly when more jobs are concurrently executed. Thus, the scheduling disagreement is likely to happen on the machine Mj. This provides a nice opportunity for the DFS method that is promising to avoid the scheduling disagreement especially when the number of jobs increases.
+
+4.7 Online BS Method
+In online cases, a non-pending coBranch becomes pending after its dependent coBranches are completed. Once the set of pending coBranches changes, the BS method recalculates the scheduling preference of pending coBranches. However, the repeated execution of Algorithm 2 is time-consuming and unnecessary. We find that the recalculation of the BS method changes the scheduling preference little after a new pending coBranch emerges. Motivated by the fact, we design an online BS method, aiming to decrease the computation overhead by adding the new pending coBranch to an existing scheduling preference. In Sections 6.2 and 6.3, experiments show that the online modification of a scheduling order impacts the performance little and decreases the algorithm overhead.
+
+Algorithm 4 shows the main steps of the online BS method. The online BS method adds a new pending coBranch, denoted by Bnew, into an existing scheduling preference P. Assume that the existing scheduling preference is P={O1→…→On}, where Oi denotes the ith schedulable object. The online BS method employs packing, inserting and replacing operations, respectively. (1) For any schedulable object Oi in P, we pack Bnew with Oi if the sum of resource requested by Bnew and Oi is smaller than the maximum value of remaining available resource. Then we calculate the value of ET-P, denoting the exceeding time of the new scheduling preference. (2) For any schedulable object Oi, we try to insert B_{new} between O_{i} and O_{i+1} and, record the exceeding time, denoted by ET-I. (3) If O_i is a coBranch combination, we try to replace inner coBranches of \lbrace O_i| i=1,\ldots,n\rbrace with B_{new}. Let B_{taken} denote the coBranches that are replaced by B_{new}. Theorem 4.2 imposes some constraints on B_{taken} to decrease the exceeding time after B_{taken} is replaced with B_{new}.
+
+Theorem 4.2.
+We divide coBranches of O_i into two groups, B_{taken} and B_{untaken}. Let B_{untaken} denote remaining coBranches that are not replaced. If T(B_{taken}) \leq T(B_{new}) and U(B_{taken}) \leq U(B_{new}), then the exceeding time of the new scheduling object \lbrace B_{new},B_{untaken}\rbrace is not larger than that of O_i.
+
+Algorithm 4. Online BS Method
+Require: A new coBranch B_{new} with the time T(B_{new}) and the urgency U(B_{new}), a scheduling preference P=\lbrace O_1\rightarrow \ldots \rightarrow O_n\rbrace and the amount of available resource R_{remain}.
+
+ET-P =ET-I =ET-R = \emptyset
+
+for Each schedulable object O_i in P do
+
+if R(B_{new}) + R(O_i) \leq R_{remain} then
+
+Pack B_{new} with O_i
+
+Calculate ET-P
+
+Insert B_{new} between O_i and O_{i+1}
+
+Calculate ET-I
+
+Select the replaced coBranch, B_{taken}
+
+if R(B_{taken})\geq R(B_{new}) then
+
+if T(B_{taken})\leq T(B_{new}) then
+
+if U(B_{taken}) \leq U(B_{new}) then
+
+Replace B_{taken} with B_{new}
+
+for Each schedulable object O_i in P do
+
+Insert B_{taken} between O_i and O_{i+1}
+
+Calculate ET-R
+
+if ET-P = \min \lbrace ET-P,\ ET-I,\ ET-R\rbrace then
+
+Pack B_{new} into O_{i}
+
+else if ET-I = \min \lbrace ET-P,\ ET-I,\ ET-R\rbrace then
+
+Insert B_{new} after O_i
+
+else
+
+Replace B_{taken} with B_{new}
+
+After replacing B_{taken} with B_{new}, B_{taken} is inserted back into P. The inserting operation causes the extra exceeding time, which is counted as part of the exceeding time incurred by the replacing operation, denoted by ET-R. We compare the exceeding time caused by all packing, inserting and replacing operations (i.e., ET-P, ET-I and ET-R) and select the scheduling preference with the least exceeding time.
+
+In Algorithm 4, the complexity of the For loop is O(|P|), where |P| is the length of the current scheduling preference P. Since Algorithm 4 includes another nested For loop, the complexity of Algorithm 4 is O(|P|^2). In the worst case, the length |P| is equal to the number of pending coBranches |B| when coBranches are scheduled one by one. Hence, the complexity of the online BS method is O(|B|^2). For a job, the number of pending coBranches is approximately equal to the width of the DAG. Thus, |B| is small and the online BS method does not incur large algorithm overheads.
+
+SECTION 5Implementation
+We implement a prototype of the BS method by extending a few modules of Spark [36]. Compared with other data-parallel computing systems, Spark is capable of rapid iterative computing [37]. Our implementation is shown in Fig. 9.
+
+
+Fig. 9.
+An illustrative implementation based on a Spark cluster.
+
+Show All
+
+In the Spark cluster, the master node is a centralized controller, which receives the job submission from multiple drivers and allocates computation resource (i.e., CPU cores), which is provided by multiple worker nodes. Users submit jobs to the master through a driver. The driver generates a DAG for a data-parallel job and supervises the execution of the job. Before the job starts to execute, the driver interacts with the master node in the Spark cluster for the job submission and resource allocation. The driver is provided with a group of worker nodes. Each worker is a physical server and contains multiple Java virtual machines, called executors, which obtain CPU cores and memory.
+
+We add new modules to the driver as shown in Fig. 9. When a data-parallel job is submitted, the driver analyzes the DAG. In the beginning, we cannot schedule them straightforward because the duration is unknown in advance. For a data-parallel job, the driver determines the iterative stage by analyzing the DAG. When computation tasks of iterative stages are completed, the task completion time is sent to the driver through specific APIs. With the task completion time, the driver estimates the coBranch duration as mentioned in Section 3.4. With the coBranch duration, the evaluation module calculates the coBranch urgency. The driver sends the urgency and coBranch duration to the master.
+
+We implement the BS algorithm on the master node. When multiple jobs are executed concurrently, each job is managed by a driver. As a centralized controller, the master interacts with multiple drivers and calculates a scheduling preference of coBranches using the BS algorithm. With the coBranch scheduling order, computation stages that belong to higher-priority coBranches are executed at first. In practice, the master allocates executors as available resource to preferred coBranches.
+
+The schedule of coBranches includes not only successive computation stages but also parallel data flows. The DFS method is implemented on the ExternalShuffleServer to schedule coflows of different coBranches. The ExternalShuffleServer is a virtual server running on the worker node. The ExternalShuffleServer aims to manage data-fetching requests. For Spark jobs, once the worker receives multiple data-fetching requests, these requests are stored in a queue of the ExternalShuffleServer and handled according to the first-come-first-serve rule. The modified ExternalShuffleServer supports the priority of data-fetching requests, which is consistent with the scheduling priority of coBranches. Once coBranches are completed, the BS method recalculates the urgency of uncompleted coBranches. Since the uncompleted coBranches become more urgent, the priority of corresponding data-fetching requests increases. Thus, the scheduling opportunities are not always preempted and the DFS method does not starve low-priority requests.
+
+SECTION 6Performance Evaluation
+We conduct extensive experiments to evaluate the performance of the BS method in a real Spark cluster. The first-in-first-out (FIFO) method is adopted as baselines. The shortest-job-first method aims to schedule a job, which has a shorter JCT, with higher priorities. We adopt the SJF method as the baseline in experiments. Note that, the SJF method is an inter-job scheduler. Besides, recent coflow scheduling methods [6], [11] adopts the variant of the critical-path to handle inter-coflow dependencies. Thus, we implement the SJF method together with the CP method. The shortest-job-first critical-path (SJFCP) method prefers to schedule the job with the least JCT and executes the critical path of the shortest job at first.
+
+We measure the average JCT of mixed multiple jobs using an artificial workload and evaluate the performance improvement of the BS method when the scale of the workload increases. Besides, we also compare the BS method with the online BS method in terms of the algorithm overhead. Results show that the online BS method effectively decreases the algorithm overhead.
+
+Considering that our artificial workload is not similar to the real-world scenarios, we also evaluate the performance of the BS method in a large-scale production environment, which is simulated based on the Google trace [38].
+
+6.1 Experiment Evaluation on the Performance
+Experiment Settings. We evaluate the BS method in a Spark cluster, which consists of 30 servers placed in 6 racks. Each server is equipped with an Intel Xeon E5-2650 2.2 GHz 12-core processor. We evaluate the JCT reduction of the BS method over the SJFCP and the FIFO methods. The workload is a mixture of three typical Spark jobs, PageRank, logistic regression and KMeans to guarantee the diversity of coBranch durations. The number of jobs in a workload ranges from 10 to 50. The input of jobs ranges from 10 GB to 50 GB.
+
+6.1.1 Experiment Evaluation on the JCT Improvement
+We evaluate the average JCT improvement factor of DAG jobs when the number of jobs in one batch increases from 10 to 50. Fig. 10 plots the 10–15 percent improvement in the average JCT of the BS over the FIFO method. When the number of jobs is 40 and 50, the JCT improvement factor of the BS method over the SJFCP method is around 10 percent.
+
+
+Fig. 10.
+[Cluster] The average JCT reduction of the BS method over the FIFO and the SJFCP methods, respectively.
+
+Show All
+
+Although the average JCT increases with the number of jobs, the BS method is advantageous to schedule coBranches for larger-scale workloads. We infer that a large number of jobs provide more opportunities to delay less urgent coBranches and to prioritize more urgent coBranches of other synchronization processes. The BS method performs better when the number of jobs increases. In summary, although the tested workload is artificial, the urgency-based BS method achieves the performance improvement.
+
+6.1.2 Details
+To understand more details, we observe the process that three methods schedule 30 jobs of the workload. Fig. 11a shows the distribution of coBranch durations in the workload. In the artificial workload, the majority of the coBranches are short.
+
+
+Fig. 11.
+[Cluster] A comparison of the BS method, the FIFO and the shortest-job-first critical-path (SJFCP) methods. The artificial workload consists of 30 jobs, which mixes PageRank, KMeans and logistic regression. The 30 jobs are submitted in a batch.
+
+Show All
+
+We measure the number of completed jobs when the time increases. Fig. 11b shows that the number of cumulative completed jobs increases over time. The performance of three compared methods is very close in the first 500 seconds. Then, the execution of jobs scheduled by the FIFO method gradually slows down. Compared with the FIFO and SJFCP methods, the BS method achieves the shorter average JCT.
+
+Furthermore, we calculate the JCT improvement factor of each job as shown in Fig. 11c. Given a job of the workload, its JCT is denoted by JCT_{FIFO} when all jobs of the workload are scheduled by the FIFO method. Similarly, JCT_{BS} denotes the JCT of the job when all jobs of the workload are scheduled by the BS method. The JCT improvement factor of the BS method over the FIFO method is calculated as follows, \begin{align*} IF = \frac{JCT_{FIFO}-JCT_{BS}}{JCT_{FIFO}}. \tag{15} \end{align*}
+View SourceRight-click on figure for MathML and additional features.Note that, the JCT improvement factor of all jobs of the workload is different. Fig. 11c shows that the JCT improvement factor of the BS method over the FIFO method increases from 0 to 50 percent. For most of the jobs, the JCT improvement is around 20 percent. Similarly, we also calculate the JCT improvement factor of the BS method over the SJFCP method, ranging from -20 to 40 percent. We notice that the JCT improvement factor of individual jobs is negative. The proportion of these jobs is around 20 percent. For these jobs, JCT_{SJFCP} is smaller than JCT_{BS}. Nevertheless, the BS method achieves shorter JCTs of the majority jobs (around 80 percent) than the SJFCP method. The average JCT improvement of the BS over the SJFCP and the FIFO method is 9.82 and 14.09 percent, respectively. To sum up, the BS method is still advantageous in the artificial workload.
+
+6.2 Experiment Evaluation on System Overheads
+Given a batch of jobs, the BS method runs multiple times. Each time the BS method is used and we measure the algorithm overhead incurred by the BS method. We evaluate the sum of algorithm overheads in Fig. 12a. We demonstrate that the online BS method effectively decreases the sum of algorithm overheads in comparison to the BS method. When the number of jobs increases from 10 to 50, the sum of algorithm overheads nonlinearly increases with the number of jobs. Nevertheless, the algorithm overhead is acceptable in comparison to the JCT, which is up to thousands of seconds. It is noticeable that the total overhead incurred by the online BS method is close to half of that by the BS method. This indicates that new pending coBranches dramatically increases when the BS method is repeatedly executed and the online BS method effectively decreases algorithm overheads.
+
+
+Fig. 12.
+[Cluster] The algorithm overhead changes when the number of jobs increases.
+
+Show All
+
+Besides, we also evaluate the average algorithm overhead. Fig. 12b shows the average algorithm overhead for the different numbers of jobs. When the number of jobs increases, the average algorithm overhead incurred by the BS method varies from 100 ms to 200 ms. Although the overhead is small, the recalculation caused by the BS method incurs considerable overhead. The online BS method incurs a smaller average algorithm overhead, which is under 100 ms. The small average overhead does not almost delay the execution of jobs when new pending coBranches are scheduled. To sum up, the online BS method effectively decreases the average algorithm overhead when new pending coBranches emerge.
+
+6.3 Experiment Evaluation on the Online Performance
+In the above experiments, we submit multiple jobs in one batch. To evaluate the online BS method, we continuously submit 30 jobs. We set the interval time of job arrivals as the Poisson distribution. The average interval time is 25s.
+
+In online cases, submitted jobs might wait for cluster resource. Since 30 jobs are submitted faster than the completion of jobs, more and more jobs are backlogged when the time increases. In the beginning, available resource is allocated to early-submitted jobs, which suffer from small waiting time. Nevertheless, late-submitted jobs would be backlogged and suffer from long waiting time. Fig. 13 shows the completion of 30 jobs over time. For all tested methods, the completion time of the latest job becomes longer in the online cases than that in the offline cases. Compared with the FIFO and SJFCP methods, the online BS method achieves smaller JCTs. We note that the advantage of the online BS method is not evident for the first 10 jobs. When the number of completed jobs increases, the advantage of the online BS method becomes evident.
+
+
+Fig. 13.
+[Cluster] In online cases, 30 jobs are submitted continuously. The average interval time of job arrivals is 25 seconds.
+
+Show All
+
+6.4 Evaluation on the Prediction Accuracy
+To evaluate the prediction accuracy, we execute the workload in the Spark cluster. Then, we measure the predicted and real branch durations, and calculate the prediction errors as follows. \begin{align*} err = \frac{|T_{pred}-T_{meas}|}{T_{meas}}, \tag{16} \end{align*}
+View Sourcewhere T_{pred} and T_{meas} denote the predicted and measured branch durations, respectively. The average prediction error of our branch prediction model is shown in Fig. 14. The experiment result report that most of the branch prediction is accurate. The prediction error grows at the beginning. After the 6000th round, the prediction error keeps stable at 25 percent. The prediction becomes more accurate when the prediction round increases. We infer that the repeated execution of iterative jobs enhances the prediction accuracy.
+
+
+Fig. 14.
+[Cluster] When jobs in our workload are executed, we continuously predict branch durations. The prediction error is measured when the prediction round increases. The prediction error changes with the prediction round.
+
+Show All
+
+6.5 Simulation on Google Cluster Data
+The performance of the BS method is significantly impacted by the characteristic of workloads. Considering that our artificial workload is not similar to the real-world scenarios, we also evaluate the performance of the BS method in a simulated production environment by replaying the Google trace. The large-scale simulations show that the BS method performs better in the trace-based workload and achieves 22.59 and 35.12 percent improvement in terms of the average JCT.
+
+6.5.1 Analysis
+The benefit of the BS method lies in that we delay less urgent coBranches of some synchronization processes to schedule more urgent coBranches of other synchronization processes. Thus, the potential benefit of the BS method changes with the characteristic of the workload. We infer that it is beneficial to schedule a synchronization process with a large difference between the execution time of the longest coBranch and that of the shortest coBranch. For a data-parallel job, we calculate such a difference and call it the time gap. For a workload, we utilize the distribution of the time gap as the characteristic of the workload.
+
+We analyze data-parallel jobs and estimate the distribution of the time gap in the Google trace [38]. Fig. 15a shows the distribution of jobs with different time gaps. We see that the longest time gap among all jobs is up to around 1 hour. In the production environment, the majority of real JCTs range from 25 seconds to 10 minutes 25 seconds as shown in Fig. 15b. We see that the majority of short JCTs are usually smaller than time gaps. This provides a nice opportunity for the BS method, which delays jobs with a large time gap and prioritizes to schedule jobs with short JCTs. If the delay time does not exceed the time gap, the delayed jobs would not be prolonged. We infer that, owing to various time gaps, the BS method may be more beneficial in the simulated production environment than in our artificial workload.
+
+
+Fig. 15.
+Observations based on over the Google trace.
+
+Show All
+
+6.5.2 Simulations
+We evaluate the BS algorithm by simulating the execution of 5000 DAG jobs from Google cluster data [38] that are widely accepted as a data-parallel benchmark [39], [40], [41]. All simulations are conducted on a computer equipped with an Intel(R) Core(TM) i7-4700MQ CPU 2.40 GHz and 32 GB RAM.
+
+Workload. Google cluster data provides detailed task duration, resource requirements and machine constraints. In our simulations, we extracted 5,000 jobs as well as task information. Note that, the real task durations in the Google trace is around 5 minutes. It is very slow to simulate the execution of 5,000 jobs. Thus, we set the simulated program to run 60 times faster than the trace. Note that, Google trace does not provide any network transmission. Thus, the coBranch duration is approximated by the task computation time without considering the coflow transmission time. Although we do not coordinate the coflow transmission with task scheduling, the BS method is still applicable in the simulation owing to the benefit of the urgency-based BS strategy.
+
+Simulation on the Average JCT. We evaluate the performance of three methods via the trace replay. 5,000 jobs are submitted within 600s and assigned to 500 machines. First, we measure the JCTs of 5,000 completed jobs and show the boxplot in Fig. 16a. The maximum JCT, the minimum JCT, and the median JCT are shown in a boxplot. The target symbol inside a boxplot denotes the median value of JCTs. We note that the BS method achieves a smaller median value of JCTs than the FIFO method as well as the SJFCP method. The BS method completes 5,000 jobs faster than the SJFCP and FIFO methods.
+
+
+Fig. 16.
+[Simulation] The JCT of 5000 simulated jobs in Google trace. The JCT improvement of the BS over the SJFCP and the FIFO method is 22.59 and 35.12 percent, respectively.
+
+Show All
+
+We further evaluate the detailed JCT reduction of the 5,000 jobs. Fig. 16b shows the JCT improvement factor of the BS method over the SJFCP and FIFO methods. The JCT improvement of 5,000 jobs ranges from around -10 percent to near 50 percent. The largest JCT improvement is 50 percent, indicating that the BS method decreases the JCT of those jobs by half. The JCT improvement of under 3 percent jobs is negative. We infer that the SJFCP method completes around 150 jobs faster than the BS method.
+
+To sum up, the average JCT improvement factor of the BS method over the SJFCP and the FIFO method is 22.59 and 35.12 percent, respectively. As analyzed in Section 6.5.1, such various synchronization processes with large time gaps stimulate the more potential of the BS method in the simulated production environment than in our artificial workload.
+
+Impactor of the Number of Machines. The resource capacity is one important factor that influences the resource contention. We increase the number of simulated machines from 500 to 1,000. Fig. 17 shows the average JCT of 5000 jobs. The average JCT decreases with increasing machines. The BS method achieves the shortest average JCT. We infer that fewer machines enhance the performance of the BS method.
+
+
+Fig. 17.
+[Simulation] The JCT of the BS, the SJFCP, and the FIFO method.
+
+Show All
+
+Impactor of the Number of Jobs. Fig. 18 shows the average JCT increases when the number of jobs increases from 4,000 to 6,000. The BS method performs better than other methods. When more jobs are scheduled together, the BS method is more beneficial. Thus, the JCT reduction of the BS method over other methods rises up with the increasing number of jobs.
+
+
+Fig. 18.
+[Simulation] The JCT and coflow completion time (CCT).
+
+Show All
+
+Impactor of the Interval Time of Job Arrivals. When jobs are submitted at different rates, the performance of schedulers is different because jobs are backlogged. We submit the same batch of jobs but the time span that all jobs are submitted is different. Fig. 19 shows that the average JCT increases when the span of job submission time increases. The average JCT of the BS method is the shortest when the span of job submission time increases from 300 seconds to 1500 seconds. Nevertheless, the performance of the BS method is more evident when jobs are submitted with a shorter interval.
+
+6.6 Simulation on Facebook Coflow Data
+To evaluate the coflow completion time, we performed the simulation based on FaceBook trace [42]. We compare the distributed flow scheduling method with the smallest-effective-bottleneck-first method. The coflow information in Facebook logs is incomplete. For each coflow, the Facebook logs contain its sender machines, receiver machines, and transmitted bytes. The Facebook trace does not contain the job information and we set the DAG dependency as follows. In our simulation, each job includes a batch of parallel stages. That is, we set the tree-like dependency. To evaluate the performance of our scheduling method on the scheduling of data flows, we set the execution time of all stages to 1.
+
+Fig. 20a is a scatterplot and shows the coflow completion time (CCT) of each coflow. In the trace, the majority of data flows are short. Results show that our method does not achieve the reduction of communication. The SEBF method achieves lower CCTs than the DFS method. The SEBF method calculates the minimum coflow completion time (MCCT) of all coflows and always prefers to schedule coflows that have smaller MCCTs. Thus, the SEBF method achieves the smaller average CCT. Compared with our method, the SEBF method decreases the average CCT by 15.16 percent.
+
+Nevertheless, the DFS method aims to decrease the average job completion time by scheduling data flows in a coordinative manner. Compared with the SEBF method, the DFS method decreases the average JCT by 27.33 percent. We infer that the DFS method may accelerate some coflows to decrease the JCT although these coflows have large MCCTs.
+
+SECTION 7Conclusion
+In this paper, we proposed the coBranch abstraction to coordinate the transmission of coflows and computation stages. Further, we designed the urgency-based BS method to solve the coordinative scheduling problem and theoretically proved the performance bound of the BS method in a special case. Besides, we expanded the BS method in online cases to decrease the algorithm overhead, implemented it on Apache Spark, and conducted prototype-based experiments. Results showed that the JCT reduction of our method over the SJFCP and FIFO methods was around 10 and 15 percent, respectively. Besides, we conducted large-scale trace-based simulations and demonstrated that the performance of the BS method was more outstanding in the simulated production environment.

@@ -1,0 +1,1042 @@
+Abstract—Production storage systems complement device-level
+ECC (which covers media errors) with system-checksums and
+cross-device parity. This system-level redundancy enables systems
+to detect and recover from data corruption due to device
+firmware bugs (e.g., reading data from the wrong physical
+location). Direct access to NVM penalizes software-only implementations of system-level redundancy, forcing a choice between
+lack of data protection or significant performance penalties.
+We propose to offload the update and verification of systemlevel redundancy to TVARAK, a new hardware controller colocated with the last-level cache. TVARAK enables efficient
+protection of data from such bugs in memory controller and
+NVM DIMM firmware. Simulation-based evaluation with seven
+data-intensive applications shows that TVARAK is efficient. For
+example, TVARAK reduces Redis set-only performance by only
+3%, compared to 50% reduction for a state-of-the-art softwareonly approach.
+Index Terms—Non-volatile memory, Direct access, Redundancy
+I. INTRODUCTION
+Non-volatile memory (NVM) storage improves the performance of stateful applications by offering DRAM-like performance with disk-like durability [6, 7, 15, 18, 73]. Applications
+that seek to leverage raw NVM performance eschew conventional file system and block interfaces in favor of direct access
+(DAX) to NVM. With DAX, an application maps NVM data
+into its address space and uses load and store instructions to
+access it, eliminating system software overheads from the data
+path [14, 18, 39, 68, 69].
+The need for system-level redundancy: Production storage
+systems protect data from various failures. In addition to failstop failures like machine or device crashes, storage systems
+also need to protect data from silent corruption due to firmware
+bugs. Storage device firmware is prone to bugs because of
+its complexity, and these bugs can cause data corruption.
+Such corruption-inducing firmware bugs fall into two broad
+categories: lost write bugs and misdirected read or write
+bugs [9, 10, 30, 52, 64]. Lost write bugs cause the firmware
+to acknowledge a write without ever updating the data on
+the device media. Misdirected read or write bugs cause the
+firmware to read or write the data from the wrong location on
+the device media. Firmware-bug-induced corruption will go
+unnoticed even in the presence of device-level ECC, because
+that ECC is read/written as an atom with its data during each
+media access performed by the firmware.
+Protection against firmware-bug-induced corruption commonly relies on system-checksums for detection and crossdevice parity for recovery. System-checksums are data checksums that the storage system computes and verifies at a layer
+“above” the device firmware (e.g., the file system), using
+separate I/O requests than for the corresponding data [9,52,74].
+Using separate I/O requests for the data and the block containing its system-checksum (together with system-checksums for
+other data) reduces the likelihood of an undetected firmwarebug-induced corruption. This is because a bug is unlikely to
+affect both in a consistent manner. Thus, the storage system
+can detect a firmware-bug-induced corruption because of a
+mismatch between the two. It can then trigger recovery using
+the cross-device parity [34, 42, 46, 84]. In this paper, we use
+the term redundancy to refer to the combination of systemchecksums and cross-device parity.
+Production NVM-based storage systems will need such
+redundancy mechanisms for the same reasons as conventional
+storage. In the real world, firmware bugs happen—rare corner
+conditions in the firmware cause data loss—and production
+storage systems have low tolerance even for rare data losses
+because of the enduring nature of storage data (unlike data
+in memory or caches). NVM device firmware involves increasingly complex functionality, akin to that of other storage
+devices, making it susceptible to both lost write and misdirected read/write bugs. However, most existing NVM storage
+system designs provide insufficient protection. Although faulttolerant NVM file systems [50, 74] efficiently cover data
+accessed through the file system interfaces, they do not cover
+DAX-mapped data. The Pangolin [79] library is an exception,
+implementing system-checksums and parity for applications
+that use its transactional library interface. However, softwareonly approaches for DAX NVM redundancy incur significant
+performance overhead (e.g., 50% slowdown for a Redis setonly workload, even with Pangolin’s streamlined design).
+Our Solution: This paper proposes TVARAK1, a softwaremanaged hardware offload that efficiently maintains redundancy for DAX NVM data. TVARAK resides with the last level
+cache (LLC) controllers and coordinates with the file system to
+provide DAX data coverage without application involvement.
+The file system informs TVARAK when it DAX-maps a file.
+TVARAK updates the redundancy for each DAX NVM cache1TVARAK means accelerator in Hindi.
+624
+2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA)
+978-1-7281-4661-4/20/$31.00 ©2020 IEEE
+DOI 10.1109/ISCA45697.2020.00058
+line writeback and verifies each DAX NVM cache-line read.
+TVARAK’s design relies on two key elements to achieve
+efficient redundancy updates and verification. First, TVARAK
+reconciles the mismatch between DAX granularities (typically
+64-byte cache lines) and typical 4KB system-checksum block
+sizes by introducing cache-line granular system-checksums
+(only) while data is DAX-mapped. TVARAK accesses these
+cache-line granular system-checksums, which are themselves
+packed into cache-line-sized units, via separate NVM accesses.
+Maintaining these checksums only for DAX-mapped data
+limits the resulting space overhead. Second, TVARAK uses
+caching to reduce the number of extra NVM accesses for redundancy information. Applications’ data access locality leads
+to reuse of system-checksum and parity cache lines; TVARAK
+leverages this reuse with a small dedicated on-controller cache
+and configurable LLC partitions for redundancy information.
+Simulation-based evaluation with seven applications, each
+with multiple workloads, demonstrates TVARAK’s efficient
+DAX NVM storage redundancy. For Redis, TVARAK incurs
+only a 3% slowdown for maintaining redundancy with a setonly workload, in contrast to 50% slowdown with Pangolin’s
+efficient software approach, without compromising on coverage or checks. For other applications and workloads, the
+results consistently show that TVARAK efficiently updates and
+verifies system-checksums and parity, especially in comparison to software-only alternatives. The efficiency benefits are
+seen in both application runtimes and energy.
+This paper makes three primary contributions. First, it motivates the need for architectural support for DAX NVM storage redundancy, highlighting the limitations of software-only
+approaches. Second, it proposes TVARAK, a low-overhead,
+software-managed hardware offload for DAX NVM storage
+redundancy. It describes the challenges for efficient hardware
+DAX NVM redundancy and how TVARAK overcomes these
+challenges with straightforward, effective design. Third, it
+reports on extensive evaluation of TVARAK’s runtime, energy,
+and memory access overheads for seven applications, each
+under multiple workloads, showing its efficiency especially
+in comparison to software-only alternatives.
+II. REDUNDANCY MECHANISMS AND NVM STORAGE
+This section provides background and discusses related
+work. First, it describes conventional storage redundancy
+mechanisms for firmware bug resilience. Second, it discusses
+the need for these mechanisms in NVM storage systems,
+the direct-access (DAX) interface to NVM storage, and the
+challenges in maintaining the required redundancy with DAX.
+Third, it discusses related work and where TVARAK fits.
+A. Redundancy for Firmware Bug Resilience
+Production storage systems employ a variety of redundancy
+mechanisms to address a variety of faults [21,28,34,36,44,46,
+47, 74, 80, 82]. In this work, we focus on redundancy mechanisms used to detect and recover from firmware-bug-induced
+data corruption (specifically, per-page system-checksums and
+cross-device parity).
+)LUPZDUH
+0HGLD
+ZULWH
+DFN DFN
+ZULWH
+UHDG
+7LPH ,QLWLDO'HYLFH
+6WDWH
+%XJ)UHH:ULWH /RVW:ULWH 5HDGUHWXUQV
+2OG'DWD
+(a) The problem: device responds to read of block that experienced the lost
+write with incorrect (old) data.
+)LUPZDUH
+0HGLD
+7LPH ,QLWLDO'HYLFH
+6WDWH
+%XJ)UHH:ULWHZ
+6\VWHP&KHFNVXP
+/RVW:ULWHZ
+6\VWHP&KHFNVXP
+6\VWHP&KHFNVXP
+0LVPDWFKRQ5HDG
+ZULWH
+DFN
+ZULWH
+FVXP
+DFN
+ZULWH
+DFN DFN UHDG
+ZULWH
+FVXP UHDG
+FVXP
+(b) The fix: having the higher-level system update and verify systemchecksums when writing or reading data, in separate requests to the device,
+will detect a lost write because of mismatch between the data and the systemchecksum.
+Fig. 1. Lost write bug example. Both sub-figures show a time-line for a storage
+device with three media locations. The device is shown in an initial state, and
+then upon completion of higher-level system’s write or read to data (first, a
+successful write, then a ”lost write”, then a read) mapped to the same media
+location. (a) shows how the higher-level system can consume incorrect (old)
+data if it trusts the device to never lose an acknowledged write. (b) shows
+how the higher-level system can detect a lost write with system-checksums.
+Firmware-bug-induced data corruption: Large-scale
+studies of deployed storage systems show that device firmware
+bugs sometimes lead to data loss or corruption [9,10,30,52,64].
+Device firmware, like any software, is prone to bugs because of
+its complex responsibilities (e.g., address translation, dynamic
+re-mapping, wear leveling, block caching, request scheduling)
+that have increased both in number and complexity over
+time. Research has even proposed embedding the entire file
+system functionality [31] and application-specific functionalities [2, 12, 58, 59, 70] in device firmware. Increasing firmware
+complexity increases the propensity for bugs, some of which
+can trigger data loss or corruption.
+Corruption-inducing firmware-bugs can be categorized into
+two broad categories: lost write bugs and misdirected
+read/write bugs. A lost write bug causes the firmware to
+acknowledge a write without ever updating the media with
+the write request’s content. An example scenario that can lead
+to a lost write is if a writeback firmware cache ”forgets” that
+a cached block is dirty. Fig. 1(a) illustrates a lost write bug. It
+first shows (second stage in the time-line) a correct bug-free
+write to the block stored in the blue media location. It then
+shows a second write to the same block, but this one suffers
+from a lost write bug—the firmware acknowledges the write
+but never updates the blue media location. The subsequent
+read of the blue block returns the old data to the application.
+A misdirected write or misdirected read bug causes the
+firmware to store data at or read data from an incorrect media
+location, respectively. Fig. 2(a) illustrates a misdirected write
+bug. As before, the first write to the block stored in the
+blue location is performed correctly by the firmware. For this
+625                                     
+)LUPZDUH
+0HGLD
+ZULWH
+DFN DFN
+ZULWH
+UHDG
+7LPH ,QLWLDO'HYLFH
+6WDWH
+%XJ)UHH:ULWH 0LVGLUHFWHG:ULWH 5HDGUHWXUQV
+&RUUXSWHG'DWD
+(a) The problem: device responds to read with the incorrectly updated data
+from the blue location. Notice that the green location also has incorrect (old)
+after the misdirected write.
+)LUPZDUH
+0HGLD
+7LPH ,QLWLDO'HYLFH
+6WDWH
+%XJ)UHH:ULWHZ
+6\VWHP&KHFNVXP
+0LVGLUHFWHG:ULWHZ
+6\VWHP&KHFNVXP
+6\VWHP&KHFNVXP
+0LVPDWFKRQ5HDG
+ZULWH
+DFN
+ZULWH
+FVXP
+DFN
+ZULWH
+DFN DFN UHDG
+ZULWH
+FVXP UHDG
+FVXP
+(b) The fix: having the higher-level system update and verify systemchecksums when writing or reading data, in separate requests to the device,
+will detect a misdirected write because of mismatch between the data and the
+system-checksum.
+Fig. 2. Misdirected write bug example. Similar construction to Fig. 1, but
+with the second operation being a write intended for the green location that
+is misdirected by the firmware to the blue location.
+example, the second write request shown is for the block stored
+in the green location. But, it encounters a misdirected write
+bug wherein the data is incorrectly written to the blue media
+location. Notice that a misdirected write bug not only fails
+to update the intended block, but also corrupts (incorrectly
+replaces) the data of the block it incorrectly updates. In the
+example, the subsequent read to the the block mapped to the
+blue location returns this corrupted data.
+Although almost all storage devices maintain errorcorrecting codes (ECCs) to detect corruption due to random
+bit flips [16, 29, 67, 77], these ECCs cannot detect firmwarebug-induced corruption [9, 52]. Device-level ECCs are stored
+together with the data and computed and verified inline by the
+same firmware during the actual media update/access. So, in
+the case of a lost write, the firmware loses the ECC update
+along with the corresponding data update, because the data
+and ECC are written together on the media as one operation.
+Similarly, misdirected writes modify the ECC to match the
+incorrectly updated data and misdirected reads retrieve the
+ECC corresponding to the incorrectly read data.
+System-checksums for detection: Production storage systems maintain per-page system-checksums to detect firmwarebug-induced data corruption. System-checksums are updated
+and verified at a layer above the firmware, such as the file
+system, stored in checksum blocks (each containing checksums for many blocks) separate from the data, and read and
+written using I/O requests separate from the corresponding
+data I/O requests [21,36,44,74,80,82]. Separating the storage
+and accesses for data from corresponding system-checksums
+enables detection of firmware-bug-induced corruption, because
+such bugs are unlikely to affect both the data and its systemchecksum access. Even in an unlikely scenario that a bug
+that affect both the accesses, it is even more unlikely that the
+bug affects both in a consistent fashion (e.g., losing both or
+misdirecting both to another corresponding data and systemchecksum pair).
+Fig. 1(b) demonstrates how system-checksums enable detection of lost writes. Although the firmware loses the second
+write to the blue block is lost, it is unlikely to lose the write
+to the checksum block (stored in the orange location). Thus,
+upon the data read in the example, which is paired with a
+corresponding system-checksum read and verification, the lost
+write is detected.
+Fig. 2(b) illustrates how system-checksums enable detection
+of misdirected writes. A misdirected write firmware bug is
+extremely unlikely to affect both the data write to the green
+block and the corresponding system-checksum write to the
+orange block in a consistent manner. To do so, the firmware
+would have to incorrectly write the system-checksum to a
+location (block and the offset within the block) that stores
+the checksum for the exact block to which it misdirected the
+data write. In the illustration, the read of the blue block data,
+followed by its system-checksum read, results in a verification
+failure. Similarly, system-checksums also trigger a verification
+failure in case of a misdirected read bug, because a bug is
+unlikely to affect the both the data its system-checksum read.
+Cross-device parity for recovery: To recover from a detected page corruption, storage systems store parity pages [28,
+34, 42, 46, 47, 84]. Although parity across arbitrarily selected
+pages suffice for recovery from firmware-bug-induced corruption, storage systems often implement cross-device parity that
+enable recovery from device failures as well.
+B. NVM Storage Redundancy and Direct Access (DAX)
+Non-volatile memory (NVM) refers to a class of memory
+technologies that have DRAM-like access latency and granularity but are also durable like disks [1, 13, 25, 37, 55]. NVM
+devices have orders of magnitude lower latency and higher
+bandwidth than conventional storage devices, thereby improving stateful applications’ performance [6, 7, 15, 18, 35, 72, 73].
+Need for firmware-bug resilience in NVM storage: NVM
+storage systems will be prone to firmware-bug-induced data
+corruption and require corresponding redundancy mechanisms,
+like conventional storage systems. NVM firmware is susceptible to corruption-inducing bugs, because it is non-trivial and its
+complexity can only be expected to increase over time. NVM
+firmware already provides for address translation, bad block
+management, wear leveling, request scheduling, and other
+conventional firmware responsibilities [53,54,55,62]. A recent
+persistent memory characterization study also highlights the
+complex behavior of NVM firmware [75]. Looking forward,
+its complexity will only increase as more NVM-specific functionality is embedded into the firmware (e.g., reducing NVM
+writes and wear [11, 20, 40, 76, 85]) and as the push towards
+near-data computation [2, 4, 5, 12, 19, 24, 31, 58, 59, 70, 78]
+continues. Prior experience with firmwares of such complexity
+demonstrate that they inevitably suffer from bugs that lead to
+626                                     
+NVM Storage Redundancy Design Cheksum Checksum/Parity Update Checksum Verification Performance
+Granularity for DAX data for DAX data Overhead
+Nova-Fortis [74], Plexistore [50] (✓) Page (✗) No updates (✗) No verification (✓) None
+Mojim [81], HotPot [63] (✓) Page2 (✓) On application data flush (∼) Background scrubbing (✗) Very High
+Pangolin [79] (∼) Object (✓) On application data flush (✓) On NVM to DRAM copy (∼) Moderate–High
+Vilamb [33] (✓) Page (∼) Periodically (∼) Background scrubbing (∼) Configurable
+TVARAK (✓) Page (✓) On LLC to NVM write (✓) On NVM to LLC read (✓) Low
+TABLE I
+TRADE-OFFS AMONG TVARAK AND PREVIOUS DAX NVM STORAGE REDUNDANCY DESIGNS.
+lost or misdirected reads and writes. Consequently, production NVM storage systems will need firmware-bug resiliency
+mechanisms.
+Direct access NVM storage redundancy challenges:
+Direct-access (DAX) interface to NVM storage exposes raw
+NVM performance to applications [18,33,39,41,51,57,63,68,
+74,79,81]. DAX-enabled file systems map NVM-resident files
+directly into application address spaces; such direct mapping is
+possible because of NVM’s DRAM-like access characteristics.
+DAX enables applications to access persistent data with load
+and store instructions, eliminating system software overheads
+from the data path.
+These characteristics, however, pose challenges for maintaining firmware-bug resiliency mechanisms [33]. First, the
+lack of interposed system software in the data path makes
+it difficult to efficiently identify data reads and writes that
+should trigger a system-checksum verification and systemchecksum/parity updates, respectively. Second, updating and
+verifying system-checksums for DAX data incurs high overhead because of the mismatch between DAX’s fine-grained
+accesses and the typically large blocks (e.g., 4KB pages) over
+which checksums are computed for space efficiency.
+C. Related Work on DAX NVM Storage Redundancy
+Existing proposals for maintaining system-checksums and
+parity in NVM storage systems compromise on performance,
+coverage, and/or programming flexibility for DAX-mapped
+data. Table I summarizes these trade-offs. Two recent faulttolerant NVM file systems, Nova-Fortis [74] and Plexistore [50], update and check redundancy during explicit FS
+calls but do not update or verify redundancy while data is
+DAX mapped. Interposing library-based solutions, such as
+Mojim [81], HotPot [63], and Pangolin [79], can protect
+DAX-mapped data if applications use the given library’s
+transactional interface for all data accesses and updates. But
+software-based redundancy updates on every data update incur
+large performance overhead. Mojim [81] and HotPot [63]
+would incur very high overhead because of DAX’s fine-grained
+writes2. Pangolin [79] reduces such overhead by eschewing
+per-page checksums in favor of per-object checksums, accepting higher space overhead instead, but still incurs performance
+overheads do to redundancy updates/verifications in software.
+Vilamb [33] reduces the performance overhead, potentially
+2The original Mojim and HotPot designs do not include checksums, only
+replication, but their designs extend naturally to include per-page checksums.
+arbitrarily, by delaying and batching the per-page checksum
+updates. In doing so, however, Vilamb reduces the coverage
+guarantees by introducing windows of vulnerability wherein
+data can get corrupted silently.
+Most existing redundant NVM storage system designs do
+not verify DAX application data reads with the corresponding
+checksum. As shown in the fourth column of Table I, some do
+no verification while data is DAX-mapped, while other designs
+only verify checksums as part of background scrubbing. Pangolin does verify the checksums when it reads an object into
+a DRAM buffer, providing significantly tighter verification.
+The remainder of this paper describes and evaluates
+TVARAK, a software-managed hardware controller for efficient in-line redundancy maintenance without any application
+programming restriction. TVARAK offers strong guarantees—
+updating redundancy for every write and verifying systemchecksum for every read to and from the NVM device,
+respectively. verification for every read from from the NVM
+III. TVARAK DESIGN
+TVARAK is a hardware controller that is co-located with the
+last-level cache (LLC) bank controllers. It coordinates with the
+file system to protect DAX-mapped data from firmware-buginduced corruptions. We first outline the goals of TVARAK. We
+then start by describing a naive redundancy controller, and improve its design to reduce its overheads, leading to TVARAK.
+We end with TVARAK’s architecture, area overheads, and walk
+through examples.
+A. TVARAK’s Goals and Non-Goals
+TVARAK intends to enable the following for DAX-mapped
+NVM data: (i) detection of firmware-bug-induced data corruption, and (ii) recovery from such corruptions. To this
+end, the file system and TVARAK maintain per-page systemchecksums and cross-DIMM parity with page striping, as
+shown in Fig. 3. Note that a RAID-5 like geometry (as
+shown in Fig. 3) precludes a cache-line-granular interleaving
+across the NVM DIMMs. This is because cache-line-granular
+interleaving would require certain cache lines in pages (e.g.,
+every fourth cache line in case of 4 NVM DIMMs) to be
+reserved for parity, breaking the contiguity of virtual address
+space. Instead, a page-granular interleaving enables the OS
+to map contiguous virtual pages to data pages (bypassing the
+parity pages), retaining the contiguity of the virtual address
+627
+6\VWHP
+&KHFNVXPV 'DWD 'DWD 'DWD 3DULW\
+6\VWHP
+&KHFNVXPV 'DWD 'DWD 'DWD
+6\VWHP
+&KHFNVXPV 'DWD 'DWD 'DWD
+6\VWHP
+&KHFNVXPV 'DWD 'DWD 'DWD
+3DULW\
+3DULW\
+3DULW\
+190',00V
+'DWD
+'DWD
+'DWD
+3DULW\
+3DULW\6WULSH
+Fig. 3. TVARAK coordinates with the file system to maintain per-page systemchecksums and cross-DIMM parity akin to RAID-5 with page striping.
+space. This restriction is not unique to TVARAK and required
+for any design that implements a RAID-5 like geometry.
+TVARAK’s redundancy mechanisms co-exist with other
+complementary file system redundancy mechanisms that each
+serve a different purpose. These complementary mechanisms
+do not protect against firmware-bug-induced corruptions, and
+TVARAK does not intend to protect against the failures that
+these mechanisms cover. Examples of such complementary redundancy mechanisms include remote replication for machine
+failures [21,28,34,47], snapshots for user errors [22,60,74,82],
+write protection for scribbles [18,49], and inline sanity checks
+for file system bugs [36].
+Although not TVARAK’s primary intent, TVARAK also helps
+protect from random bit flips and recover from DIMM failures.
+TVARAK can detect random bit flips because it maintains a
+checksum over the data. This coverage is in concert with
+device-level ECCs [16, 29, 67] that are designed for detecting
+and recovering from random bit flips. TVARAK’s cross-DIMM
+parity also enables recovery from DIMM failures. The file
+system and TVARAK ensure that recovery from a DIMM
+failure does not use corrupted data/parity from other DIMMs.
+To that end, the system-checksum for a page is stored in the
+same DIMM as the page, and the file system verifies a page’s
+data with its system-checksum before using it.
+B. Naive Redundancy Controller Design
+Fig. 4 illustrates a basic redundancy controller design that
+satisfies the requirements for detecting firmware-bug-induced
+corruptions, as described in Section II-A. We will improve
+this naive design to build up to TVARAK. The naive controller
+resides above the device firmware in the data path (with the
+LLC bank controllers). The file system informs the controller
+about physical page ranges of a file when it DAX-maps the file,
+along with the corresponding system-checksum pages and the
+parity scheme. For each cache-line writeback from the LLC
+and cache-line read into the LLC, the controller performs an
+address range matching. The controller does not do anything
+for cache lines that do not belong to a DAX-mapped region,
+as illustrated in the leftmost access in Fig. 4. The file system
+continues to maintain the redundancy for such data [50, 74].
+For DAX-mapped cache lines, the controller updates and
+verifies redundancy using separate accesses from the corre190',00V
+//&%DQN
+'$;PDSSHG"
+9HULI\V\VWHPFVXP
+12 <(6
+UHDG
+UHDG
+GDWD
+&RPSXWHV\VWHPFVXP
+DQGSDULW\
+<(6
+ZULWH DFN
+UHDG ZULWH
+1DLYH
+'DWD 6\VWHP&KHFNVXPV 3DULW\
+UHDGZULWH U GDWDDFN
+Fig. 4. Naive Redundancy Controller Design: The redundancy controller
+operates only on DAX-mapped data. For DAX-mapped cache-line reads, the
+controller reads the entire page to compute the checksum, reads the systemchecksum, and verifies that the two match. For cache-line writes, it reads the
+old data, system-checksum, and parity, computes the data diff, uses that to
+compute the new system-checksum and parity, and writes them back to NVM.
+sponding data. The request in the center of Fig. 4 shows a DAX
+cache-line read. To verify the read, the controller reads the
+entire page (shown with black arrows), computes the page’s
+checksum, reads the page’s system-checksum (shown in olive)
+and verifies that the two match. The rightmost request in Fig. 4
+shows a cache-line write. The controller reads the old data in
+the cache line, the old system-checksum, and the old parity
+(illustrated using black, olive and pink, respectively). It then
+computes the data diff using the old and the new data and uses
+that to compute the new system-checksum and parity values3.
+It then writes the new data, new system-checksum, and the
+new parity to NVM. The cross-DIMM parity design and the
+use of data diffs to update parity is similar to recently proposed
+RAIM-5b [84].
+Note that we assume that the NVM servers are equipped
+with backup power to flush CPU caches in case of a power
+failure. The backup power guarantees that the controller can
+complete the system-checksum and parity writes corresponding to a data write in case of a power failure, even if they cache
+this information, as we will describe later. This backup power
+could either be from top-of-the-rack batteries with OS/BIOS
+support to flush caches, or ADR-like support for caches with
+cache-controller managed flushing. Both of these designs are
+common in production systems [3,17,22,32,45,48,83]. Backup
+power also eliminates the need for durability-induced cacheline flushes and improves performance [45, 83] at a low
+cost (e.g., $2 for a 2 socket machine with 8MB LLC per
+socket [45]). We extend this assumption, and the corresponding performance benefits, to the all the designs we compare
+TVARAK to in Section IV.
+C. Efficient Checksum Verification
+Verifying system-checksums in naive design incurs a high
+overhead because it has to read the entire page, as shown
+in Fig. 4. For typical granularities of 4KB checksum pages
+and and 64B cache lines, the naive design reads 65× more
+cache lines (64 cache line in a page and one for the checksum). Although a smaller checksum granularity would reduce
+3We assume that the controller implements incremental system-checksums
+that can be updated using the data diffs, e.g., CRC.
+628                
+190',00V
+//&%DQN
+'$;PDSSHG"
+9HULI\V\VWHPFVXP
+12 <(6
+UHDG
+UHDG
+GDWD
+&RPSXWHV\VWHPFVXP
+DQGSDULW\
+<(6
+ZULWH DFN
+UHDG ZULWH
+1DLYH
+'$;&/&VXPV
+'DWD 6\VWHP&KHFNVXPV 3DULW\ '$;&/&KHFNVXPV
+UHDGZULWH GDWDDFN
+Fig. 5. Efficient Checksum Verification: DAX-CL-checksums eliminate the
+need to read the entire page for DAX cache-line read verification. Instead, the
+controller only reads the cache line and its corresponding DAX-CL-checksum.
+the checksum verification overhead, doing so would require
+dedicating more of the expensive NVM storage for redundant
+data. For example, per-cache-line checksums would require
+64× more space than per-page checksums. Instead, the trend
+in storage system designs is to move towards larger, rather
+than smaller, checksum granularities [38, 66, 71].
+We introduce DAX-CL-checksums to reconcile the performance overhead of page-granular checksum verification with
+the space overhead of cache-line-granular checksums. Adding
+DAX-CL-checksums to the naive controller results in the
+design shown in Fig. 5. As the name suggests, DAX-CLchecksums are cache-line-granular checksums that the controller maintains only when data is DAX-mapped. The read
+request in the middle of Fig. 5 illustrates that using DAX-CLchecksums reduces the read amplification to only 2× from
+65× for the naive design—the controller only needs to read
+the DAX-CL-checksum in addition to the data to verify the
+read. The additional space required for DAX-CL-checksums
+is a small frction (e.g., 1
+64
+th of the DAX-mapped data size,
+assuming 64 byte cache lines) and temporary in nature—it
+is required only for the fraction of NVM that an application
+has DAX-mapped and is freed after the application unmaps the
+NVM data. This is in contrast to the dedicated space overhead
+of maintaining fine-grained object-granular checksums for all
+NVM data at all times [79].
+The controller accesses DAX-CL-checksums separately
+from the corresponding data to ensure that the it continues
+to provide protection from firmware-bug-induced corruptions.
+For DAX-mapped cache-line writes, the controller updates the
+corresponding DAX-CL-checksum as well, using a similar
+process as that for system-checksums and parity (rightmost
+request in Fig. 5).
+Managing DAX-CL-checksums is simple because the controller uses them only while data is DAX-mapped. In particular, when recovering from any failure or crash, the file system
+verifies data integrity using system-checksums rather than
+DAX-CL-checksums. Thus the controller need not maintain
+the DAX-CL-checksums persistently. When the file system
+DAX-maps a file, the controller requests a buffer space for
+DAX-CL-checksums. The file system can allocate this buffer
+space in either NVM or in DRAM; our implementation stores
+DAX-CL-checksums in NVM. The file system reclaims this
+space when it unmaps a file. Unlike page system-checksums,
+190',00V
+//&%DQN
+'$;PDSSHG"
+9HULI\V\VWHPFVXP
+12 <(6
+UHDG
+UHDG
+GDWD
+&RPSXWHV\VWHPFVXP
+DQGSDULW\
+<(6
+ZULWH DFN
+UHDGZULWH GDWDDFN UHDG ZULWH
+'DWD 6\VWHP&KHFNVXPV 3DULW\ '$;&/&KHFNVXPV
+2Q&RQWUROOHU&DFKH
+JHWGDWD
+GLII
+1DLYH
+'$;&/&VXPV
+&DFKH5HGXQGDQF\
+'DWD'LIIVLQ//&
+Fig. 6. Efficient Checksum and Parity Updates: The controller caches
+redundancy cache lines in an on-controller cache and a LLC partition (not
+shown). It also uses a LLC partition to store data diffs, eliminating the need
+to read the old data from NVM upon cache-line writebacks.
+DAX-CL-checksums need not be stored on the same DIMM
+as its corresponding data because they are not used to verify
+data during recovery from a DIMM failure.
+D. Efficient Checksum and Parity Updates
+The rightmost request in Fig. 5 shows that the controller
+incurs 4 NVM reads and writes for each cache-line write to update the redundancy. To reduce these NVM accesses, we note
+that redundancy information is cache-friendly. Checksums are
+typically small and multiple checksums fit in one cache line.
+In our implementation of 4 byte CRC-32C checksums, one 64
+byte cache line holds 16 checksums. DAX-CL-checksums for
+consecutive cache lines and system-checksums for consecutive
+physical pages in a DIMM belong to the same cache line. Access locality in data leads to reuse of DAX-CL-checksum and
+system-checksum cache lines. Similarly, accesses to logically
+consecutive pages lead to reuse of parity cache lines because
+they belong to the same RAID stripe.
+Fig. 6 shows a design that caches the redundancy data,
+i.e., system-checksums, DAX-CL-checksums, and parity, in a
+small on-controller cache. The controller does not cache the
+corresponding NVM data because the LLC already does that.
+The controller also uses a partition of the LLC to increase
+its cache space for redundancy information (not shown in
+the figure). Using a reserved LLC partition for caching redundancy information limits the interference with application
+data. The controller can insert up to 3 redundancy cache lines
+(checksum, DAX-CL-checksum, and parity) per data cacheline writeback. If the controller were to share the entire LLC
+for caching redundancy information, each of these redundancy
+cache lines could force out application data. Reserving a
+partition for redundancy information eliminates this possibility
+because the redundancy controller can only evict a redundancy
+cache line when inserting a new one.
+We further eliminate the need for the controller to fetch the
+old data from NVM to compute the data diff. Cache lines in
+the LLC become dirty when they are evicted from the L2.
+Since the LLC already contains the soon-to-be-old data value,
+the controller uses it to compute the data diff and stores this
+diff in a LLC partition. This enables the controller to directly
+use this data diff upon a LLC cache-line writeback (shown as
+maroon arrows from the controller to the LLC in the rightmost
+629                                         
+request in Fig. 6). Upon an eviction from the LLC data diff
+partition (e.g., to insert a new data diff), the controller writes
+back the corresponding data without evicting it from the LLC,
+and marks the data cache line as clean in the LLC. This ensures
+that the future eviction of the data cache line would not require
+the controller to read the old data either, while allowing for
+reuse of the data in the LLC.
+The LLC partitions (for caching redundancy and storing
+data diffs) are completely decoupled from the application data
+partitions. The LLC bank controllers do not lookup application
+data in redundancy and data diff partitions, and the redundancy
+controller does not look up redundancy or data diff cache lines
+in application data partitions. Our design of storing the data
+diff in the LLC assumes inclusive caches. We evaluate the
+impact of exclusive caching in Section IV-G.
+E. Putting it all together with TVARAK
+Fig. 7 shows TVARAK’s components that implement the
+functionality of a redundancy controller with all the optimizations described above (DAX-CL-checksums, redundancy
+caching and storing data diffs in LLC). One TVARAK controller resides with each LLC cache bank. Each TVARAK
+controller consists of comparators for address range matching
+and adders for checksum and parity computations. TVARAK
+includes a small on-controller cache for redundancy data and
+uses LLC way-partitions for caching redundancy data and
+storing data diffs. The on-controller cache and LLC waypartition form an inclusive cache hierarchy. The controllers
+use MESI coherence protocol for sharing the redundancy
+cache lines between their private caches. TVARAK also uses a
+separate LLC way-partition of storing data diffs.
+Area overhead: The on-controller cache dominates
+TVARAK’s area overhead because its other components (comparators and adders) only require small logic units. In our
+evaluation with 2MB LLC cache banks, each TVARAK controller consists of a 4KB cache. This implies that TVARAK’s
+dedicated area is only 0.2% of the LLC. TVARAK’s design of
+caching redundancy in an LLC partition instead of using its
+own large cache keeps TVARAK’s dedicated area overheads
+low, without compromising on performance (Section IV). We
+evaluate the impact of reserving LLC partitions for caching
+redundancy and storing data diffs on application performance
+in Section IV-G.
+DAX-mapped cache-line accesses with TVARAK: For a
+DAX-mapped cache-line read, TVARAK computes its DAXCL-checksum address and looks it up in the on-controller
+cache. Upon a miss, it looks up the DAX-CL-checksum in the
+LLC redundancy partition. If it misses in the LLC partition
+as well, TVARAK reads the DAX-CL-checksum from NVM
+and caches it. TVARAK reads the data cache line from NVM,
+computes its checksum, and verifies it with the DAX-CLchecksum. If the verification succeeds, TVARAK hands over
+the data to the bank controller. In case of an error, TVARAK
+raises an interrupt that traps in the OS; the file system then
+initiates recovery using the cross-DIMM parity.
+&RUH
+/&DFKH
+/&DFKH
+//&
+&RUH
+/&DFKH
+/&DFKH
+'5$0',00V
+7YDUDN
+$GGHU
+2Q&RQWUROOHU
+&DFKH
+&RPSDUDWRU
+//&
+&DFKH%DQN
+'DWD'LIIV
+5HGXQGDQF\
+&DFKH&WUO
+&DFKH%DQN
+7YDUDN
+0HPRU\&RQWUROOHU
+190',00V
+&DFKH&WUO
+&DFKH%DQN
+7YDUDN
+Fig. 7. TVARAK resides with the LLC bank controllers. It includes comparators to identify cache lines that belong to DAX-mapped pages and adders to
+compute checksums and parity. It includes a small on-controller redundancy
+cache that is backed by a LLC partition. TVARAK also stores the data diffs
+to compute checksums and parity.
+On a DAX-mapped cache-line write, TVARAK computes
+the corresponding system-checksum, DAX-CL-checksum, and
+parity addresses and reads them following the same process
+as above. TVARAK retrieves the data diff from the LLC bank
+partition and uses that to compute the new system-checksum,
+DAX-CL-checksum, and parity. TVARAK stores the updated
+redundancy information in the on-controller cache, and writes
+back the data cache line to NVM. TVARAK can safely cache
+the updated redundancy information because it assumes that
+servers are equipped with backup power to flush caches to
+persistence in case of a power failure (Section III-B).
+TVARAK fills an important gap in NVM storage redundancy
+with simple architectural changes. Integrating NVM devices
+into servers already requires changing the on-chip memory
+controller to support the new DDR-T protocol [27]. Hence, we
+believe that TVARAK can be easily integrated in storage server
+chips, especially given its low-overhead and energy-efficient
+design, as we show next.
+IV. EVALUATION
+We evaluate TVARAK with 7 applications and with multiple
+workloads for each application. Table II describes our applications and their workloads. Redis [57], Intel PMDK’s [26] treebased key-value stores (C-Tree, B-Tree, and RB-Tree), and NStore [6] are NVM applications with complex access patterns.
+We also use the standard file system benchmarking tool fio [8]
+to generate synthetic sequential and random access patterns,
+and stream [65] for sequential access memory-bandwidth
+intensive microbenchmarks.
+We compare TVARAK with three alternatives: Baseline,
+TxB-Object-Csums, and TxB-Page-Csums. Baseline implements no redudancy mechanisms. TxB-Object-Csums and
+TxB-Page-Csums are software-only redudancy approaches;
+TxB-Object-Csums is based on Pangolin [79] and TxB-PageCsums is based on Mojim [81] and HotPot [63]4. Both
+4The original Mojim and HotPot designs do not include checksums, but
+can be extended to include them.
+630          
+Application Workload
+Redis Set-only and get-only with 1–6 parallel instances
+C-Tree Insert-only, and 100:0, 50:50, & 0:100 updates:reads
+with 12 parallel instances
+B-Tree Insert-only, and 100:0, 50:50, & 0:100 updates:reads
+with 12 parallel instances
+RB-Tree Insert-only, and 100:0, 50:50, & 0:100 updates:reads
+with 12 parallel instances
+N-Store Read heavy, balanced, and write-heavy YCSB workloads
+Fio Sequential and random reads and writes with 12 threads
+Stream 4 memory bandwidth intensive kernels with 12 threads
+TABLE II
+APPLICATIONS AND THEIR WORKLOADS.
+TxB-Object-Csums and TxB-Page-Csums update systemchecksums and parity when applications inform the interposing library after completing a write, which is typically at
+a transaction boundary (TxB). TxB-Object-Csums maintains
+system-checksums at an object granularity, whereas TxBPage-Csums maintains system-checksums at a page granularity. TxB-Object-Csums does not need to read the entire
+page to compute the system-checksum after a write, however,
+TxB-Object-Csums has higher space overhead because of
+the object-granular checksums. Unlike Pangolin, TxB-ObjectCsums does not copy data between NVM and DRAM. Consequently, TxB-Object-Csums avoids the data copying overhead
+of Pangolin and does not verify data reads (which can also
+incur up to 50% overhead [79]). However, because data is
+updated in place, TxB-Object-Csums also loses the ability to
+update parity using a data diff. TxB-Page-Csums also does
+not verify data reads and updates parity by recomputing it as
+opposed to using a data diff.
+TVARAK updates system-checksums and parity upon every
+writeback from the LLC to the NVM, and verifies systemchecksums upon every read from the NVM to the LLC. As
+mentioned in Section III-B, we assume battery-backed CPU
+caches, so none of the designs flush cache lines for durability.
+Methodology: We use zsim [61] to simulate a system
+similar to Intel Westmere processors [61]. Table III details
+our simulation parameters. We simulate 12 OOO cores, each
+with 32KB private L1 and 256KB private L2 caches. The
+cores share a 24MB last level cache (LLC) with 12 banks of
+2MB each. The simulated system consists of 4 NVM DIMMs;
+we use the latency and energy parameters derived by Lee et
+al. [37] (60/150 ns read/write latency, 1.6/9 nJ per read/write).
+We evaluate the impact of changing the number of NVM
+DIMMs and the underlying NVM technology (and the associated performance characteristics) in Section IV-H. We use
+a fixed-work methodology to compare the designs: baseline,
+TVARAK, TxB-Object-Csums, and TxB-Page-Csums. Unless
+stated otherwise, we present the average of three runs for each
+data point with root mean square error bars.
+A. Key Evaluation Takeaways
+We highlight the key takeaways from our results before
+describing each application’s results in detail.
+Cores 12 cores, x86-64 ISA, 2.27 GHz,
+Westmere-like OOO [61]
+L1-D caches 32KB, 8-way set-associative, 4 cycle latency,
+LRU replacement, 15/33 pJ per hit/miss [43]
+L1-I caches 32KB, 4-way set-associative, 3 cycle latency,
+LRU replacement, 15/33 pJ per hit/miss [43]
+L2 caches 256KB, 8-way set-associative, 7 cycle latency,
+LRU replacement, 46/94 pJ per hit/miss [43]
+L3 cache
+24MB (12 2MB banks), 16-way set-associative,
+27 cycle latency, shared and inclusive,
+MESI coherence, 64B lines
+LRU replacement, 240/500 pJ per hit/miss [43]
+DRAM 6 DDR DIMMs, 15ns reads/writes
+NVM 4 DDR DIMMs, 60ns reads, 150ns writes [37]
+1.6/9 nJ per read/write [37]
+TVARAK
+4KB on-controller cache with 1 cycle latency, 15/33 pJ per hit/miss
+2 cycle latency for address range matching
+1 cycle per checksum/parity computation and verification,
+2 ways (out of 16) reserved for caching redundancy information,
+1 way (out of 16) for storing data diffs.
+TABLE III
+SIMULATION PARAMETERS
+• TVARAK provides efficient redundancy updates for application data writes, e.g., with only 1.5% overhead over
+baseline that provides no redundancy for an insert-only
+workload with tree-based key-value stores (C-Tree, BTree, RB-Tree).
+• TVARAK verifies all application data reads, unlike most
+existing solutions, and does so efficiently. For example,
+in comparison to baseline that does not verify any reads,
+TVARAK increase Redis get-only runtime by only 3%.
+• TVARAK benefits from application data access locality
+because it improves cache usage for redundancy information. For example, for synthetic fio benchmarks, TVARAK
+has negligible overheads with sequential accesses, but 2%
+overhead for random reads and 33% for random writes,
+compared to baseline.
+• TVARAK outperforms existing software-only redundancy
+mechanisms. For example, for Nstore workloads, TxBObject-Csums is 33–53% slower than TVARAK, and TxBPage-Csums is 180–390% slower than TVARAK.
+• TVARAK’s efficiency comes without an increase in (dedicated) space requirements. TxB-Object-Csums outperforms TxB-Page-Csums but at the cost of higher space
+overhead for per-object checksums. TVARAK instead uses
+DAX-CL-checksums that improve performance without
+demanding dedicated storage.
+B. Redis
+Redis is a widely used single-threaded in-memory key-value
+store that uses a hashtable as its primary data structure [56].
+We modify Redis (v3.1) to use a persistent memory heap
+using Intel PMDK’s libpmemobj library [26], building upon
+an open-source implementation [57]. We vary the number of
+Redis instances, each of which operate independently. We use
+the redis-benchmark utility to spawn 100 clients that together
+generate 1 million requests per Redis instance. We use set631
+(a) Redis: Runtime (b) Redis: Energy (c) Redis: NVM Accesses (d) Redis: Cache Accesses
+(e) KV-Structures: Runtime (f) KV-Structures: Energy (g) KV-Structures: NVM Accesses (h) KV-Structures: Cache Accesses
+(i) N-Store: Runtime (j) N-Store: Energy (k) N-Store: NVM Accesses (l) N-Store: Cache Accesses
+(m) Fio: Runtime (n) Fio: Energy (o) Fio: NVM Accesses (p) Fio: Cache Accesses
+(q) Stream: Runtime (r) Stream: Energy (s) Stream: NVM Accesses (t) Stream: Cache Accesses
+Fig. 8. Runtime, energy, and NVM and cache accesses for various Redis (Figs. 8(a) to 8(d)), tree-based key-value data structures (Figs. 8(e) to 8(h)), N-Store
+(Figs. 8(i) to 8(l)), Fio (Figs. 8(m) to 8(p)), and Stream (Figs. 8(q) to 8(t)) workloads. We divide NVM accesses into data and redundancy information accesses,
+and cache accesses into L1, L2, LLC, and on-TVARAK cache.
+632
+only and get-only workloads. We show the results only for
+6 Redis instances for ease of presentation; the trends are the
+same for 1–6 Redis instances that we evaluated.
+Fig. 8(a) shows the runtime for Redis set-only and get-only
+workloads. In comparison to baseline, that maintains no redundancy, TVARAK increases the runtime by only 3% for both the
+workloads. In contrast, TxB-Object-Csums typically increases
+the runtime by 50% and TxB-Page-Csums by 200% over the
+baseline for the set-only workload. For get-only workloads,
+TxB-Object-Csums and TxB-Page-Csums increase the runtime
+for by a maximum of 5% and 28% over baseline, respectively.
+This increase for TxB-Object-Csums and TxB-Page-Csums,
+despite them not verifying any application data reads, is
+because Redis uses libpmemobj transactions for get requests as
+well and these transactions lead to persistent metadata writes
+(e.g., to set the transaction state as started or committed).
+Redis uses transactions for get requests also because it uses
+an incremental rehashing design wherein it rehashes part of its
+hashtable upon each request. The incremental rehashing can
+lead to writes for get requests also. We do not change Redis’
+behavior to eliminate these transactions to suit our get-only
+workload, which wouldn’t actually trigger a rehashing.
+Figs. 8(b) to 8(d) show the energy, NVM accesses and cache
+accesses. The energy results are similar to that for runtime.
+For the set-only workload, TVARAK performs more NVM
+accesses than TxB-Object-Csums because TVARAK does not
+cache the data or redundancy information in the L1 and
+L2 caches; TxB-Object-Csums instead performs more cache
+accesses. Even though TxB-Page-Csums can and does use
+the caches (demonstrated by TxB-Page-Csums’s more than
+2.5× more cache accesses than baseline), it also requires more
+NVM accesses because it needs to read the entire page to
+compute the page-granular system-checksums. For get-only
+workloads, TVARAK performs more NVM accesses than both
+TxB-Object-Csums and TxB-Page-Csums because it verifies
+the application data reads with DAX-CL-checksums.
+C. Key-value Data Structures
+We use three persistent memory key-value data structures,
+namely C-Tree, B-Tree, and RB-Tree, from Intel PMDK [26].
+We use PMDK’s pmembench utility to generate insert-only,
+update-only, balanced (50:50 updates:reads), and read-only
+workloads. We stress the NVM usage by using 12 instances
+of each data-structure; each instance is driven by a single
+threaded workload generator. Having 12 independent instances
+of single-threaded workloads allows us to remove locks from
+the data-structures and increase the workload throughput. We
+show the results for insert-only and balanced workloads; the
+trends are the same for other workloads.
+Figs. 8(e) to 8(h) show the runtime, energy, and NVM and
+cache accesses for the different workloads and data-structures.
+For the insert-only workload, TVARAK increases the runtime
+by a maximum of 1.5% (for RB-Tree) over the baseline while
+updating the redundancy for all inserted tuples. In contrast,
+TxB-Object-Csums and TxB-Page-Csums increase the runtime
+by 43% and 171% over the baseline, respectively. For the
+balanced workload, TVARAK updates the redundancy for tuple
+updates and also verifies tuple reads with system-checksums
+with only 5% increase in runtime over the baseline for CTree and B-Tree. TxB-Object-Csums incurs a 20% increase in
+runtime over baseline for just updating the redundancy upon
+tuple updates; TxB-Page-Csums performs even worse.
+D. N-Store
+N-Store is a NVM-optimized relational DBMS. We use
+update-heavy (90:10 updates:reads), balanced (50:50 updates:reads) and read-heavy (10:90 updates:reads) YCSB
+workloads with high skew (90% of transactions go to 10%
+of tuples) [6]. We use 4 client threads to drive the workload
+and perform a total of 800000 transactions. For N-Store, we
+present results from a single run with no error bars.
+Figs. 8(i) to 8(l) show runtime and energy, and NVM and
+cache accesses. TVARAK increases the runtime by 27% and
+41% over the baseline for the read-heavy and update-heavy
+workloads, respectively. TVARAK’s overheads are higher with
+N-Store than with Redis or key-value structures because NStore uses a linked-list-based write-ahead log that leads to
+a random-write access pattern for update transactions: each
+update transaction allocates and writes to a linked list node.
+Because the linked list layout is not sequential in NVM,
+TVARAK incurs cache misses for the redundancy information and performs more NVM accesses. The random-write
+access pattern also affects TxB-Object-Csums and TxB-PageCsums, with a 70%–117% and 264%–600% longer runtime
+than baseline, respectively. This is because TxB-Object-Csums
+and TxB-Page-Csums also incur misses for for redundancy
+information in the L1, L2 and LLC caches and have to perform
+more NVM accesses for random writes.
+E. Fio Benchmarks
+Fio is a file system benchmarking tool that supports multiple
+access patterns [8]. We use Fio’s libpmem engine that accesses
+DAX-mapped NVM file data using load and store instructions.
+We use sequential and random read and write workloads with
+a 64B access granularity. We use 12 concurrent threads with
+each thread performing 32MB worth of accesses (reads or
+writes). Each thread accesses data from a non-overlapping
+512MB region, and no cache line is accessed twice.
+Figs. 8(m) to 8(p) show the results for fio. As discussed
+above in the context of N-Store, random access patterns
+in the application hurt TVARAK because of poor reuse for
+redundancy cache lines with random accesses. This trend is
+visible for fio as well—whereas TVARAK has essentially the
+same runtime as baseline for sequential accesses, TVARAK
+increases the runtime by 2% and 33% over baseline for
+random reads and writes, respectively. However, TVARAK
+still outperforms TxB-Object-Csums and TxB-Page-Csums
+for the write workloads. For read workloads, TxB-ObjectCsums and TxB-Page-Csums have no impact because they
+do not verify application data reads. For the random write
+workload, TVARAK incurs a higher energy overhead than
+TxB-Object-Csums. This is because the energy required for
+633
+Fig. 9. Impact of TVARAK’s Design Choices: We evaluate the impact of
+TVARAK’s design optimizations with one workload for each application. We
+present the results for the naive design and then add optimizations: DAXCL-checksums, redundancy caching, and data diffs in LLC. With all the
+optimizations enabled, we get TVARAK.
+additional NVM accesses that TVARAK generates exceed that
+required for the additional cache accesses that TxB-ObjectCsums generates.
+F. Stream Benchmarks
+Stream is a memory bandwidth stress tool [65] that is part
+of the HPC Challenge suite [23]. Stream comprises of four
+sequential access kernels: (i) Copy data from one array to
+another, (ii) Scale elements from one array by a constant factor
+and write them in a second array, (iii) Add elements from two
+arrays and write them in a third array, and (iv) Triad which is
+a combination of Add and Scale: it scales the elements from
+one array, adds them to the corresponding elements from the
+second array, and stores the values in a third array. We modify
+stream to store and access data in persistent memory. We use
+12 concurrent threads that operate on non-overlapping regions
+of the arrays. Each array has a size of 128MB.
+Figs. 8(q) to 8(t) show the results for the four kernels. The
+trends are similar to the preceding results. TVARAK, TxBObject-Csums, and TxB-Page-Csums increase the runtime by
+6%–21%, 700%–1200%, and 1800%–3200% over the baseline, respectively. The absolute values of the overheads are
+higher for all the designs because the baseline already saturates
+the NVM bandwidth, unlike the real-world applications considered above that consume the data in more complex fashions.
+The impact of computation complexity is clear even across the
+four microbenchmarks: copy is the simplest kernel, followed
+by scale, add, and triad. Consequently, the overheads for all
+the designs are highest for the copy kernel and lowest for the
+triad kernel.
+G. Impact of TVARAK’s Design Choices
+We break down the impact of TVARAK’s design choices,
+namely, using DAX-CL-checksum, caching redundancy information, and storing data diffs in LLC. We present the results
+for one workload from each of the above applications: setonly workload with 6 instances for Redis, insert-only workload
+for C-Tree, balanced workload for N-Store, random write
+workload for fio, and triad kernel for stream.
+Fig. 9 shows the performance for the naive design, and then
+adds individual design elements, i.e., DAX-CL-checksums,
+redundancy caching, and storing data diffs in LLC. With
+all the design elements, we get the complete TVARAK design. Not storing data diffs in LLC, while using DAX-CLchecksums and redundancy caching corresponds to TVARAK
+design for systems with exclusive caching. For Redis, C-Tree
+and stream’s triad kernel, all of TVARAK’s design choices
+improve performance. This is the case for B-Tree, RB-Tree,
+other stream kernels, and fio sequential access workloads as
+well (not shown in the figure).
+For N-Store and fio random write workload, redundancy
+caching and storing data diffs in the LLC hurt performance.
+This is because taking away cache space from application data
+creates more NVM accesses than that saved by caching the
+redundancy data and storing the data diffs in LLC for N-Store
+and fio random writes—their random access patterns lead to
+poor reuse of redundancy cache lines.
+This evaluation highlights the importance of right-sizing
+LLC partitions that TVARAK uses to cache redundancy information and to store data diffs. We now evaluate the application
+performance sensitivity to these parameters.
+H. Sensitivity Analysis
+We evaluate the sensitivity of TVARAK to the size of LLC
+partitions that it can use for caching redundancy information
+and storing data diffs. We present the results for one workload
+from each of the set of applications, namely, set-only workload
+with 6 instances for Redis, insert-only workload for C-Tree,
+balanced workload for N-Store, random write workload for
+fio, and triad kernel for stream.
+Fig. 10(a) shows the impact of changing the number of LLC
+ways (out of 16) that TVARAK can use for caching redundancy
+information. Redis and C-Tree are largely unaffected by the
+redundancy partition size, with Redis benefitting marginally
+from reserving 2 ways instead of 1. Stream and fio, being synthetic memory stressing microbenchmarks, demonstrate that
+dedicating a larger partition for redundancy caching improves
+TVARAK’s performance because of the increased cache space.
+N-Store is cache-sensitive and taking away the cache from
+application data for redundancy hurts its performance.
+Fig. 10(b) shows the sensitivity of TVARAK to the number
+of ways reserved for storing data diffs. As with the sensitivity
+to redundancy information partition size, changing the data
+diff partition size has negligible impact on Redis and CTree. For N-Store, increasing the number of ways reserved
+for storing data diffs hurts performance because N-Store is
+cache-sensitive. Stream and fio show an interesting pattern:
+increasing the number of data diff ways from 1 to 4 hurts
+performance, but increasing it to 6 or 8 improves performance
+(although the performance remains worse than reserving just
+634
+(a) Sensitivity to number of ways for
+caching redundancy information.
+(b) Sensitivity to number of ways for
+storing data diffs.
+Fig. 10. Impact of changing the number of LLC ways (out of 16) that TVARAK
+can use for caching redundancy data and for storing data diffs.
+1 way). This is because dedicating more ways for storing data
+diffs has two contradicting effects. It reduces the number of
+writebacks due to data diff evictions, but it also causes more
+writebacks because of the reduced cache space for application
+data. Their combined effect dictates the overall performance.
+We also evaluate the impact of increasing the number of
+NVM DIMMs and changing the underlying NVM technology
+on baseline, TVARAK, TxB-Object-Csums, and TxB-PageCsums. The relative performance trends stay the same with
+both of these changes; we do not show the results here for
+brevity. As an example, even with 8 NVM DIMMs or with
+improved NVM performance by considering battery-backed
+DRAM as NVM, TVARAK continues to outperform TxBObject-Csums and TxB-Page-Csums by orders of magnitude
+for the stream microbenchmarks.
+V. CONCLUSION
+TVARAK efficiently maintains system-checksums and crossdevice parity for DAX NVM storage, addressing controller and
+firmware imperfections expected to arise with NVM as they
+have with other storage technologies. As a hardware offload,
+managed by the storage software, TVARAK does so with
+minimal overhead and much more efficiently that softwareonly approaches. Since system-level redundancy is expected
+from production storage, TVARAK is an important step towards
+the use of DAX NVM as primary storage.

@@ -1,0 +1,2177 @@
+Abstract—The capacity of offloading data and control tasks to
+the network is becoming increasingly important, especially if we
+consider the faster growth of network speed when compared
+to CPU frequencies. In-network compute alleviates the host
+CPU load by running tasks directly in the network, enabling
+additional computation/communication overlap and potentially
+improving overall application performance. However, sustaining
+bandwidths provided by next-generation networks, e.g., 400
+Gbit/s, can become a challenge. sPIN is a programming model
+for in-NIC compute, where users specify handler functions that
+are executed on the NIC, for each incoming packet belonging
+to a given message or flow. It enables a CUDA-like acceleration,
+where the NIC is equipped with lightweight processing elements
+that process network packets in parallel. We investigate the
+architectural specialties that a sPIN NIC should provide to enable
+high-performance, low-power, and flexible packet processing. We
+introduce PsPIN, a first open-source sPIN implementation, based
+on a multi-cluster RISC-V architecture and designed according
+to the identified architectural specialties. We investigate the
+performance of PsPIN with cycle-accurate simulations, showing
+that it can process packets at 400 Gbit/s for several use cases,
+introducing minimal latencies (26 ns for 64 B packets) and
+occupying a total area of 18.5 mm2 (22 nm FDSOI).
+Index Terms—in-network compute, packet processing, specialized architecture, sPIN.
+I. MOTIVATION
+Today’s cloud and high-performance datacenters form a
+crucial pillar of compute infrastructures and are growing at
+unprecedented speeds. At the core, they are a collection
+of machines connected by a fast network carrying petabits
+per second of internal and external traffic. Emerging online
+services such as video communication, streaming, and online collaboration increase the incoming and outgoing traffic
+volume. Furthermore, the growing deployment of specialized
+accelerators and general trends towards disaggregation exacerbates the quickly growing network load. Packet processing
+capabilities are a top performance target for datacenters.
+These requirements have led to a wave of modernization in
+datacenter networks: not only are high-bandwidth technologies
+going up to 200 Gbit/s gaining wide adoption but endpoints
+must also be tuned to reduce packet processing overheads.
+Specifically, remote direct memory access (RDMA) networks
+move much of the packet and protocol processing to fixedfunction hardware units in the network card and directly access
+data into user-space memory. Even though this greatly reduces
+packet processing overheads on the CPU, the incoming data
+must still be processed. A flurry of specialized technologies
+exists to move additional parts of this processing into network
+cards, e.g., FPGAs virtualization support [22], P4 simple
+rewriting rules [13], or triggered operations [9].
+Streaming processing in the network (sPIN) [28] defines a
+unified programming model and architecture for network acceleration beyond simple RDMA. It provides a user-level interface, similar to CUDA for compute acceleration, considering
+the specialties and constraints of low-latency line-rate packet
+processing. It defines a flexible and programmable network
+instruction set architecture (NISA) that not only lowers the
+barrier of entry but also supports a large set of use-cases [28].
+For example, Di Girolamo et al. demonstrate up to 10x
+speedups for serialization and deserialization (marshalling) of
+non-consecutive data [20].
+While the NISA defined by sPIN can be implemented on
+existing SmartNICs [1], their microarchitecture (often standard
+ARM SoCs) is not optimized for packet-processing tasks. In
+this work, we define an open-source high-performance and
+low-power microarchitecture for sPIN network interface cards
+(NICs). We break first ground by developing principles for
+NIC microarchitectures that enable flexible packet processing
+at 400 Gbit/s line-rate.
+As core contributions in this work, we
+‚ establish principles for flexible and programmable NICbased packet processing microarchitectures,
+‚ design and implement a fully-functional 32-core SoC for
+packet processing that can be added into any NIC pipeline,
+‚ analyze latencies, message rates, and bandwidths for a large
+set of example processing handlers, and
+‚ open-source the SoC design to benefit the community.
+We implement PsPIN in synthesizable hardware description
+language (HDL) code. Overall, it occupies less than 20mm2
+in a 22nm FDSOI process, which is about 25x smaller than
+an Intel Skylake Xeon die. We show how, given the nature of
+in-network compute tasks, a PsPIN unit can achieve similar
+or higher throughput than more complex architectures, like
+Xeon- or ARM- based ones by using at most 6.3W.
+
+"$.*&&&UI"OOVBM*OUFSOBUJPOBM4ZNQPTJVNPO$PNQVUFS"SDIJUFDUVSF	*4$"
+
+¥*&&&
+%0**4$"
+2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA) | 978-1-6654-3333-4/21/$31.00 ©2021 IEEE | DOI: 10.1109/ISCA52012.2021.00079
+Solution L P G U Notes
+Azure AccellNet [22]  FPGA-based NICs; Flow-steering.
+P4 [13]˚, FlexNIC [32]  Packet steering and rewriting. FlexNIC adds memory support. ˚Runs on NICs and switches.
+Mellanox SHARP [24]  Data aggregation and reduction. Runs on switches.
+Portals 4 [9], INCA [49]  Sequences of predefined actions can be expressed with triggered operations. Both target NICs.
+Mellanox CORE-Direct [25]  Sequence of predefined actions can be chained. Targets switches.
+Cray Aries Reduction Engine [6]  Data reductions (up to 64 bytes). Runs on switches.
+Quadrics [43], Myrinet [16]  Users define threads to run on the NIC / NIC is re-programmable by users.
+SmartNICs [2], [1]  Runs full linux stack on the NIC; Offloading of new code requires flashing.
+FPGA packet parsing pipeline [8]  Only packet parsing, read-only packets, might require FPGA reconfiguration. Target NICs.
+eBPF (host) [39]  Runs user-defined code (eBPF code) in virtual machine in the OS kernel.
+eBPF (Netronome) [33], hXDP [15]  eBPF programs can be offloaded to NIC.
+DPDK [46]  Runs in user space. Applications can poll for new raw packets from the NIC.
+StRoM [51]  Handlers for DMA streams are implemented on FPGA NIC.
+NICA [21]  Bind kernels running on on-NIC accelerators to user sockets.
+PANIC [36]  Applications compose execution of pre-installed compute units. Targets NICs.
+sPIN [28]  Applications define C/C++ packet handlers to map to different messages/flows. Targets NICs.
+TABLE I
+L: LOCATION ( ON NICS OR SWITCHES;  ON NICS BUT OUTSIDE THE PACKET PIPELINE;  ON HOST CPU). P: PROGRAMMABILITY ( FULLY
+PROGRAMMABLE;  LIMITED PROGRAMMABILITY;  PREDEFINED FUNCTIONS). G: GRANULARITY ( MESSAGE AND PACKETS;  ONLY PACKETS;
+ ONLY MESSAGES). U: USABILITY ( USABLE BY APPLICATIONS AND PRIVILEGED USERS;  ONLY BY PRIVILEGED USERS).
+II. IN-NETWORK COMPUTE
+In-network compute is the capability of an interconnection
+network to process, steer, and produce data according to a
+set of programmable actions. The exact definition of action
+depends on the specific in-network-compute solution: it can
+vary from pre-defined actions (e.g., pass or drop a packet
+according to a set of rules) to fully programmable packet or
+message handlers (e.g., sPIN handlers).
+There are several advantages of computing in the network:
+(1) More overlap. Applications can define actions to execute
+on incoming data. Letting the network execute them allows
+applications to overlap these tasks with other useful work;
+(2) Lower latency. The network can promptly react to incoming data (cf. Portals 4 triggered operations [9], virtual
+functions [22], sPIN handlers), immediately executing actions
+depending on it. Doing the same on the host requires applications to poll for new data, check for dependent actions, and
+then execute them. (3) Higher throughput. Some in-networkcompute solutions enable stream processing of the incoming
+data. For example, sPIN can run packet handlers on each
+incoming packet, potentially improving the overall throughput.
+(4) Less resource contention. Running tasks in the network can
+reduce the volume of data moved through the PCIe bus and the
+memory hierarchy. This implies fewer data movements, less
+memory contention and cache pollution, potentially improving
+the performance of host CPU tasks.
+Table I surveys existing in-network-compute solutions. This
+classification focuses on the high-level characteristics of these
+solutions, comparing them by the location where policies are
+run, the level of programmability, the granularity at which the
+actions are applied, and their usability.
+(L) Location. Policies can be executed at different points
+along the path from the endpoint sending the data to the endpoint receiving it. We classify in-network-compute solutions
+as:  running in network devices (e.g., on NICs or switches);
+ running in network devices but not on the packet pipeline
+(e.g., SmartNICs act as close-to-network endpoints, running
+full Linux stack);  if they run on the host CPUs.
+(P) Programmability. It defines the expressiveness of the
+actions. Network solutions enabling fully programmable actions that can access the message/packet header and payload,
+access the NIC and host memory, and issue new network
+operations (e.g., RDMA put or gets) are marked with .
+Solutions that provide a predefined set of actions that can be
+composed among themselves (e.g., P4 match-actions or Portals
+4 triggered operations) are marked with . Solutions providing
+only predefined functions are marked with .
+(G) Granularity. Actions can be applied to full messages (),
+requiring to first fully receive the message, or to single packets,
+as they are received (). Solutions enabling both types of
+actions are marked with .
+(U) Usability. It defines which entities can install actions
+into the network. In-network-compute solutions enabling user
+applications and libraries (even in multi-tenant settings) to
+install actions are marked with . Solutions that require
+elevated privileges, service disruption, and/or device memory
+flashing to install new actions are marked with .
+Among the solutions of Table I, sPIN is the only one letting
+user-space applications define per-message or per-packet tasks
+(called handlers) that are executed in the NIC. sPIN handlers
+can access and modify packet data, share NIC memory, and
+issue NIC and DMA commands. Handlers can be installed on
+the NIC without disrupting operations and memory isolation
+must be guaranteed (see Section III-B2). For these reasons,
+we focus on the sPIN programming model, investigate the
+challenges of building a sPIN engine, and introduce PsPIN,
+a general and open-source sPIN implementation. By opensourcing the hardware design of PsPIN under a permissive
+open-source license (Solderpad), we want to encourage its
+usage and foster the creation of prototypes by anyone in the
+community.
+A. sPIN: Streaming processing in the network
+The key idea of sPIN is to extend RDMA by enabling
+users to define simple processing tasks, called handlers, to
+be executed directly on the NIC. A message sent through the
+                                                               
+Fast shared
+NIC
+memory
+HPU 0
+HPU 1
+HPU N...
+DMA
+Engine
+Packet Scheduler
+interconnect
+HPU 2
+sPIN NIC
+H
+P
+P
+C...
+Packets from
+the network
+(Header,
+Payload,
+Completion)
+Host
+Memory
+Host CPUs
+upload
+handlers
+manage
+memory
+R/W
+Fig. 1. sPIN abstract machine model.
+network is seen as a sequence of packets: the first packet is
+defined as header, the last one as completion, and all the
+intermediate ones as payload. As the packets of a message
+reach their destination, the receiving NIC invokes the respective packet handlers. For each message, three types of handlers
+are defined: the header handler, executed only on the header
+packet; the payload handler, executed on all the packets, and
+the completion handler, executed after all packets have been
+processed. Handlers are defined by applications running on
+the host and cross-compiled for the NIC microarchitecture.
+The programming model that sPIN proposes is similar to
+CUDA [40] and OpenCL [52]: the difference is that in these
+frameworks, applications define kernels to be offloaded to
+GPUs. In sPIN, the kernels (i.e., handlers) are offloaded to the
+NIC, and their execution is triggered by the arrival of packets.
+Figure 1 sketches the sPIN abstract machine model.
+Host applications define packet handlers and associate them
+with message descriptors. Packet handlers are optional: e.g.,
+by specifying either the header or completion handler and no
+payload handler, only one packet handler for the full message
+will be executed. Message descriptors, together with packet
+handlers, are installed into the NIC. Incoming packets are
+matched to message descriptors and handlers are executed on
+Handler Processing Units (HPUs). Handlers can also issue NIC
+commands and DMA transfers to/from the host memory.
+1) Architectural Specialties: The sPIN abstract machine
+model specifies a streaming execution model with microarchitectural requirements that are quite different from classical specialized packet processing engines, which normally
+constraint the type of actions that can be performed or the
+entity that can program them, and traditional compute cores.
+We now outline a set of architectural properties that a sPIN
+implementation should provide to enable fully-programmable
+high-performance packet processing.
+S1. Highly parallel. Many payload packets can be processed
+in parallel. The higher the number of HPUs, the longer the
+handlers can run without becoming a bottleneck.
+S2. Fast scheduling. Arriving packets must be scheduled
+to HPU cores while maintaining ordering requirements that
+mandate that header handlers execute before payload handlers
+that execute before completion handlers.
+S3. Fast explicit memory access. Packet processing has low
+temporal locality by definition (a packet is seen only once),
+hence scratchpad memories are better than caches.
+S4. Local handler state. Handlers can keep state across
+packets of a message as well as multiple messages. If the
+memory is partitioned, then scheduling needs to ensure that
+the state is reachable/addressable.
+S5. Low latency, full throughput. To minimize the time a
+packet stays in the NIC, the time from when the packet is seen
+by sPIN to when the handlers execute should be minimized.
+Furthermore, the sPIN unit must not obstruct line-rate.
+S6. Area and power efficiency. To lead to an easier integration of a sPIN unit in a broader range of NIC architectures.
+S7. Handler isolation. Handlers processing a message should
+not be able to access memory belonging to other messages,
+especially if they belong to different applications.
+S8. Configurability. A sPIN unit should be easily reconfigurable to be scaled to different network requirements.
+III. PSPIN
+PsPIN is a sPIN implementation designed to match the
+architecture specialties of Section II-A1. PsPIN builds on top
+of the PULP (parallel ultra-low power) platform [48], a siliconproven [23] and open [55] architectural template for scalable
+and energy-efficient processing. PULP implements the RISCV ISA [59] and organizes the processing elements in clusters:
+each cluster has a fixed number of cores (32-bit, single-issue,
+in-order) and single-cycle-accessible scratchpad memory (S3).
+The system can be scaled by adding or removing clusters (S1).
+We have implemented all hardware components of PsPIN in
+synthesizable hardware description language (HDL) code.
+A. Architecture Overview
+PsPIN has a modular architecture, where the HPUs are
+grouped into processing clusters. The HPUs are implemented
+as RISC-V cores, and each cluster is equipped with a singlecycle access scratchpad memory called L1 memory. All clusters are interconnected to each other (i.e., HPUs can access
+data in remote L1s) and to three off-cluster memories (L2): the
+packet buffer, the handler memory, and the program memory.
+Figure 2 shows an overview of how PsPIN integrates in a
+generic NIC model and its architecture. We adopt a generic
+NIC model to identify the general building blocks of a NIC
+architecture. Later, in Section III-D, we discuss how PsPIN
+can be integrated in existing NIC architectures.
+Inbound
+Engine
+Outbound
+Engine
+Network Interface
+Host Interface
+PsPIN Unit
+Command
+Unit
+L2 program
+memory
+L2 handler
+memory
+L2 packet
+buffer
+DMA engine
+(off-cluster)
+Packet
+Scheduler
+Command
+unit
+Monitoring
+& control
+L1 TCDM
+H H H H
+H H H H
+DMA
+CSCHED
+Cluster 3
+L1 TCDM
+H H H H
+H H H H
+DMA
+CSCHED
+Cluster 2
+L1 TCDM
+H H H H
+H H H H
+DMA
+CSCHED
+Cluster 1
+L1 TCDM
+H H H H
+H H H H
+DMA
+CSCHED
+Cluster 0
+Fig. 2. NIC model and PsPIN architecture overview.
+Host applications access program and handler memories to
+offload handlers code and data, respectively. The management
+of these memory regions is left to the NIC driver, which
+is in charge of exposing an interface to the applications in
+order to move code and data. The toolchain and the NIC
+driver extensions to offload handlers code and data are out
+of the scope of this work. Once both code and data for the
+handlers are offloaded, the host builds an execution context,
+
+which contains: pointers to the handler functions (header,
+payload, and completion handlers), a pointer to the allocated
+handler memory, and information on how to match packets
+that need to be processed according to this execution context.
+The execution context is offloaded to the NIC and it is used
+by the NIC inbound engine to forward packets to PsPIN.
+Receiving data. Data is received by the NIC inbound engine,
+which is normally interfaced with the host for copying it to
+host memory. In a PsPIN-NIC, the inbound engine is also
+interfaced to the PsPIN unit. The inbound engine must be able
+to distinguish packets that need to be processed by PsPIN from
+the ones taking the classical non-processing path. To make this
+distinction, it matches packets to PsPIN execution contexts
+and, if a match is found, it forwards the packet to the PsPIN
+unit. Otherwise, the packet is copied to the host as normal.
+While some networks already have the concept of packet
+matching (e.g., RDMA NICs match packets to queue pairs),
+in others this concept is missing and needs to be introduced
+to enable packet-level processing (see Section III-D).
+Packets to be processed on the NIC are copied to the L2
+packet buffer. Once the copy is complete, the NIC inbound
+sends a Handler Execution Request (HER) to PsPIN’s packet
+scheduler. The HER contains all information necessary to
+schedule a handler to process the packet, which are a pointer
+to the packet in the L2 packet buffer and an execution context.
+If the packet buffer is full, the NIC inbound engine can
+either back pressure the senders [30], send explicit congestion
+notifications [47], drop packets, or kill connections [9]. The
+exact policy to adopt depends on the network in which PsPIN
+is integrated and the choice is similar to the case where the
+host cannot consume incoming packets fast enough.
+The packet scheduler selects the processing cluster that processes the new packet. The cluster-local scheduler (CSCHED)
+is in charge of starting a DMA copy of the packets from the
+L2 packet buffer to the L1 Tightly-Coupled Data Memory
+(TCDM) and selecting an idle HPU (H) where to run handlers
+for packets that are available in L1. Once the packet processing
+completes, a notification is sent back to the NIC to let it update
+its view of the packet buffer (e.g., move the head pointer in
+case the packet buffer is managed as a ring buffer).
+Sending Data. Packet handlers, in addition to processing the
+packet data, can send data over the network or move data
+to/from host memory. To send data directly from the NIC, the
+sPIN API provides an RDMA-put operation: When a handler
+issues this operation, the PsPIN runtime translates it into a
+NIC command, which is sent to the NIC outbound engine.
+If the NIC outbound engine cannot receive new commands,
+the handler blocks waiting for it to become available again.
+The NIC outbound can send data from either the L2 packet
+memory, the L2 handler memory, or L1 memories, or it can
+specify a host memory address as data source, behaving as
+a host-issued command. To move data to/from the host, the
+handlers can issue DMA operations: These operations translate
+to commands that are forwarded to the off-cluster DMA
+engine, which writes data to host memory through PCIe.
+Task
+dispatcher
+Command unit
+HER
+1 2 3
+4
+5
+6
+task task
+completion notification
+cmd
+resp cmd resp cmd resp
+cmd
+resp
+MPQ
+engine
+7
+completion
+notification
+HostDirect
+Cluster 1
+(8 HPUs)
+Cluster 2
+(8 HPUs)
+Cluster 3
+(8 HPUs)
+Cluster 0
+(8 HPUs) Packet scheduler
+DMA engine
+(off-cluster)
+DMA engine
+(off-cluster)
+NIC
+outbound
+engine
+NIC
+inbound
+engine
+Fig. 3. PsPIN control path overview.
+B. Control path
+Figure 3 shows the PsPIN control path, which includes:
+1 receiving HERs from the NIC inbound engine, 2 scheduling packets, handling commands from the handlers, and
+7 sending completion notifications back to the NIC.
+1) Inter-cluster packet scheduling: PsPIN is informed of
+new packets to process by receiving HERs from the NIC
+inbound engine 1 . The HER is received by the packet
+scheduler, which is composed of the Message Processing
+Queue (MPQ) engine and the task dispatcher. The MPQ engine handles scheduling dependencies between packets. These
+dependencies are defined by the sPIN programming model:
+‚ the header handler is executed on the first packet of a message and no payload handler can start before its completion;
+‚ the completion handler is executed after the last packet of a
+message is received and all payload handlers are completed.
+A message is a sequence of packets mapped to an MPQ and
+matched to an execution context. We let the NIC define the
+packets that are part of a message or flow. Once the last packet
+of a message arrives, the NIC marks the corresponding HER
+with an end-of-message flag, letting PsPIN run the completion
+handler when all other handlers of that MPQ complete.
+Task dispatcher. The task dispatcher selects the processing
+cluster where to forward a task for its execution 3 . We
+introduce a dedicated hardware unit for dispatching packets
+to clusters. A software solution would not provide enough
+bandwidth to schedule packets at line rate. If we consider a
+target bandwidth of 400 Gbit/s and 64 B packets, we get one
+packet every 1.28 ns, which requires to schedule a packet every
+1.28 cycles on average. A cluster can accept new tasks when
+it has enough space in its L1 to store the packet data. We use
+the message ID, which is included in the HER, to determine
+the home cluster of a message: the task dispatcher tries to
+schedule packets to their home clusters. If the home cluster
+cannot accept it, then the least loaded cluster is selected. The
+task dispatcher blocks if there are no available clusters.
+
+ 
+      
+1
+10
+100
+1000
+10000
+4 16 64 256 1024 4096
+Data size (bytes)
+Cycles
+Single core latency
+         
+1
+10
+100
+4 16 64 256 1024 4096
+Bytes
+Througput (Gbit/s)
+Single core throughput
+ Local L1 (load/store) L2 (DMA) Remote L1 or L2 (load/store)
+2 cycles (1 load, 1 store)
+21 cycles
+~23 K cycles
+~2.5 K cycles
+~89 cycles 5.6 Gbit/s (DMA)
+1.3 Gbit/s (remote access)
+14.9 Gbit/s
+342 Gbit/s
+11.9 Gbit/s
+Fig. 4. Data copy latency and bandwidth.
+The rationale behind the concept of home cluster is given by
+the fact that handlers processing packets of the same message
+
+can share L1 memory, hence scheduling them on the same
+cluster avoids remote L1 accesses. Figure 4 shows the memory
+latency and bandwidth experienced by a single core when
+copying data from local or remote memories using different
+access types (i.e., load/stores, DMA). As each core can execute
+one single-word memory access at a time, the latency for
+accessing a chunk of data increases linearly with its size. The
+DMA engine, on the other hand, moves data in bursts, so
+multiple words can be “in-flight” concurrently.
+Handler execution and completion notification. Within a
+processing cluster, task execution requests are handled by the
+cluster-local scheduler. We describe the details of intra-cluster
+handler scheduling in Section III-B2. During their execution,
+handlers can issue commands that are handled by a command
+unit 4 . We define three types of commands to interact with
+the NIC outbound and with the off-cluster DMA engine:
+‚ NIC commands to send data over the network: a handler
+can forward the packet or generate new ones.
+‚ DMA commands to move data to/from host memory. The
+host virtual addresses can be stored in application-defined
+data structures in handler memory.
+‚ HostDirect commands are similar to DMA commands but,
+instead of a source address, they carry 32 B immediate data
+that is written directly to the host memory address.
+Command responses 5 are used to inform the handlers of
+the completion of the issued commands or error conditions.
+Once a handler terminates and there are no in-flight commands for which a response is still pending, a completion
+notification is generated 6 . The MPQ engine uses this
+notification to track the state of message queues (e.g., mark
+a queue as ready when the header handler completes). The
+notification is also forwarded to the NIC inbound engine,
+which uses it to free sections in the L2 packet buffer.
+CSCHED
+DMA engine
+HPU driver HPU driver
+L1 TCDM (1 MiB, 64 banks, word-interleaved)
+Packet buffer: 32 KiB; Runtime: 8 KiB; Scratchpad: 984 KiB.
+HPU driver
+RISC-V
+HPU 7
+RISC-V
+HPU 1
+RISC-V
+HPU 0
+TCDM interconnect
+FIFO
+new task
+(from task dispatcher) command response
+(from command unit) completion notification (to MPQ engine)
+command
+(to command
+unit) …
+…
+…
+RR arbiter
+RR arbiter
+Fig. 5. PsPIN processing cluster.
+2) Intra-cluster handler scheduling: Tasks are received by
+the cluster-local scheduler (CSCHED) that is in charge of
+scheduling them on the HPUs. For each new task, it starts
+a DMA transfer of the packet data from L2 to L1. Moving
+the packet data to L1 enables single-cycle access from the
+cores. Once a transfer completes, the corresponding task is
+popped from the queue and scheduled to an idle HPU. At 400
+Gbit/s, a cluster receives tasks for 64 B packets every 5.12
+ns on average (1.28 ns ¨ 4). This time budget is not sufficient
+to handle intra-cluster scheduling in software. For comparison,
+issuing a DMA command already takes 6 cycles. Furthermore,
+having the scheduling algorithm running on the HPUs, e.g.,
+in a cooperative scheduling approach, would require to run
+it in a higher privilege mode in order to guarantee handlers
+isolation, adding additional overheads. Hence, we opted for a
+hardware intra-cluster scheduler, which also allowed us to have
+a lighter runtime running on the HPUs. HPUs are interfaced
+with a memory-mapped device, the HPU driver, from which
+they can read information about the task to execute.
+The PsPIN runtime running on the HPU consists of a loop
+executing the following steps: (1) Read the handler function
+pointer from the HPU driver. If the HPU driver has no
+task/handler to execute, it stops the HPUs by clock-gating
+it. When a task arrives, the HPU is enabled and the load
+completes. (2) Prepare the handler arguments (e.g., packet
+memory pointer). (3) Call the handler function. (4) Write to a
+doorbell memory location in the HPU driver to inform it that
+the handler execution is completed. The HPU driver sends a
+completion notification as soon as it detects that there are no
+in-flight commands issued by the completed task. The HPU
+driver can buffer a completed task for which the completion
+notification cannot be sent and start processing a new one.
+Since multiple HPU drivers can send feedback and issue
+commands at the same time, we use round-robin arbiters to
+select, at every cycle, an HPU that can send a feedback and
+one that can issue a command. Figure 5 shows an overview
+of a PsPIN processing cluster. The figure shows only the
+connections relevant to the scheduling processes and to the
+handling of handler commands. In reality, the HPUs are also
+interfaced to the cluster DMA engine and can issue arbitrary
+DMA transfers from/to the accessible L2 handler memory.
+Memory accesses and protection. Handlers processing
+packets matched to the same execution context share the
+L2 handler memory region that has been allocated by the
+application when defining the execution context. Additionally,
+each message shares a statically allocated scratchpad area in
+the L1 of the home cluster. In particular, L1 memories, which
+are 1 MiB each in our configuration, contain: the packet buffer
+(32 KiB), the runtime data structure (e.g., HPU stacks, 8 KiB),
+the message scratchpads (984 KiB). Scratchpads are allocated
+through the NIC driver and associated with execution contexts.
+To protect against illegal memory accesses and guarantee
+handler isolation (S7), the HPU driver configures the RISC-V
+Physical Memory Protection (PMP) unit [58] for each task,
+allowing the core to access only a subset of the address
+space (e.g., handler code, packet memory, L1 scratchpad).
+The handlers are always run in user mode. In case of a
+memory access violation or any other exception, an interrupt
+is generated and handled by the PsPIN runtime. The exception
+handling consists of resetting the environment (e.g., stack
+pointer) for the next handler execution and informing the HPU
+driver of the error condition. The HPU driver will then send
+a command to the HostDirect unit to write the error condition
+to the execution context descriptor in host memory. A failed
+handler leads to the release of the occupied resources.
+3) Monitoring and control: While processing packets on
+the NIC, there are two scenarios that must be prevented to
+ensure correct operation: (1) Packets of a message stop coming
+and the end-of-message is not received. This can be due to
+
+0
+500
+1000
+64 128 256 512 1024
+Packet size (bytes)
+Max handler time (ns)
+0
+100
+200
+300
+400
+0 500 1000 1500 2000
+Handler duration (ns)
+Throughput (Gbit/s)
+200 Gbit/s
+400 Gbit/s
+400 Gbit/s
+200 Gbit/s
+64 B
+512 B 1024 B
+1 ns = 1 cycle @1GHz
+Fig. 6. Relation between handlers execution times and line rate.
+factors such as network failure, network congestion, or bugs
+in applications or protocols. (2) Slow handlers that cannot
+process packets at line rate. To detect case (1), we use a
+pseudo-LRU [27] solution on active MPQs (i.e., MPQs which
+are receiving packets). Every time an MPQ is accessed (i.e.,
+packet pushed to it), it is moved to the back of the LRU list.
+If the candidate victim does not receive packets for more than
+a threshold specified in the execution context of the message
+that activated it, the MPQ is reset. This event is signaled to
+the host through the execution context descriptor. Case (2) is
+detected by the HPU drivers themselves by using a watchdog
+timer that generates an interrupt on the HPU and causes the
+runtime to reset it. The timer is configured according to a
+threshold specified in the execution context either by the NIC
+driver or the application itself. This case is handled similarly
+to memory access violations by notifying the host of the error
+condition through the execution context descriptor.
+To understand the time budget available to the handlers,
+Figure 6 shows the relation between handlers execution time
+and line rate. We assume a PsPIN configuration with 32 HPUs.
+On the left, it shows the maximum duration handlers should
+have to process packets at line rate for different packet sizes,
+in case of 200 Gbit/s and 400 Gbit/s networks. On the right, it
+shows how the processing throughput is affected by handlers
+duration for different packet sizes and network speeds.
+C. Data path
+We now discuss how data flows within PsPIN, explaining
+the design choices made to guarantee optimal bandwidth. We
+equip PsPIN with three interconnects: the NIC-Host interconnect, which interfaces the NIC and the host to PsPIN
+memories; the DMA interconnect, which interfaces the clusterlocal DMA engines to both L2 packet buffer and handler
+memories; and the processing-elements (PE) interconnect,
+which allows HPUs to read from either L2 memories or remote
+L1s. Both NIC-Host and DMA interconnect have wide data
+ports (512 bit), while the PE interconnect is designed for finer
+granularity accesses (32 bit). Since PsPIN is clocked at 1 GHz,
+the offered bandwidth of these interconnects is 512 Gbit/s
+and 32 Gbit/s, respectively. PsPIN’s on-chip interconnects,
+memory controllers, and DMA engine are based on [35].
+Figure 7 shows an overview of the PsPIN memories, interconnects, and units that can move data (in gray if they are
+interfaced to but not within PsPIN). We identify three critical
+data flows that require full bandwidth in order to not obstruct
+line rate and optimize PsPIN data paths to achieve this goal.
+‚ Flow 1: from NIC inbound to L2 packet buffer to clusters’
+L1s. The NIC inbound writes packets to the L2 packet
+buffer at line rate and, in the worst case, this data is always
+copied to the L1s of the processing clusters by their DMA
+Cluster 0 Cluster 1 Cluster 2 Cluster 3
+L2
+program
+memory
+L2
+handler
+memory
+L2 packet
+memory
+NIC
+outbound
+NIC
+inbound
+DMA
+(off-cluster)
+Host mst
+(AXI2PCI)
+Host
+Direct
+mux
+IOMMU
+Host slv
+(AXI2PCI)
+mux mux mux
+DMA interconnect
+NHI interconnect
+PE interconnect
+AXI4 512 bit
+AXI4 32 bit
+DMA TCDM DMA TCDM DMA TCDM DMA TCDM
+Fig. 7. PsPIN data path overview. Bold arrows represent AXI4 connections
+with 512 bit data width. Thin arrows represent 32 bit AXI4 connections.
+Arrow heads indicate AXI4 “slave” ports, while tails are for “master” ports.
+engines, before starting the handlers. The main bottleneck
+of this data flow can be the L2 packet buffer, which is
+accessed in both write and read directions.
+‚ Flow 2: from L2/L1 to host memory. Assuming all handlers
+copy the data to host, we have a steady flow of data
+towards the host memory. The data source is specified in
+the command issued by the handlers and can be either the
+L2 packet buffer, the L2 handler memory, or the clusters’
+L1s. This data is moved by the off-cluster DMA engine,
+which interfaces to an IOMMU to translate the virtual
+addresses specified in the handler command to physical
+ones. The IOMMU is updated by the NIC driver when the
+host registers memory that can be accessed by the NIC.
+‚ Flow 3: from L2/L1 to NIC outbound. Similar to flow 2,
+but the data is moved towards the NIC outbound engine.
+We assume the NIC outbound has its own DMA engine,
+which it uses to read data.
+All the identified critical flows can involve the L2 packet
+buffer. To avoid being a bottleneck, this memory must provide
+full bandwidth to the NIC inbound engine and to the clusterlocal DMA engines (flow 1), plus it must provide full bandwidth to the system composed of the NIC outbound engine and
+the off-cluster DMA (flow 2 + flow 3), letting them reach up
+to 256 Gbit/s read-bandwidth each under full load. To achieve
+this goal, we implement the L2 packet buffer as 4 MiB, twoports full-duplex, multi-banked (32 banks) word-interleaved
+memory. With 512 bit words, the L2 packet buffer is suitable
+more for wide accesses than single (32 bit) load/store accesses
+from HPUs. In fact, if handlers are going to frequently access
+packets, then their execution context can be configured to let
+PsPIN move packets to L1, before the handlers start. The
+maximum bandwidth that the L2 packet buffer can sustain
+is 512 Gbit/s per port, full duplex. This bandwidth can be
+achieved in case there are no bank conflicts. One port of the L2
+packet buffer is accessible through the NIC-Host interconnect,
+where the NIC inbound engine is connected. Only the NIC
+inbound engine can write through this port, hence it gets the
+full write bandwidth. Other units connected to the NIC-Host
+interconnect that can access the L2 packet buffer, namely
+the NIC outbound engine and the off-cluster DMA engine,
+share the read bandwidth. The second port is connected to
+both DMA and PE interconnects. This configuration allows
+supporting a maximum line rate of 512 Gbit/s, making PsPIN
+suitable for up to 400 Gbit/s networks.
+
+L2 handler and program memory. The L2 handler memory
+is less bandwidth-critical than the L2 packet buffer, but not less
+important. In the current configuration, the handler memory
+is 4 MiB. The sPIN programming model allows the host
+to access memory regions on the NIC to, e.g., write data
+needed by the handlers or read data back when a message is
+fully processed. Host applications can allocate memory regions
+in this memory through the NIC driver, which manages the
+allocation state. The host can copy data in the handler memory
+before packets triggering handlers using it start arriving. For
+example, Di Girolamo et al. [20] use this memory to store
+information about MPI datatypes, deploying general handlers
+that process the packets according to the memory layout
+described in the handler memory. Differently from the packet
+buffer, we foresee that the handler memory can be targeted
+more frequently by the HPUs with 32-bit word accesses,
+hence we adopt 64 bit-wide banks to reduce the probability of
+bank conflicts. Similarly, to the L2 packet buffer, the handler
+memory can be involved by flows 2 and 3 and offers a
+maximum bandwidth of 512 Gbit/s per port, full duplex.
+The program memory (32 KiB) stores handlers code. It is
+accessed by the host to offload code and by the PE interconnect
+to refill the per-cluster 4 KiB instruction cache. Since this
+memory is not on the critical path, we implement it as singleport, half-duplex, with 64 Gbit/s bandwidth. The per-cluster
+instruction cache is 4-way set associative with 8 ports. The
+concept of the home cluster, which tries to schedule packets
+of the same message (i.e., same handlers’ code) to the same
+cluster, helps to reduce instruction cache pollution.
+D. NIC integration
+We described PsPIN within the context of the NIC model
+discussed in Section III-A but, how to integrate a PsPIN unit
+in existing networks? To answer this question, we identify a set
+of NIC capabilities, some of which are required for integrating
+PsPIN, and others that are optional but can provide a richer
+handler semantic. The required capabilities are:
+Message/flow matching. Packet handlers are defined per
+message/flow on the receiver side. The NIC must match a
+packet to a message/flow to identify the handler(s) to execute.
+We do not explicitly define messages or flows because this
+depends on the network where PsPIN is integrated into. For
+PsPIN, a message or flow is a sequence of packets targeting the
+same message processing queue (MPQ, see Section III-B3).
+The feedback channel to the NIC inbound engine is used
+to communicate when an MPQ becomes idle and can be
+remapped to a new NIC-defined message or flow.
+Header first. The first packet that is processed by PsPIN
+must carry the information characterizing the message. This
+requirement can be relaxed if packets carry information to
+identify a message or flow (e.g., TCP, UDP).
+NICs can provide additional capabilities that can (1) extend
+the functionalities that the handlers have access to and (2) let
+the applications make stronger assumptions on the network
+behavior. Applications can query the NIC capabilities, potentially providing different handlers depending on the available
+capabilities. One such capability is reliability. With a reliable
+network layer, PsPIN is guaranteed to receive all packets of
+a message and to not receive duplicated packets. With this
+capability, applications can employ non-idempotent handlers.
+Otherwise, the handlers have to take into account that, e.g.,
+they can be executed more than once on the same packet.
+1) Match-action tables: NICs providing match-action table
+abstraction [44], [32], [13] are an ideal candidate for a PsPIN
+integration. With this abstraction, users can install packet
+parsing rules that lead to specific actions. To integrate PsPIN,
+a new action should be made available that has the effect of
+forwarding the matched packet to the PsPIN unit, together with
+an execution context that is associated with the match-action
+entry. This solution enables applications to define their own
+concept of message or flow, providing the greatest flexibility.
+For example, applications can define a flow as a TCP stream
+(i.e., by matching on both IP and TCP headers) or as all
+UDP packets targeting a specific port. This solution would
+not be affected by ossification because the way flows are
+defined can be programmed. For example, applications using
+HTTP/2 [12] that multiplex multiple streams within the same
+long-lived TCP connection can define a PsPIN message/flow
+as a single stream (i.e., matching on the HTTP/2 header).
+Similarly, transport protocols like QUIC [31] can match PsPIN
+messages/flows on single streams of long-lived connections.
+2) RDMA-Capable Networks: Remote Direct Memory Access (RDMA) networks let applications expose memory regions over the network, enabling remote processes to access
+them for reading or writing data. When using RDMA, applications register memory regions on the NIC, so that its
+IOMMU can translate virtual to physical addresses. Whenever
+a remote process wants to, e.g., perform a write operation, it
+has to specify where in the target memory the data has to be
+written. This memory location can be directly specified by its
+target virtual memory address in the write request [30], [6],
+or indirectly [9]. In the indirect case, the application not only
+registers the memory but also specifies a receive descriptor that
+can be matched by incoming remote memory access requests:
+e.g., in Portals 4, these descriptors are named list entries or
+matched list entries according to whether they are associated
+with a set of matching bits or not.
+In general, RDMA NICs already perform the packet matching on the NIC. In the direct case, the NIC matches the
+virtual address carried by the request to a physical address.
+In the indirect case, the NIC matches the packet to the receive
+descriptor, to derive the target memory location. Hence, the
+required message matching capability is provided; the question
+is: to which object do we attach the PsPIN handlers? Table II
+reports different RDMA-capable networks and objects where
+the PsPIN handlers can be attached. For example, associating
+handlers to the InfiniBand queue pair means that all packets
+targeting that queue pair will be processed by PsPIN.
+The second required capability is header first. For InfiniBand, this is given by the in-order delivery that the network
+already provides. For other networks that cannot guarantee
+that, the NIC must be able to buffer or discard payloads
+
+Network Interface Handlers Descriptor
+InfiniBand [30], RoCE [53] ibverbs [11] Queue Pair
+Bull BXI [19], Cray Slingshot [50] Portals 4[9] Match List Entry
+Cray Gemini [7], Cray Aries [6] uGNI, DMAPP [5] Memory Handle
+TABLE II
+RDMA NETWORKS AND SPIN HANDLERS ATTACH POINTS.
+packets arriving before the header packet. RDMA-capable
+networks already implement reliability at the network layer,
+hence applications can adopt non-idempotent handlers.
+E. NIC driver
+To expose packet-processing functionalities, the NIC driver
+needs to implement the sPIN interface described by Hoefler
+et al. [28]. In particular, the driver manages the NIC memory
+by letting applications allocate memory regions for data (e.g.,
+handler memory) and code (e.g., program memory). The
+PsPIN unit is not involved in applications memory management, which is delegated to the software layer. A detailed
+description of a NIC driver is out of the scope of this work.
+F. Special cases and exceptions
+Can PsPIN deadlock if no processing cluster can accept new
+tasks? In this case, the task dispatcher will block, waiting for
+a queue to become available again and this will create backpressure towards the NIC inbound engine. The system cannot
+deadlock because the processing clusters can keep running
+since they are not dependent on new HERs to arrive. The
+header-before-payloads dependency does not cause problems
+because if payload handlers are waiting for the header, then
+it is guaranteed that the header is being already processed
+(because of the header-first requisite and the in-order scheduling guaranteed by the MPQ engine on a per-message basis).
+If badly-written handlers deadlock, the HPU driver watchdog
+will trigger causing the handler termination.
+What if a message is not fully delivered? The completion
+feedback will not be triggered causing resources (e.g., message
+state in the MPQ engine) to not be freed. PsPIN can detect
+this case and force resource release (see Section III-B3).
+How is encrypted traffic handled? Handlers are responsible for
+the decryption of incoming data. We foresee the possibility
+of supporting user handlers with libraries providing common
+functions like crypto primitives. Given the modular design of
+PsPIN, a per-cluster crypto engine can be deployed to enable hardware-accelerated crypto primitives (e.g., AES-EBC).
+While a crypto engine for PULP (hence PsPIN-compatible)
+already exist [26], we consider its evaluation as future work.
+IV. EVALUATION
+Our evaluation aims to answer the following questions: (1)
+How big is PsPIN in terms of post-synthesis area and how does
+that scale with the number of HPUs? (2) In which cases can
+PsPIN sustain line rate? (3) Does the choice of implementing
+sPIN on top of a RISC-V based architecture with a flat noncoherent memory hierarchy pay off? What are the trade-offs
+of choosing more complex architectures for sPIN?
+Simulation environment. We simulate PsPIN in a cycleaccurate testbench comprised of SystemVerilog modules.
+We use synthesizable modules for all PsPIN components.
+We develop simulation-only modules modeling the NIC
+inbound and outbound engines. Our inbound engine takes a
+trace of packets as input and injects them in PsPIN at a given
+rate. The outbound engine reads data from PsPIN according
+to the received commands, generating memory pressure. The
+host interface is emulated with a PCIe model (PCIe 5.0, 16
+lanes), implemented as a fixed-rate data sink. Unless otherwise
+specified, we do not limit the packet generator injection rate in
+order to test the maximum throughput PsPIN can offer. Packet
+handlers are compiled with the PULP SDK, which contains
+an extended version of GCC 7.1.1 (riscv32). All handlers are
+compiled with full optimizations on (-O3 -flto).
+A. Hardware Synthesis and Power
+We synthesized PsPIN in GlobalFoundries’ 22 nm fully
+depleted silicon on insulator (FDSOI) technology using Synopsys DesignCompiler 2019.12, and we were able to close the
+timing of the system at 1 GHz. We employ Invecas’ memory
+compiler to generate SRAM macros that are tailored to the
+architectural requirements. Area and power measurements
+are summarized in Table III. Including memories, the entire
+accelerator has a complexity on the order of 95 MGE.1 Of
+the overall area, the four clusters (including their L1 memory
+and the intra-cluster scheduler) occupy 43 %, the L2 memory
+51 %, the inter-cluster scheduler 3 %, and the inter-cluster
+interconnect and L2 memory controllers another 3 %. The L2
+memory macros occupy a total area of 9.48 mm2. Depending
+on the NIC architecture where PsPIN is integrated into, the L2
+packet buffer could be mapped to the NIC packet buffer, saving
+memory area. The area of the clusters is dominated by the L1
+memory macros, which take 1.65 mm2 per cluster. The instruction cache and the cluster interconnect have a complexity of
+ca. 700 kGE per cluster, which corresponds to ca. 0.2 mm2
+at 70 % placement density. Each core has a complexity of
+ca. 50 kGE, which corresponds to ca. 0.014 mm2. The total
+cluster area is ca. 1.99 mm2. The total area of our architecture
+is ca. 18.5 mm2 (S6). For comparison, from [37], [45] it can
+be inferred that a Mellanox BlueField SoC, scaled to 16 ARM
+A72 cores (22 nm), would occupy ca. 51 mm2.
+Component Area (mm2) Power (W)
+Unit Total Perc. Unit Total Perc.
+PsPIN 18.47 18.47 100.0% 6.08 6.08 100.0%
+ë L2 memories (ˆ1) 9.48 9.48 51.3% 1.09 1.10 18.1%
+ë Interconnect (ˆ1) 0.57 0.57 3.0% 0.71 0.71 11.7%
+ë Cluster (ˆ4) 1.99 7.95 43.0% 0.94 3.77 62.0%
+ë L1 (ˆ1) 1.65 1.65 82.9% 0.52 0.52 55.3%
+ë Core (ˆ8) 0.01 0.08 4.0% 0.02 0.14 15.3%
+ë Instr. cache (ˆ1) 0.08 0.08 4.0% 0.14 0.14 15.1%
+ë Interconnect (ˆ1) 0.06 0.06 3.0% 0.11 0.11 11.3%
+TABLE III
+AREA AND ENERGY OF MAIN PSPIN COMPONENTS. PERCENTAGES ARE
+RELATIVE TO THE PARENT COMPONENT.
+We derive a worst-case upper bound for the power consumption of our architecture by assuming 100 % toggle rate
+on all logic cells and 50/50 % read/write activity at each
+memory macro. The overall power envelope is 6.1 W, 99.8 %
+1One gate equivalent (GE) equals 0.199 μm2 in GF 22 nm FDSOI.
+
+of which is dynamic power (S6). The four clusters consume
+62 % of the total power, ca. 3.8 W. Within each cluster, the
+L1 memory consumes ca. 55 % of the power. The L2 memory
+consumes 18 % of the total power, ca. 1.1 W. The inter-cluster
+scheduler consumes 8 % of the total power, ca. 0.5 W. The
+inter-cluster interconnect and L2 memory controllers consume
+11.7 %, ca. 0.7 W. As our architecture offers 32 HPUs, the
+power normalized to the number of HPUs is 190 mW.
+B. Microbenchmarks
+We now investigate the performance characteristics of
+PsPIN: we first discuss the latencies experienced by a packet
+when being processed by PsPIN. Then, we study the maximum
+packet processing throughput that PsPIN can achieve and how
+the complexity of the packet handlers can affect it.
+1) Packet Latency: We define the packet latency as the
+time that elapses from when PsPIN receives an HER from
+the NIC inbound engine to when the completion notification
+for that packet is sent back to it. It does not include the time
+needed by the NIC inbound engine to write the packet to the
+L2 packet buffer. The measurements of this section are taken
+in an unloaded system by instrumenting the cycle-accurate
+simulation. Overall, we observe latencies ranging from 26 ns
+for 64 B packets to 40 ns for 1024 B ones. In particular, a
+task execution request takes 3 ns to arrive to the cluster-local
+scheduler (i.e., CSCHED in Figure 5). At that point, the packet
+is copied to the cluster L1 by the cluster-local DMA engine.
+This transfer has latencies varying from 12 ns for 64 B packets
+to 26 ns for 1024 B packets. Once the data reaches L1, the
+task is assigned to an HPU driver in a single cycle. The HPU
+runtime takes 7 ns to invoke the handler: this time is used for
+reading the handler function pointer, setting up the handler’s
+arguments, and making the jump. Once the handler completes,
+the runtime makes a single-cycle store to the HPU driver to
+inform it of the completion. The completion notification takes
+1 ns to get back to the NIC inbound engine, but it can be
+delayed of additional 6 ns and 2 ns in case of the round-robin
+arbiters prioritize other HPUs and clusters, respectively.
+2) Packet processing throughput: In Section III-C we describe three critical data flows that can run over a PsPIN unit.
+Flow 1 (inbound flow) moves data from the NIC inbound
+engine to the L2 packet memory and, from there, to the L1
+memory of the processing cluster where the packet has been
+assigned. Moving packet data to L1 memories is not always
+needed. For example, a handler might only use the packet
+header (e.g., filtering), the packet header plus a small part
+of the packet payload (e.g., handlers looking at applicationspecific headers), or they might not need packet data at all
+(e.g., packet counting). Applications specify the number of
+bytes that handlers need for each packet. Flows 2 and 3
+move data from PsPIN to the outbound interfaces, namely
+the NIC outbound (outbound NIC flow) and the host interface
+through PCIe (outbound host flow). They are generated by the
+handlers, which can issue commands to move data to the NIC
+or to the host. Handlers do not necessarily issue commands
+as they can directly consume data and communicate results to
+0
+100
+200
+300
+400
+500
+8 16 32 64 128 256 512 102420484096
+# instructions/handler
+Throughput (Gbit/s)
+Handler complexity
+0
+10
+20
+30
+8 1024 16 32 4096 64 128 256 512 2048
+# instructions/handler
+Max # HPUs
+Utilization
+64 B
+64 B
+512 B
+512 B
+1024 B
+1024 B
+theoretical
+misaligned
+(size+1B)
+Fig. 8. PsPIN maximum throughput.
+the host once the message processing finishes: e.g., handlers
+performing data reductions on the NIC, letting the completion
+handler write data to the host.
+Inbound flow. We measure the throughput PsPIN can sustain
+for the inbound flow. We measure it as function of the
+frequency of the completion notifications received by the MPQ
+engine and the packet size. Figure 8 (left) shows the throughput for handlers executing different number of instructions (xaxis) and for different packet sizes (i.e., 64 B, 512 B, and 1024
+B packets). We also include: (1) the maximum throughput
+that the PsPIN can achieve: this is the minimum between the
+interconnect bandwidth and the cumulative bandwidth offered
+by the 32 HPUs when executing x instructions; and (2) the
+throughput for misaligned packets (i.e., packet size + 1 byte).
+We let each handler execute x integer arithmetic instructions,
+each completed in a single cycle. The x-axis can also be
+read as handler duration in nanoseconds. The data shows how
+PsPIN can schedule aligned packets at the maximum available bandwidth and the HPU runtime introduces minimum
+overhead (i.e., 8 cycles per packet, see Section IV-B1).
+Figure 8 (right) shows the maximum number of HPUs that
+are utilized when running handlers executing x instructions,
+for different packet sizes. PsPIN can schedule one 64 B packet
+per cycle. Even with empty handlers, we need 19 HPUs to
+process them because of the overhead necessary to invoke
+the handlers. With bigger packets, the time budget increases:
+handlers with small instruction counts can process 512 B and
+1024 B packets at full throughput with a single HPU.
+Inbound + outbound flows. We now study the throughput
+offered when packets are received and sent out of PsPIN. The
+execution context is configured to move the full packet to
+L1. For testing the outbound NIC flow, we develop handlers
+performing a UDP ping-pong: they swap source and destination IPs and UDP ports, then issue a NIC command to
+send it back over the network. Overall, this handler consists
+of 27 instructions (20 for the swap and 7 for the issuing the
+command). The handlers for the outbound host flow only issue
+a DMA command to move the packet to the host, without
+modifying it. Figure 9 shows both the cases in which the
+packet is sent from L1 and from the L2 packet buffer.
+0
+200
+400
+64 128 256 512 1024
+Packet size (B)
+Throghput (Gbit/s)
+Outbound NIC flow
+0
+200
+400
+64 128 256 512 1024
+Packet size (B)
+Throghput (Gbit/s)
+Outbound host flow
+data from L1
+data from L2
+data from L1
+data from L2
+Fig. 9. Moving data out of PsPIN.
+The L2 packet buffer, with its 32 512-bit-wide banks,
+is optimized for wide accesses, as the ones performed by
+the DMA engines of the involved units. The L1 TCDM is
+
+0
+100
+200
+300
+400
+500
+ filtering histogram kvstore reduce strided_ddt
+Gbit/s
+64 B
+512 B 1024 B
+aggregate
+Fig. 10. Handler throughput on PsPIN for different packet sizes.
+optimized for serving 32-bit word accesses from the HPUs
+and organized in 64 32-bit-wide banks. This difference shows
+up in the throughput and it is caused by a higher number of
+bank conflicts in the data-from-L1 case: with 64 B packets,
+both the outbound flows hardly reach 200 Gbit/s when reading
+from L1, while 400 Gbit/s is reached when reading data from
+the L2. For bigger packets (ě512 B), the time budget is large
+enough to allow also the L1 case to reach full bandwidth.
+C. Handlers Characterization
+To evaluate the performance of PsPIN for realistic packet
+handlers, we select a set of use cases ranging from packet
+steering to full message processing. We first show the throughput they can achieve on PsPIN, then we measure the percore throughput achievable on PsPIN RISC-V and compare
+it to the one achieved on more complex and powerful, but
+bigger, architectures such as x86 and ARM. This comparison
+aims to analyze costs and benefits of employing more complex
+architectures for packet processing and to motivate our design
+choice of employing simple RISC-V cores as HPUs. We
+simulate a network with zero inter-packet-delay, in order to
+not make our results network-bound and show the maximum
+achievable throughput. The considered use cases are:
+Data reduction. Reducing data of multiple messages is a
+core operation of collective reductions [38] and one-sided
+accumulations [29]. Given n messages, each carrying m data
+items of type t, this operation computes an array of m entries
+of type t where entry i is the reduction of the i-th data item
+across the n messages. We benchmark an instance of this use
+case (named reduce) with 512 packet, each carrying 512 32-
+bit integers. Payload handlers accumulate data in L1 using the
+sum operator. The completion handler informs the host that
+the result is available with a a direct host write command.
+Data aggregation. Utilized in, e.g., data-mining applications [34], this operation consists in accumulating the data
+items carried by a message. This benchmark (aggregate) uses
+a 1 MiB message of 32-bit integers that are summed up in L1.
+The completion handler copies the aggregate to host memory.
+Packet filtering/rewriting. Typical of intrusion-detection,
+traffic monitoring, and packet sniffing systems [18]. For each
+packet, it queries an application-defined hash table (in L2) by
+using the source IP address (32-bit) as key. If a match is found,
+the UDP destination port is overwritten with the matched value
+and written to host memory. This benchmark, named filtering,
+uses 512 messages and a hash table of 65,536 entries.
+Key-Value cache. A key-value store (kvstore) cache on the
+NIC. The cache is stored in L2 and is implemented as a setassociative cache to limit the L2 accesses needed to maintain
+the cache (e.g., eviction victims are chosen within a row).
+0
+50
+100
+150
+200
+aggregate
+filtering
+histogram
+kvstore
+reduce
+strided_ddt
+Gbit/s
+Percore throughput
+0
+50
+100
+150
+200
+aggregate
+filtering
+histogram
+kvstore
+reduce
+strided_ddt
+Gbit/s/mm²
+Percore throughput/area
+PsPIN
+zynq
+ault
+4563 3261
+Fig. 11. Per-core handler throughput: ARM vs x86 vs RISC-V.
+We generate a YCSB [17] workload of 1,000 requests (50/50
+read/write ratio, θ=1.1). The cache associativity is set to 4 and
+the total number of entries is set to 500. The set is determined
+as the key (32-bit integer) modulo the number of sets.
+Scatter. This use case (strided ddt) models data transfers that
+are copied to the destination memory according to a receiverspecified memory layout [38], [20]. This benchmark sends a 1
+MiB message that is copied to host memory in blocks of 256
+bytes and with a stride of 512 bytes. The layout description
+(i.e., block size and stride) is stored in L2.
+Histogram. Given a set of messages, it summarizes data
+items by value. This application is common in distributed join
+algorithms [10]. In our instance, we receive 512 messages,
+each carrying 512 integers randomly generated in the r0, 1024s
+interval. The handlers count how many data items per value
+have been received and finally copy the histogram to the host.
+1) Handler Throughput: Figure 10 shows the throughput
+achieved by the considered handlers on PsPIN for different
+packet sizes. We observe that PsPIN achieves 400 Gbit/s for
+filtering, kvstore, and strided ddt already for 512 B packets. In the other cases, handlers are compute-intensive, and
+they operate on every 32-bit word of each received packet.
+Nonetheless, PsPIN achieves more than 200 Gbit/s, which the
+state-of-the-art network speed, from 512 B packets. Thanks to
+the modularity of this architecture (S8), a scenario where 400
+Gbit/s must be sustained also for this type of workload can be
+satisfied by doubling the number of processing clusters.
+2) RISC-V vs x86 vs ARM: This set of experiments outlines
+the benefits of adopting a simple, RISC-V-based architecture
+over more powerful and complex ones, such as x86 and ARM.
+We select two representative architectures, showing not only
+the effects of different CPU types but also of different memory
+subsystem configurations (e.g., caches vs scratchpads):
+‚ ault 18-core 64-bit 2-way SMT, 4-way superscalar, out-oforder-execution Intel Skylake Xeon Gold 6154 (3 GHz).
+‚ zynq Xilinx Zynq ZU9EG MPSoC featuring a quad-core
+ARM Cortex-A53 (64-bit 2-way superscalar at 1.2 GHz).
+To run on these architectures, we develop a benchmark that
+loads a predefined list of packets in memory, spawns a set
+of worker threads, and statically assigns the packets to the
+workers. This setting can be compared to an ideal DPDK
+execution since the packets are already in memory and the
+workers do not experience any DPDK-related overheads (e.g.,
+polling device ports, copying bursts in local buffer). If not
+otherwise specified, the packet size is set to 1 KiB.
+Figure 11 (left) compares the per-core throughput of each
+architecture, which is computed as function of the median
+handler completion time when using a number of worker
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+
+ 
+
+
+
+
+
+
+   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+  
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+aggregate filtering histogram kvstore reduce strided_ddt
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+3
+6
+9
+0
+3
+6
+9
+12
+2
+3
+4
+5
+0.0
+0.1
+0.2
+0.3
+0.4
+0.4
+0.8
+1.2
+1.6
+85
+90
+95
+100
+105
+1000
+1500
+2000
+2500
+200
+400
+600
+1000
+1250
+1500
+1750
+2000
+82.5
+85.0
+87.5
+90.0
+425
+450
+475
+500
+525
+0
+10 K
+20 K
+30 K
+300
+600
+900
+1200
+0
+200
+400
+600
+400
+600
+800
+1000
+1200
+0
+10 K
+20 K
+30 K
+1 K
+2 K
+3 K
+ault zynq PsPIN ault zynq PsPIN ault zynq PsPIN ault zynq PsPIN ault zynq PsPIN ault zynq PsPIN
+0
+10
+20
+30
+0
+50
+100
+150
+0
+20
+40
+60
+0
+20
+40
+60
+0
+10
+20
+30
+0
+10
+20
+30
+40
+Time (us) Instructions MIP
+S
+Cache misses
+1 thread
+4 threads
+Fig. 12. Handlers performance on different architectures. For zynq and ault, we show the cases with one and four worker threads. The upper and lower
+whiskers of the boxplot represent Q3 ` 1.5 ¨ IQR and Q1 ´ 1.5 ¨ IQR (Qi: i-th quartile; IQR: inter-quartile range), respectively.
+threads equal to the number of available cores. Despite the fact
+that this comparison is disadvantageous for PsPIN because it is
+the one potentially experiencing the most memory contention
+with its 32 cores, PsPIN shows better per-core throughput over
+the best competitor for histogram (1.3x), kvstore (1.9x), and
+reduce (5.3x). For less memory-bound workloads, the more
+powerful cores of ault and zynq outperform PsPIN by up to
+1.8x for aggregate, 40x for filtering, and 36x for strided ddt.
+However, comparing the per-core throughput without factoring in the area of each architecture is not fair (e.g., ault is
+26x larger than PsPIN). Table IV summarizes area estimates
+and shows the scaled area per processing element (Area/PE
+(scaled)), which is the area per processing element (Area/PE)
+scaled to the same production process (22 nm) and same
+amount of memory per PE. Figure 11 (right) reports the
+throughput normalized to the scaled area for the considered
+architectures. PsPIN is up to 10.7x more area-efficient than
+zynq (minimum: 2.6x for strided ddt) and up to 248x more
+area-efficient than ault (minimum: 1.5x for filtering) on all
+considered workloads. We conclude that, while it is expected
+that more powerful architectures achieve higher raw throughput for compute-intensive workloads, PsPIN provides better
+area efficiency and can sustain line rate while fully offloading
+packet processing to the NIC and freeing CPU resources.
+Arch. Tech. Die area PEs Memory Area/PE Area/PE (scaled)
+ault 14 nm 485 mm2 [4] 18 43.3 MiB 17.978 mm2 35.956 mm2
+zynq 16 nm 3.27 mm2 [3] 4 1.125 MiB 0.876 mm2 1.752 mm2
+PsPIN 22 nm 18.5 mm2 32 12 MiB 0.578 mm2 0.578 mm2
+TABLE IV
+ARCHITECTURAL CHARACTERISTICS. PE: PROCESSING ELEMENT
+To gain more insights on the performance characteristics of
+the selected handlers, Figure 12 shows a set of performance
+metrics as measured on the considered architectures. We report
+handlers’ execution times, number of executed instructions,
+MIPS (million instructions per second), and cache misses. For
+PsPIN, L1 misses represent the number of accesses to either
+remote L1s or L2. For ault and zynq, performance is measured
+with CPU hardware counters [54]. To show the effects of
+resource contention, we run experiments with a single worker
+thread (i.e., no contention) and with four workers in parallel.
+For most of the considered use cases, running times on
+PsPIN are not more than 2x the best case (i.e., no contention)
+of other architectures. The worst case is filtering, which
+computes a hash function on an 8-byte value, resulting in
+a compute-intensive task that allows ault to run this handler more than 30x times faster than PsPIN. In general, for
+workloads that mainly execute arithmetic instructions (e.g.,
+aggregate and filtering) or do not frequently access shared or
+packet memory (e.g., strided ddt), ault outperforms zynq and
+PsPIN in terms of completion time. For example, on ault, the
+compiler optimizes aggregate by using SIMD packed integer
+instructions. However, as shown if Figure 11, this difference
+does not take into account the larger area occupied by this
+architecture. Even though PsPIN has a simpler architecture
+than ault and zynq, it still competes in overall execution time
+for the other cases due to the comparable rate of executed
+instructions per second (MIPS), which is influenced by higher
+L1 miss rates on ault and zynq (see histogram, kvstore, and
+reduce). In PsPIN, packets are copied directly into the L1 of
+the cluster where the handler is executed, enabling single-cycle
+access. Also, PsPIN has no hardware caches, hence it does
+not suffer from cache-line ping-pong scenarios, as observed
+on other architectures for, e.g., histogram and reduce. RISC-V
+AMOs [59] enable single-cycle atomic operations that can save
+up to 3x instructions over other implementations (e.g., linked
+load, store conditional) for the reduce and histogram cases.
+V. DISCUSSION AND FUTURE WORK
+The PsPIN configuration and analysis that we show in this
+work is aimed at sustaining a 400 Gbit/s line rate. How can
+PsPIN be scaled out to sustain higher bandwidths? To reason
+about scaling we need to consider how to scale memories,
+interconnects, and cores and how this affects power and area.
+We identify two types of memories: the packet buffer, the
+size of which depends on the network bandwidth and the
+time packets spend in PsPIN (i.e., the packet latency), and
+
+the handler memory, the size of which depends on the specific
+handlers that are offloaded (e.g., to store their state). Note that
+the second class does not depend on the network bandwidth.
+
+
+
+0
+100
+200
+300
+0 1000 2000 3000 min max geomean
+200 Gbit/s (16 cores)
+400 Gbit/s (32 cores)
+800 Gbit/s (64 cores)
+HCT (4 KiB pkt)
+HCT (1 KiB pkt)
+HCT (256 B pkt)
+Packet bu
+er size (KiB)
+Packet latency (ns)
+Fig. 13. Packet buffer size over packet latencies and line rates. Horizontal
+lines are min, geometric mean, and max handler running times among the ones
+of Figure 12. Points indicate handler critical times (HCT) after which handlers
+are bottlenecks for a given packet-size/line-rate/number-of-cores combination.
+In Figure 13 we use Little’s law to determine the packet
+buffer size over different packet latencies (x-axis) and line
+rates (200 Gbit/s, 400 Gbit/s, and 800 Gbit/s). The packet
+latency is the time from when a packet arrives in PsPIN to
+when it is processed and can be freed up from the packet
+buffer. As we show in Section IV-B1, the time needed to
+schedule a handler processing a given packet ranges from 26 ns
+for 64 B packets to 40 ns for 1024 B ones. For simplicity, we
+do not take into account the scheduling latency in the following
+discussion but only the handler execution time. Figure 13
+further shows the minimum, maximum, and the geometric
+mean for all handlers of Section IV-C. We notice how, even
+for an 800 Gbit/s network and packet latencies of 3 us, the
+required packet buffer capacity is only 300 KiB. Currently,
+PsPIN provides a 4 MiB packet buffer that would be enough to
+sustain even higher line rate or packet latencies. Moreover, we
+need to take into account that handlers should terminate within
+a threshold in order to not bottleneck the incoming data flow,
+constraining the packet buffer size. We plot the handler critical
+times (HCT) that are thresholds after which handlers become
+bottlenecks for given combination of packet size, line rate,
+and core count. HCTs are computed by scaling the number of
+cores together with the line rate. We show HCTs for 256 B,
+1024 B, and 4096 B packets. In Section IV-A, we show how
+memories take a large portion of both area (87%) and power
+(52%). Since the memories provided in this configuration
+are partially independent from the network bandwidth (i.e.,
+handler memory) and partially over-provisioned (i.e., packet
+buffer), we expect area and power to remain stable while
+scaling PsPIN to sustain higher line rates.
+The modular organization of PsPIN allows to scale up the
+number of processing clusters (S8) for, e.g., enabling higher
+workloads (i.e., longer handlers) without becoming a bottleneck. However, to increase the sustained network bandwidth,
+we would either need to re-balance the system in order to feed
+the processing clusters at line rate (e.g., to sustain 1 Tbit/s,
+we should adopt 1024-bit data paths), or have multiple PsPIN
+accelerators with an additional scheduling level.
+In the near future, we plan to investigate a possible integration of Snitch [61] cores and clusters in PsPIN. With
+simpler RISC-V cores, a more flexible cluster architecture,
+and virtual memory support, we believe this integration can
+further improve area and power efficiency, and increase the
+flexibility of the proposed in-network compute accelerator.
+Additionally, we are following a line of research aimed at
+evaluating the costs and benefits of having PsPIN integrated
+into network switches, which would enable general packet
+processing deeper in the network.
+VI. RELATED WORK
+One of the oldest concepts related to PsPIN is Active
+Messages (AM) [56]. However, in the AM model, messages
+are atomic and can be processed only once they are fully
+received. In sPIN, the processing happens at the packets level,
+leading to lower latencies and buffer requirements.
+sPIN is closely related to systems such as P4 [13], which
+allow users to define match-action rules on a per-packet basis
+and are supported by switch architectures such as AMT [14],
+FlexPipe [41], and Cavium’s Xplaint. Those architectures
+target switches and work on packet headers, not packet data.
+FlexNIC [32] extends this idea by introducing modifiable
+memory and enabling fine-grained steering of DMA streams at
+the receiver NIC. These extensions can be used for, e.g., partition the key-space of a key-value store and steer requests to
+specific cores. However, the offloading of complex applicationspecific tasks (e.g., datatype processing [20]) has not been
+demonstrated in this programming model. In contrast, PsPIN
+allows offloading of arbitrary functions executed on generalpurpose processing cores with small hardware extensions to
+increase throughput and reduce latency. PANIC [36] is a
+recent work sharing many design principles of PsPIN. The
+main difference is that PsPIN allows applications to define
+handlers to be executed on incoming packets while PANIC
+enables them to express compositions of pre-offloaded tasks.
+Programmable NICs are not new. Quadrics QSNet employed
+them to accelerate collectives [60] and to implement early
+versions of Portals [42]. Myrinet NICs [57] allowed users
+to offload modules written in C to the specialized NIC
+cores. Modern approaches to NIC offload [51], [21] requires
+network engineers to implement functionalities as FPGA modules, while PsPIN uses easier to (re-)program RISC-V cores.
+Differently from these approaches, sPIN enables user-space
+applications to define their own C/C++ packet handlers.
+VII. CONCLUSIONS
+Processing data in the network is a necessary step to scale
+applications along with the network speeds. This work defines
+principles and architectural characteristics of packet processing
+engines, which are the next step after RDMA acceleration.
+We propose PsPIN, a power and area efficient RISC-V based
+unit implementing the sPIN programming model, defining the
+interfaces for NIC integration. We evaluate PsPIN, showing
+that it can process packets at up to 400 Gbit/s line rate and
+motivate our architectural choices with a performance study of
+a set of example handlers over different architectures. PsPIN
+is an open-source project and is available at:   

@@ -1,0 +1,1950 @@
+ABSTRACT
+With slowing technology scaling, specialized accelerators are
+increasingly attractive solutions to continue expected generational scaling of performance. However, in order to accelerate
+more advanced algorithms or those from challenging domains,
+supporting data-dependence becomes necessary. This manifests
+as either data-dependent control (eg. join two sparse lists), or
+data-dependent memory accesses (eg. hash-table access). These
+forms of data-dependence inherently couple compute with memory,
+and also preclude efficient vectorization – defeating the traditional
+mechanisms of programmable accelerators (eg. GPUs).
+Our goal is to develop an accelerator which is broadly applicable across algorithms with and without data-dependence. To this
+end, we first identify forms of data-dependence which are both
+common and possible to exploit with specialized hardware: specifically stream-join and alias-free indirection. Then, we create an
+accelerator with an interface to support these, called the Sparse
+Processing Unit (SPU). SPU supports alias-free indirection with
+a compute-enabled scratchpad and aggressive stream reordering
+and stream-join with a novel dataflow control model for a reconfigurable systolic compute-fabric. Finally, we add robustness across
+datatypes by adding decomposability across the compute and memory pipelines. SPU achieves 16.5×, 10.3×, and 14.2× over a 24-core
+SKL CPU on ML, database, and graph algorithms respectively. SPU
+achieves similar performance to domain-specific accelerators. For
+ML, SPU achieves 1.8-7× speedup against a similarly provisioned
+GPGPU, with much less area and power.
+CCS CONCEPTS
+• Computer systems organization → Reconfigurable computing; Data flow architectures; Heterogeneous (hybrid) systems.
+KEYWORDS
+Irregularity, data-dependence, accelerators, generality, dataflow,
+systolic, reconfigurable, join, indirection
+1 INTRODUCTION
+Trends in technology scaling and application needs are causing
+a broad push towards specialized accelerators. Examples pervade
+many domains, including graphs [9, 28, 39, 91, 108], AI/ML [10,
+43, 47, 80, 85, 98, 107], databases [48, 50, 105, 106], systems [31–
+33, 110], and genomics [23, 36, 95, 96]). This trend is also true in
+industry [46, 62, 69, 79, 100].
+Designs which are performance-robust across domains would
+be valuable for economies of scale. Furthermore, with a perishing
+Moore’s Law, the approach of spending transistors on ever more
+non-programmable ASICs will become less effective [35]. However, the success of the above domain-specific accelerators suggests
+that existing general purpose data processing hardware (eg. GPGPUs [69], Intel MIC [30] & KNL [90]) are orders-of-magnitude lower
+in performance and/or energy efficiency. But why? Our insight is
+the following: data-dependence, in the form of data-dependent control and data-dependent memory access, fundamentally interferes
+with common mechanisms relied on by such processors.
+To explain, consider the following two basic hardware principles: decoupling the memory access and computation pipelines, and
+vectorizing the computation across independent hardware units.
+GPUs are a classic example that exploit vectorization through the
+SIMT execution model, and perform decoupling by relying on many
+threads. Data-dependent control introduces thread divergence (bad
+for vectorization), and data dependent memory introduces noncontiguous loads (bad for vectorization) and further requires more
+threads to hide the likely higher latency (bad for decoupling). Other
+924
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+Systolic
+Array
+Ctrl
+Wide Scratchpad
+Systolic
+Array
+Ctrl
+Compute-Enabled
+Scratchpad for fast
+Alias-free indirect
+access
+Decomposable
+mem/net/compute
+for flexible datatypes
+Systolic array
+supporting
+stream-join
+control
+Wide Scratchpad
+I- ROB
+(a) Stereotypical Dense
+Accelerator Core
+(b) SPU & its specialization
+for data-dependence
+Router Router
+Figure 1: Our approach: Data-dependence Specialization
+high-throughput data-processors face similar problems.
+On top of this, supporting data-dependence makes computing or
+accessing arbitrary datatypes (8-bit,16-bit,32-bit) more difficult. The
+traditional approach of sub-word SIMD (used by eg. GPUs) does
+not suffice in the presence of data-dependent control or memory,
+as sub-words may have different control outcomes or memory
+addresses respectively. Hence, the effective bandwidth would have
+to be reduced to that achievable by the vector-lane’s word-length.
+Not only is data-dependence problematic, it is also extremely
+common. Table 1 outlines algorithms from several domains, which
+rely on data-dependent versions for one of many reasons: Some
+use a sparse representation to save computation and memory bandwidth/capacity. Others rely on data-structures that represent relationships like graphs or trees. Some use data-subsetting like a
+database filter or simply reorder data, like Sort or Join.
+While some prior accelerators have mechanisms for datadependence, they tend not to be programmable for different
+domains (eg. cannot run a DNN on a database accelerator), and they
+also tend to be inefficient on kernels which are not data-dependent
+(eg. cannot run a dense-matrix multiply on a sparse-matrix
+accelerator). Our goal is to develop a programmable, domain-neutral
+accelerator which can efficiently execute data-dependent and
+non-data-dependent algorithms at high efficiency.
+Insight: Our key observation is that the data-dependence support
+required across data-processing domains is not arbitrary. Two basic
+forms cover a wide variety of data-dependent kernels: stream-joins
+and alias-free indirection.
+Stream joins are defined by in-order processing of data, where
+the relative order of consumption and production of new data is dependent on control decisions. Alias-free indirection is characterized
+by memory access with data-dependent addresses, but where it can
+be guaranteed that there are no implicit dependences through aliasing. These restrictions can enable efficient hardware mechanisms,
+and while simple, these forms are quite general: the algorithms in
+Table 1 can be expressed as one or the other (or both).
+Approach: Because our goal is to be performance-robust across
+algorithms, we start with an architecture known to work well
+for non-data-dependent: a systolic-style1
+coarse grained reconfigurable architecture (CGRA) with streaming memory support
+(extremely common, eg. [10, 19, 22, 46, 54, 98]) – see Figure 1(a).
+We then develop hardware and software mechanisms for our two
+data-dependence forms to enable fully-pipelined stream-join and
+high-bandwidth alias-free indirection at low overhead. Finally, to
+1By systolic, we mean that processing elements only perform one operation, are fullypipelined to execute one operation per cycle, and only communicate with neighbors.
+support a variety of datatypes, we add decomposability into the
+compute, network, and memory.
+Our design, the Sparse Processing Unit (SPU), is shown in Figure 1(b). SPU supports fully-pipelined stream-joins with a systolic CGRA augmented with a novel dataflow-control model. SPU
+supports high-bandwidth alias-free indirection (load/store/update)
+with a banked scratchpad with aggressive reordering and embedded compute units. To flexibly support different datatypes, the
+hardware enables decomposing the reconfigurable network and
+wide memory access into power-of-two finer-grain resources while
+maintaining data-dependence semantics. Decomposability is more
+powerful than subword-SIMD alone, as it effectively lets dataflow
+of finer-grain datatypes flow independently, which is necessary for
+independent control flow and indirect memory access.
+For the hardware/software interface, we augment a streamdataflow ISA [65], which enables simple embedding of the memory
+and control primitives. For the overall design, SPU cores are
+connected using a traditional mesh network-on-chip (NoC) to
+create a high-performance multi-core accelerator.
+Chosen Workloads: We study machine learning (ML) as our primary domain, and graph processing and databases to demonstrate
+generality. Chosen ML workloads cover the sparse and dense versions of the top-5 ML algorithms used by Facebook in 2018 [42]. FC
+and CNN are the core kernels used in state-of-the-art speech and
+image/video recognition. Arithmetic Circuits are graphical model
+representations which can be used to answer inference questions
+on probability distributions [87]. From graph processing we study
+page rank and BFS. From databases, we study a subset of TPC-H.
+Results: We evaluate our approach across three domains:
+• AI/ML: SPU achieves 1.8-7× speedup over a similar GPU
+(NVIDIA P4000), using 24% power. Further, retaining capability
+to express dense algorithms led to up to 4.5× speedup.
+• Graph: For both ordered and unordered algorithms, we achieve
+14.2× performance over a 24-core SKL CPU, competitive with
+the scaled-up Graphicionado [39] accelerator.
+• Database: For database workloads, we achieve 10.3× over the
+CPU, which is competitive with the Q100 [106] accelerator.
+Our contributions are:
+• Identifying two data-dependence forms which are highlyspecializable, yet are general across many algorithms.
+• Hardware/software codesign for the data-dependence forms:
+1. Dataflow control model enabling pipelined stream-joins. 2.
+Scratchpad supporting high-bandwidth indirect access. 3. Architecture decomposability for different data-type sizes.
+• Evaluation of SPU multicore across three domains
+(AI/ML,Graph,Database) using real-world datasets.
+Paper Organization: First, we describe the two key datadependence forms and their challenges and opportunities
+(Section 2). Then we describe codesigned abstractions and
+hardware mechanisms for specializing for data-dependent
+control (Section 3) and memory (Section 4). We then integrate
+these to create the proposed SPU accelerator, and explain its
+parallelism/communication mechanisms (Section 5). Finally we
+describe the experimental methodology, present our evaluation,
+and cover related work (Section 6, 7, 8).
+925
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+Indicative of
+Stream-Join
+class row:
+ int idx[]
+ float val[]
+ int cnt
+float sparse_dotp(row r1, r2)
+ int i1=0, i2=0
+ float total=0
+ while(i1<r1.cnt && i2<r2.cnt)
+ if (r1.idx[i1]==r2.idx[i2])
+ total+=r1.val[i1]*r2.val[i2]
+ i1++; i2++
+ elif (r1.idx[i1]< r2.idx[i2])
+ i1++
+ else
+ i2++
+ ...
+(a) Sparse Vec. Mult. (inner-prod) (b) Merge
+float merge(int left, mid, right)
+ ...
+ int i1=0, i2=mid
+ while(i1 < mid && i2 < right)
+ if in_arr[i1] <= in_arr[i2]
+ out_arr[iout]=in_arr[i1]
+ i1++
+ else
+ out_arr[iout]=in_arr[i2]
+ i2++
+ iout++
+float in_arr[N]
+float out_arr[N]
+Data
+structure
+Code Example
+2, 5, 8, 12
+5, 3, 4, 2
+r1
+r2
+cnt: 4
+0, 2, 4, 5, 9
+2, 3, 2, 4, 1
+cnt: 5
+idx
+idx
+val
+val
+total=27
+(5*3+3*4)
+Output
+Underlined
+Indices Match
+Output
+out_array 1, 2, 5, 8, 13, 17, 20, 21
+in_array 2, 5, 13, 17, 1, 8, 20, 21
+Indicative of
+Stream-Join
+Figure 2: Example Stream-Join Algorithms
+2 EXPLOITABLE DATA-DEP. FORMS
+We observe that two restricted forms of data-dependence are sufficient to cover many algorithms: stream-join and alias-free indirection. In this section, we first define these forms and give some
+intuition on their performance challenges for existing architectures,
+then explain how they guide our design.
+Preliminary Term – “Streams”: Both of the dependence-forms
+rely on the concept of stream abstractions, so we briefly explain.
+Streams are simply an ordered sequence of values, used as architecture primitives in many prior designs [25, 26, 44, 65, 83, 102, 106].
+Relevant to this work are memory streams, which are sequences of
+loads or stores. Streams are similar to vector accesses, but have no
+fixed length (for examples see Listings 1-3 on page ).
+Preliminary Term – “Regular Algorithm”: A regular algorithm
+is one with no data-dependent control decisions or memory addresses. Further, no implicit dependences are allowed through memory streams, created by aliasing. The data-dependence forms can
+be viewed as relaxations of regular algorithms.
+2.1 Stream-Join
+An interesting class of algorithms iterates over each input (each
+stream) in order, but the total order of operations (and perhaps
+whether an output is produced) is data-dependent. Two relevant
+kernels are shown in Figure 2. Sparse vector multiplication (a)
+iterates over two sparse rows (in CSR format) where indices are
+stored in sorted order, and performs the multiplication if there is a
+match. The core of the merge kernel (b) iterates over two sorted
+lists, and at each step outputs the smaller item. Even though the
+data-structures, datatypes and purpose are very different, their
+relationship to data-dependence is the same: they both have stream
+access, but the relative ordering of stream consumption is datadependent (they reuse data from some stream multiple times).
+Stream Join Definition: A program region which is regular, except that the re-use of stream data and production of outputs may
+depend on the data.
+Problem for CPUs/GPUs: Because of their data-dependent nature, Stream-joins introduce branch-mispredictions for CPUs. For
+GPGPUs, control dependence makes vectorization difficult due to
+class row:
+ int idx[]
+ float val[]
+ int cnt
+(a) Sparse Vec/Mat. Mult. (b) Histogram
+histo(float in_arr[N])
+ ...
+ for i=0 to N, ++i
+ b = compute_bin(in_arr[i])
+ out_hist[b] += 1
+ ...
+float in_arr[N]
+int out_hist[M]
+Data
+structure
+Code Example
+Output
+out_arr 1,2,2,2,1,1
+in_arr 1,2,5,3,2,4,3,5,1,0
+float sparse_mv(row r1, m2)
+ ...
+ for i1=0 to r1.cnt, ++i1
+ cid = r1.idx[i1]
+ for i2=ptr[cid] to ptr[cid+1]
+ out_vec[m2.idx[i2]] +=
+ r1.val[i1]*m2.val[i2]
+ i2++
+(assume compute_bin is a cast to integer)
+(outer-prod)
+Indirection
+1, 3
+2, 3
+0, 1, 5, 3, 4, 0, 3, 5, 0, 3
+1, 2, 2, 3, 2, 4, 3, 5, 1, 1
+Output
+r1
+idx
+val
+idx
+val
+ptr
+3, 0, 0, 9, 5, 0
+m2
+Underlined
+indices match
+(3*1, 0, 0, 2*3+3*1, 2*2, 0)
+out_vec cnt: 2
+Indirection
+Figure 3: Example Alias-Free Scatter/Gather Algorithms
+control divergence of SIMT lanes; also the memory pattern can
+diverge between lanes, causing L1 cache bank conflicts.
+Our Goal for stream-join: Create a dataflow control model which
+can execute stream-join at full bandwidth and utilization.
+2.2 Alias-Free Indirection (AF-Indirect)
+Many algorithms rely on indirect read, write, and update to memory,
+often showing up as a[f(b[i])]. Figure 3 shows two examples: The
+sparse-vector/sparse-matrix outer product (a) works by performing
+all combinations of non-zero multiplications, and accumulating
+in the correct location in a dense output vector. Histogram (b) is
+straightforward. The similarities here are clear: both perform an
+access to an indirect location. This can be viewed as two dependent
+streams. Another important observation is that there are no unknown aliases between streams – the only dependence is between
+the load and store of the indirect update.
+Alias-Free Indirection Definition: A program region which is
+regular (including no implicit dependences), except that memory
+streams may be dependent on each other.
+Problem for CPUs/GPUs: On CPUs, indirect memory is possible
+with scatter/gather, however the throughput is quite limited given
+the limited ports to read/write vector-length number of cache lines
+simultaneously. As for indirect update, Intel AVX512 recently added
+support for conflict detection instructions. These do not improve
+the above cache-port throughput problem, only the instruction
+overhead – yet still any conflicts within the vector are handled
+serially with no reordering across vectors [45]. Also, not leveraging
+alias-freedom means a reliance on expensive load-store queues.
+While GPUs have similar throughput issues for caches, their
+scratchpads are banked for faster indirect access. However, they do
+not reorder requests across subsequent vector warp accesses [103],
+which is important to get high indirect throughput. Doing so in a
+GPU would require dependence-checking of in-flight accesses, as
+they cannot guarantee alias freedom.
+Our Goal for AF-Indirect: Create a stream-based hardware/software interface and microarchitecture enabling indirect access at
+full bandwidth through aggressive reordering.
+Dependence Form Relationship: Finally, note that dependence
+926
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+forms are not mutually exclusive. An example is the histogrambased Sparse GBDT (Figure 13 on Page ). Alias-free indirection is
+used for updating the histogram count, while a stream-join is used
+for iterating over the sparse feature values. Other examples include
+deep neural networks (indirection for matrix-multiply and streamjoin to subsequently resparsify the output vector) and triangle
+counting in graphs (indirection to traverse the graph and streamjoin to find intersecting neighbors).
+3 STREAM-JOIN SPECIALIZATION
+A conventional computational fabric which is proven to perform
+well for non-data-dependent codes is a systolic-execution array [19,
+22, 46, 54, 98], as they are quite simple. Note we define a systolicexecution array as a set of processing tiles which together form
+a deep pipeline, where each tile executes a single logical instruction and only communicates with its neighbors. This definition is
+general enough that such designs can include a circuit-switched
+network [37, 57, 66, 88, 99], so we refer to these as systolic CGRAs.
+In this section, we propose a novel control model to enhance a
+conventional systolic CGRA for stream-join. We also discuss supporting finer-grain datatypes at low overhead and high hardware
+utilization through decomposability.
+3.1 Stream-join Control
+Existing systolic arrays are unable to make control decisions beyond
+simple predication, as they do not account for data dependences in
+deciding when and how to produce or consume data.
+We discuss a number of examples in Figure 4, for which show
+the original code and a traditional dataflow representation. Here,
+black arrows represent data dependence, and green arrows indicate control. The dataflow representation is quite similar to what
+is executed on an OOO core. These examples motivate the need
+for a new dataflow-control model; one which can express the datadependence without expensive throughput-limiting control dependence loops; this figure also shows these codes represented in our
+stream-join dataflow model.
+Merge Example: Consider the pseudo-code in Figure 4(a), which
+shows a simple merge kernel (only the part where both lists have
+data), for use in merge-sort for example. An item is selected and
+stored based on which of two items is smaller. This dataflow can
+be mapped to a systolic array, but only at low throughput.
+To explain, note that there is a loop-carried dependence through
+the control-dependent increment and memory access. This prevents
+perfect pipelining, and the throughput is limited to one instance
+of this computation every n cycles, where n is the total latency
+of these instructions. Note that the same problem exists for the
+out-of-order core, and it is made even worse with the unpredictable
+data-dependent branch which would increase the average latency
+due to mispredictions.
+However, note that from the perspective of the memory, the
+control dependence is unnecessary, as all loads will be performed
+anyways. Therefore, to break the dependence, we need to separate
+the loads from computation (luckily, decoupled streams do this
+already), then expose a mechanism for controlling the order of
+data consumption. Intuitively for this example, if the model treats
+ x=ReLU(in[i])
+ (x!=0)
+ val[cnt] = x
+ idx[cnt] = i
+
+for i=0 to N
+if
+++cnt
+ x=ReLU(in[i])
+ (x!=0)
+ val[cnt] = x
+ idx[cnt] = i
+
+for i=0 to N
+if
+++cnt
+Traditional Dataflow Stream
+-join
+Dataflow
+C code
+(d) Re-sparsify
+Cmp
++
+strm
+idx1
+strm
+idx2
+Streams
+embed their
+own iterators
+×
+strm
+val1
+strm
+val2
+reuse reuse reuse
+acc
+c c
+<, ==, >
+c
+output
+init
+reuse
+(a) Merge
+ (list1[i1] <= list2[i2])
+ out_list[iout] = list1[i1]
+
+ out_list[iout] = list2[i2]
+
+++iout
+while(i1 < L1 && i2 < L2)
+++i1
+++i2
+if
+else
+strm
+list1
+strm
+list2
+reuse reuse
+Select
+Cmp
+c
+strm st
+out_list
+++ ++
+Select
+ld
+list1
+Select
+ld
+list2
+0 1 Cmp 0 1
+ControlDep.
+<=
+++
+Select
+st
+out_list
+>
+i1 i2
+iout
+(b) Sparse Vec. Mult. (inner)
+
+ (r1.idx[i1]==r2.idx[i2])
+ total+=r1.val[i1]*r2.val[i2]
+
+ (r1.idx[i1] < r2.idx[i2])
+ ++i1
+else
+ ++i2
+++i1; ++i2;
+while(i1<r1.cnt && i2<r2.cnt)
+if
+elif
+++
++
+++
+Select
+ld
+idx1
+ld
+val1
+Select
+ld
+val2
+ld
+idx2
+Cmp
+×
+0 1 0 1
+ControlDep.
+< >
+==
+output
+i1 i2
+ControlDep.
+(c) Streaming Database join
+ (tbl1.key[i1]==tbl2.key[i2])
+ tbl_out.key[iout] =tbl1.key[i1]
+ tbl_out.data1[iout]=tbl1.data[i1]
+ tbl_out.data2[iout]=tbl2.data[i2]
+
+ (tbl1.key[i1] < tbl2.key[i2])
+++i1; ++i2; ++iout
+while(i1 < N1 && i2 < N2)
+ ++i1
+else
+ ++i2
+if
+elif
+++ ++
+Select
+ld
+key1
+ld
+data1
+Select
+ld
+data2
+ld
+key2
+0 1 Cmp 0 1
+ControlDep.
+ControlDep.
+< >
+==
+st
+data1
+st
+data2
+++
+Select
+0
+1
+st
+key
+i1 i2
+iout
+Cmp
+strm
+key1
+strm
+key2
+Con
+cat
+strm
+data1
+strm
+data2
+reuse reuse c c
+<, ==, >
+strm st
+tbl_out
+Con
+cat
+c
+st
+ind
+ld
+in
+ReLU
+Cmp
+++
+++
+Select
+0 1
+!=0
+st
+val
+0
+!=0
+i
+strm
+in ReLU
+Cmp
+strm st
+ind
+strm st val
++
+acc
+c
+cnt
+init
+c c
+Stream
+Loads
+i
+!=0
+For simplicity, loop
+exit conditions not
+shown.
+Note:
+ReLU(x): max(x,0)
+Stream
+Store
+ControlDep.
+Control
+Compute
+Memory
+Data Dep.
+Control Dep.
+Legend
+Control
+Compute
+Memory
+Data Dep.
+Control Dep.
+Legend
+cnt
+Figure 4: Stream-Join Control Model
+927
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+incoming values like a queue, it is possible to “pop” the values as
+they are consumed. Essentially, what we require here within the
+computation fabric is the ability to perform data-dependent reuse.
+Sparse Inner-Product Example: Figure 4(b) is a sparse-vector
+multiplication. Here, two pointers are maintained based on the comparison of corresponding item indices. Compared to merge, there
+is a similar control dependence and overhead. A similar approach
+could work here as well, decouple the streams and conditionally
+reuse indices (and values). The difference is that we only apply the
+multiply accumulate on matching indices, so we should discard
+some of this data. Therefore, in addition to data-dependent reuse,
+we also require data-dependent discard.
+Database Join Example: Figure 4(c) shows an inner equijoin. It
+iterates over sorted keys, and concatenates equivalent keys and corresponding columns. It has a surprisingly similar form and control
+dependence loop to the sparse multiplication, where the computation is replaced with concatenation. A similar approach of decoupling streams and applying data-dependent reuse and discard will
+break the control dependence loop and enable high throughput.
+Re-sparsification Example: Re-sparsification (Figure 4(d)) produces a sparse row from a dense stream. The dataflow version has a
+predicated increment and store, and can achieve a pipelined schedule (so can the OOO core if it has predicated stores, otherwise it
+would be serialized by mispredictions). This example demonstrates
+that the ability to discard (ie. filter) is useful on its own. It is also
+an example where predication is enough, whereas predication is
+insufficient in the other examples.
+Our Stream-join Proposal: We find the desired behavior can be
+accomplished with a simple and novel control flow model for fullthroughput systolic execution. The basic idea is to allow each instruction to perform the following control operations: re-use inputs,
+discard instructions or reset a register based on a dataflow input.
+Figure 5 shows the execution flow of the sparse vector multiplication when expressed as a stream-join, showing the fully-pipelined
+execution over several cycles. Dataflow values are represented as
+circles, and for simplicity they take one cycle to flow along a dependence. Sentinel values (infinity for indices and zero for values)
+are used to indicate the end of a stream; these allow the other
+stream to drain on stream completion. Also, the subsequent vector
+multiplications can begin without draining the pipeline.
+Figure 4 shows all of the examples written in this model. Datadependent operand re-use is useful in (a,b,c) to iterate over input
+streams in correct relative order. Data-dependent discard is also
+useful in (b,c,d) for ignoring data which is not needed. The datadependent reset is useful in (b,d) for resetting the accumulator. In
+both examples, adding stream-join primitives to instruction execution either shrinks the throughput-limiting dependence chain or
+eliminates it completely, enabling a fully-pipelined dataflow.
+To enable flexible control interpretation, each instruction embeds
+a simple configurable mapping function from the instruction output
+and control input to the control operations:
+f (inst_out, control_in) → reuse1,reuse2, discard,reset
+Stream-join Overheads: In kernels where input data is discarded
+(eg. sparse-matrix multiply and database join), the transformation to stream-joins can cause additional loads. Theoretically the
+Cmp
++
+×
+acc
+c c
+c
+init
+INF 0 3
+>
+INF
+12
+Cmp
++
+×
+acc
+c c
+c
+output
+init
+0 0
+==
+12
+== > Cmp
++
+×
+acc
+c c
+c
+output
+init 0
+output 12
+Cmp
++
+×
+acc
+c c
+c
+init
+2 4
+0 2 5 2
+Cmp
++
+×
+acc
+c c
+c
+init
+2 2 5 2
+<
+INF 4
+Cmp
++
+×
+acc
+c c
+c
+init
+4 6 2
+==
+INF
+INF
+6 3 0 3
+<
+6
+3
+output output output
+Cmp
++
+×
+acc
+c c
+c
+init
+2 4
+0 2 5 2
+Cmp
++
+×
+acc
+c c
+c
+init
+2 2 5 2
+<
+INF 4
+Cmp
++
+×
+acc
+c c
+c
+init
+4 6 2
+==
+INF
+INF
+6 3 0 3
+<
+6
+3
+output output output
+Cycle - 1 Cycle - 2 Cycle - 3
+Cycle - 4 Cycle - 5 Cycle - 6
+0
+5, 6, 0
+idx1
+val1
+0, 2, INF
+5, 6, 0
+idx1
+val1
+0, 2, INF
+2, 4, INF
+2, 3, 0
+idx2
+val2
+2, 4, INF
+2, 3, 0
+idx2
+val2
+INPUT
+LISTS
+==
+Figure 5: Execution diagram for join of two sorted lists.
+worst case extra overhead compared to the original is (value_size +
+key_size)/(key_size). This can happen if there are extremely sparse
+matches, for example in databases. For such cases, we could only
+load values for matching indices; this would increase the latency
+of accessing values, but this can usually be hidden. For this, SPU
+provides efficient support for indirect accesses (Section 4).
+3.2 Stream-join Compute Fabric: DGRA
+Here we explain how we augment a systolic CGRA to support
+stream-join control. Its network is decomposable to support control
+semantics for smaller datatypes; thus we refer to the design as the
+decomposable granularity reconfigurable architecture: DGRA.
+Stream-join Processing Element (PE) Implementation: The
+stream-join control model enables an instruction to 1. treat its
+inputs as queues that it can conditionally reuse, 2. conditionally
+discard its output value, and/or 3. conditionally reset its accumulator. Instructions may use their output or a control input to specify
+the conditions (ie. the control info).
+discardFunc. UnitACCCLTFIFO0FIFO1FIFO2From Networkreusereset
+SExStream-JoinFlow-Ctrl
+Data-FlowFigure 6: CLT integration
+To implement, we add a control
+lookup table (CLT) to each FU (Figure 6), which determines a mapping
+between the control inputs and possible control operations. For the inputs of this table, we use the lower
+two bits of either the instruction
+output or the control input. For the
+outputs, there are four possible control actions: reuse-first-input, reusesecond-input, discard-operation, reset-accumulator. Therefore, for
+a fully configurable mapping between the 2-bit input (four combinations) and 4-bit outputs, we require a 16-bit table, and one extra bit
+to specify whether the instruction output or control input should be
+used as input. This becomes additional instruction configuration.
+Supporting Decomposability: To support stream-join semantics
+with arbitrary datatypes, our approach is to support the principle
+of decomposability – the ability to use a coarse grain resource as
+multiple finer grain resources. Therefore, the network of the DGRA
+is decomposable into multiple parallel finer-grain sub-networks. It
+provides limited connectivity between these sub-networks. For this
+we require both a decomposable switch and PE.
+928
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+S0 S1 S2 S3
+N0 E0 S0 W0 X1 N1 E1 S1 W1 X2 N2 E2 S2 W2 X3 N3 E3 S3 W3 X0
+55.5
+5
+MUX
+E
+S
+N E S W
+S
+W
+N
+W
+W
+N
+E
+S
+CGRA
+Switch
+DGRA
+Switch
+S
+E
+N
+64-bit
+16-bit
+MUX
+(to/from Switches and Fus)
+Figure 7: DGRA Switch
+(to/from Switches)
+55.5
+5
+NW NE
+SE SW
+CGRA PE
+SE
+discard
+Func. Unit ACC
+reuse
+CLT
+64-bit
+32-bit
+Control
+CLT ACC
+NW NE
+SE SW
+55.5
+5
+SE0
+SE1
+DGRA PE
+SE SW0 SW1
+NW0
+NW1 NE1 NE0
+SE0
+SE1
+CLT ACC
+Figure 8: DGRA Processing Element
+DGRA Switch: Figure 7 compares a CGRA switch to our DGRA
+switch. On the left is an implementation of a coarse grain switch,
+which has one Mux per-output. The DGRA switch decomposes
+inputs and outputs, and separately routes each 16-bit sub-network.
+Flow control is maintained separately with a credit path (not shown)
+for each subnetwork. For flexible routing, we add the ability for
+incoming values to change sub-networks. In the design this is done
+by adding an additional input to each output Mux, which uses the
+latched output of the previous Mux. This forms a ring, as shown
+by the “X” inputs.
+DGRA PE: The decomposable PE (Figure 8) follows the same principles as the switch. Each coarse grain input of a FU can be decomposed into two finer-grain inputs which are used to feed two
+separate lower-granularity FUs. We replicate the CLT for each
+subnetwork so that each can have their own control semantics.
+Mixed-precision Scheduling: Mapping dataflow graphs onto reconfigurable architecture is known as spatial scheduling (eg. [67,
+73, 74, 109]). Adding decomposability increases the complexity
+due to managing more routing decisions due to subnetworks. At a
+very high-level, our approach combines the principle of stochasticscheduling [64] and over-provisioning (eg. within Pathfinder [56]).
+At each iteration, we attempt to map (or re-map) a dataflow instruction and its dependences onto several different positions on the
+DGRA; the algorithm will typically choose the position with the
+highest objective, but will occasionally select a random position.
+To avoid getting stuck in local minima, we allow over-provisioning
+f o r i =0 t o n
+. . . = a [ i ] → l o a d ( a [ 0 : n ] )
+Listing 1: Linear Stream
+s t r u c t { i n t f1 , f 2 } a [ n ]
+f o r i =0 t o n
+i n d = i n d e x [ i ]
+= a [ i n d ] . f i e l d 1
+= a [ i n d ] . f i e l d 2
+c [ i n d ] = . . .
+→
+s t r 1 = l o a d ( i n d e x [ 0 : n ] )
+i n d _ l o a d ( a d d r = s t r 1 , o f f s e t _ l i s t = { 0 , 4 } )
+i n d _ s t o r e ( a d d r = s t r 1 , v a l u e = . . . ,
+o f f s e t _ l i s t = { 0 } )
+Listing 2: Indirect Load and Store Streams
+f o r i =0 t o n
+i n d = i n d e x [ i ]
+v a l = v a l u e [ i ]
+h i s t o [ i n d ] += v a l
+→
+s t r _ i n d = l o a d ( i n d e x [ 0 : n ] )
+s t r _ v a l = l o a d ( v a l u e [ 0 : n ] )
+u p d a t e ( a d d r = s t r _ i n d , v a l = s t r _ v a l ,
+opcode = " add " , o f f s e t _ l i s t = { 0 } )
+Listing 3: Indirect Update Stream
+f o r i =0 t o n
+s i z e = s u b _ s i z e [ i ]
+f o r j =0 t o s ize
+v a l = v a l u e [ j ]
+→
+s t r _ s i z e = l o a d ( s u b _ s i z e [ 0 : n ] )
+d a t a _ d e p _ l o a d ( v a l u e [ 0 : l e n = s t r _ s i z e ] )
+Listing 4: Data-dependent Load Stream
+compute and network resources and penalize over-provisioning in
+the objective function.
+4 SPECIALIZING DATA-DEP. MEMORY
+The main challenge for specializing for alias-free indirection is
+creating a high-bandwidth memory pipeline which aggressively reorders accesses. In order to explain our proposed microarchitecture,
+we first discuss the set of stream abstractions that are expressed to
+the hardware.
+4.1 Sparse Memory Abstractions
+As we explained earlier, we start with a simple non-data-dependent
+contiguous stream (Listing 1 shows an example). For specifying
+indirect loads or stores, we enable one streams’ addresses to be
+dependent on another streams’ values. Often, array-of-structs style
+data structures require several lookups offset from the base address.
+We add this capability with an “offset list”, shown in the example
+in Listing 2.
+Indirect updates (as in histogramming) could hypothetically be
+supported by using an indirect load stream as above, performing the
+reduction operation, and finally using an indirect store stream to
+the same series of addresses. However, this requires dynamic alias
+detection or eschewing pipeline parallelism to prevent aliasing read-
+/write pairs from being mis-ordered. Instead, we can leverage the
+alias-free property to add a specialized interface for indirect update.
+In our implementation, indirect update may perform common operations like add, sub, max, and min directly on the indirect-addressed
+data item. Listing 3 shows an example.
+Often, streams consist of sub-streams with data-dependent
+length. For example, indirect matrix-vector multiplication requires
+access to columns with varying size (Figure 3, page ). We enable
+streams to specify a data-dependent length, as in Listing 4.
+4.2 Data-Dep Memory Microarchitecture
+Armed with expressive abstractions, we develop a high-bandwidth
+and flexible scratchpad controller capable of high-bandwidth indirect access. Because our workloads often require a mix of linear
+and indirect arrays simultaneously, for example streaming read of
+indices (direct) and associated values (indirect), we begin our design
+929
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+4
+Arbiter
+XBAR(eg.16x32)
+Indirect
+Address
+Generation
+Linear
+Access
+Stream
+Table
+Linear Address
+Generatio
+n
+MUX
+Indirect
+Rd/Wr/
+Atomic
+Stream
+Table
+rd-wr bank-queues
+Control Logic
+Composable
+Banked Scratchpad
+NoC
+Linear Scratchpad
+Control Unit
+Sel
+Indirect
+ROB
+To Compute Fabric
+From Compute Fabric
+Figure 9: Scratchpad Controller
+5
+Bank
+0
+Bank
+1
+Bank
+n-1
+Addr. Decode
+Addr. Decode
+Addr. Decode
+Address Value
+Row Buffer Row Buffer
+Enable
+Opcode0 Opcode1 Opcoden-1
+Composable
+Row Buffer
+To SPAD Controller (for reordering)
+From SPAD Controller
+Figure 10: Compute-enabled Banked Scratchpad
+with two logical scratchpad memories, one highly banked and one
+linear. In this design, both exist within the same address space.
+The role of the scratchpad controller (eventual design in Figure 9)
+is to generate requests for reads/writes to the linear scratchpad,
+and reads/writes/updates to the indirect scratchpad. A control unit
+assigns the scratchpad streams, and their state is maintained in
+either linear or indirect stream tables. The controller should then
+select between any concurrent stream for address generation and
+send to the associated scratchpad to maximize expected bandwidth.
+The linear address generator’s operation is simple – create wide
+scratchpad requests using the linear access pattern.
+The indirect address generator creates a vector of requests by
+combining each element of the stream of addresses (coming from
+the compute fabric, explained in Section 3) with each element in
+the stream description’s offset list. This vector of requests is sent to
+an arbitrated crossbar for distribution to banks, and a set of queues
+buffer requests for each SRAM bank (Figure 10) until they can be
+serviced. Reads, writes and updates are explained as follows:
+Indirect Writes: Bank queues buffer both address and values. Importantly, because writes are not ordered with respect to anything
+besides barriers, requests originating from within the stream and
+across streams can be “mixed” within the bank queues without
+any additional hardware support. Mixing requests across multiple
+request-vectors helps to hide bank contention, a critical feature
+enabling higher throughput than traditional memories.
+Indirect Updates: Indirect updates use the compute units within
+the scratchpad. To explain, the bank queues buffer the address,
+operation type and the operand for the update. Within the banked
+0x8
+0x18
+0xA8
+0xB8
+0x58
+0x68
+0x118 0x98 0x218
+0x28 0x228 0x328
+0x38
+0x48
+0xD8
+0x78
+Scratch banks
+0
+1
+2
+3
+4
+5
+6
+7
+0x8
+0x18
+0xA8
+0xB8
+0x58
+0x68
+0x118 0x98 0x218
+0x28 0x228 0x328
+0x38
+0x48
+0xD8
+0x78
+head
+0x18 0x58 0x68 0x118 0xA8 0xB8 0xD8
+0x28 0x48 0x8 0x38 0x78
+Indexed by
+req_id
+Cycle count
+1 2 3 4 5 6 1 2 3 4 5 6
+Cycle count
+(b) Benefit of reordering
+IROB at cycle count 2
+(c) SPU reordering
+Crossbar
+(addr, req_id, col)
+0x18 0x58 0x68 0x118 0x98 0xA8 0xB8 0xD8
+0x28 0x48 0x8 0x218 0x38 0x78 0x228 0x328
+Vec req1
+Vec req2
+(a) Example request stream
+Reorder within vector (typical for GPUs) Aggressive reordering through IROB
+tail
+Banks
+Figure 11: Functioning of IROB. (bits<6..4> indicate bank number)
+scratchpad, after the value is read, the associated compute unit
+executes, then writes the value back to the same location in the
+next cycle. We support only common integer operations within this
+pipeline (add, sub, min, max). The pipeline stalls only if subsequent
+updates are to the same address (max 2-cycle bubble).
+Indirect Reads: In contrast to the above, the order of reads must
+be preserved. For performance, we would like to maintain the ability to mix requests from subsequent accesses to hide bank contention. This actually goes beyond what even modern GPUs are
+capable of, as they only reorder a single vector of requests at one
+time [7, 58, 103]. We believe the reason for this limitation on GPUs
+is the challenge in handling potential memory dependences. To
+explain, Figure 11(a) shows an example of two parallel indirect read
+requests. Figure 11(b) shows the difference between how a typical
+GPU approach would schedule transactions, and how an aggressive
+reordering approach would work. The ability to intermingle parallel
+requests can significantly increase throughput.
+To accomplish this, we maintain ordering in a structure called
+an indirect read reorder-buffer (IROB), which maintains incomplete
+requests in a circular buffer. It is allocated an entry whenever a request is generated from the indirect address generator. For indirect
+reads, the bank queues maintain the address and row & column
+of the IROB. As results return from the banked scratchpad, they
+use this row & column to update the IROB. IROB entries are deallocated in-order when a request’s data is sent to the compute unit.
+Overall, our abstractions enable expression of the alias-free property of indirect reads in hardware, which is what allows a simple
+hardware structure like the IROB to aggressively reorder across
+multiple requests without memory dependence checking.
+Decomposability: The indirect scratchpad also requires decomposability to various datatypes. Multiple contiguous lanes are used
+in lock-step to support larger datatypes. Consider indirect store
+bandwidth for example: the 16×32 crossbar either supports 16 16-
+bit stores (to 32 logical banks), 8 32-bit stores (to 16 logical banks),
+or 4 64-bit stores (to 8 logical banks). We use the same approach
+for accessing the SRAM banks of the indirect scratchpad.
+930
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+Crossbar
+Main Memory
+Memory Stream Engine
+Core1 Core8
+Core9
+Core57 Core64
+NoC Router
+Datapath DGRA
+Compute
+Fabric
+Input Port
+Interface
+Scratchpad
+Controller
+Linear
+Scratchpad
+Banked
+Scratchpad
+Indirect
+Vector Ports
+Stream
+Dispatcher
+Control
+Core
+Output Port SPU-Core Interface
+Aribter
+to NoC
+Figure 12: SPU Overview
+5 SPARSE PROCESSING UNIT
+The sparse processing unit (SPU) is our overall proposed design.
+Each SPU core is composed of the specialized memory and compute
+fabric (DGRA), together with a control core for coordination among
+streams. In this section, we overview the primary aspects of the
+design, then discuss how we map our workloads to SPU’s computation, memory, and network abstractions. Finally, we discuss the
+role of the compiler and possible framework integration.
+SPU Organization: Figure 12 shows how SPU cores would be
+integrated into a mesh network-on-chip (NoC), along with the
+high-level block diagram of the core. The basic operation of each
+core is that the control core will first configure the DGRA for a
+particular dataflow computation, and then send stream commands
+to the scratchpad controller to read data or write to the DGRA,
+which itself has an input and output "port interface" to buffer data.
+Memory Integration: These workloads require shared access to
+a larger pool of on-chip memory. To enable this, our approach
+was to rely on software support, rather than expensive general
+purpose caches and coherence. In particular, SPU uses a partitioned
+global address space for scratchpad. Data should be partitioned
+for locality if possible. Streams may access remote memory over
+the NoC. We add remote versions of the indirect read, write, and
+update streams. Indirect write and update are generally one-way
+communication operations, but we provide support to synchronize
+on the last write/update of a stream for barrier synchronization.
+Other synchronization is described next.
+Communication/synchronization: SPU provides two specialized mechanisms for communication. First, we include multicast
+capability in the network. Data can be broadcast to a subset of cores,
+using the same relative offset in scratchpad. As a specialization for
+loading main memory, cores issue their load requests to a centralized memory stream engine, and data can be multi-cast from there
+to relevant cores. For synchronizing on for data-readiness, SPU
+uses a dataflow-tracker-like [98] mechanism to wait on a count of
+remote-scratchpad writes.
+Control ISA: We leverage an open-source stream-dataflow ISA [63,
+65] for the control core’s implementation of streams, and add support for indirect reads/writes/updates, stream-join dataflow model,
+and typed dataflow graph. The ISA contains stream instructions
+for the data transfer, including reading/writing to main memory
+and scratchpad.
+Map stream-join
+pattern to SPU
+control model
+update(addr=st_hist_addr,
+val=st_grad_update, opcode=”add”,
+offset_list={sp_addr[tid]})
+# Setup local linear scratchpad streams
+
+ multicast(strm_ind1, mask=”1111")
+multicast(strm_grad, mask=”1111")
+# Setup main-memory streams
+# Setup local indirect scratchpad streams
+wait_local_streams()
+# Global reduction using dataflow tracker
+if (tid==0): wait_df(C-1)
+else: st(red_val[tid], dst=core0, scr=1)
+# Setup local linear scratchpad streams
+
+ multicast(strm_ind1, mask=”1111")
+multicast(strm_grad, mask=”1111")
+# Setup main-memory streams
+# Setup local indirect scratchpad streams
+wait_local_streams()
+# Global reduction using dataflow tracker
+if (tid==0): wait_df(C-1)
+else: st(red_val[tid], dst=core0, scr=1)
+# Setup local linear scratchpad streams
+
+ multicast(strm_ind1, mask=”1111")
+multicast(strm_grad, mask=”1111")
+# Setup main-memory streams
+# Setup local indirect scratchpad streams
+wait_local_streams()
+# Global reduction using dataflow tracker
+if (tid==0): wait_df(C-1)
+else: st(red_val[tid], dst=core0, scr=1)
+strm_ind1 = ld(node_ind[p][0:n], scr=1)
+strm_grad = ld(grad[0:n], scr=1)
+strm_ind2 = ld(feat_ind[tid][0:n])
+strm_hist_bin = ld(feat_val[tid][0:n])
+Scratchpad Controller
+feat_ind[tid][0:n]
+feat_val[tid][0:n]
+Control
+Core
+DGRA
+(runs dataflow graph)
+strm
+hist_addr+grad_update
+Store
+node_ind[0:n/C],
+grad[0:n/C]
+Linear Scratch
+setup
+streams
+Banked Scratch
+...
+Store grad_hist[0..k]
+while(id1 < len(node_ind[p]) &&
+ id2 < len(feat_ind[fid])): ind1 =
+ ind2 =
+hist_bin =
+
+strm
+ind1
+strm
+ind2
+strm
+hist_bin
+reuse discard
+node_ind[p][id1]
+feat_ind[fid][id2]
+if (ind1==ind2):
+ ++id1; ++id2
+elif (ind1<ind2): ++id1
+else:
+ ++id2
+feat_val[fid][id2]
+grad[ind1]
+id1, id2 implicit using
+stream-join control
+grad_hist[hist_bin] +=
+(a) C code (single core)
+Execute
+stream
+code
+(b) Stream-Join Dataflow Graph
+(d) Hardware Mapping (c) Parallel Stream Code
+Linear
+streams
+Addr.
+Gen.
+ALU array
+Crossbar
+Cmp
++
+Filter
+reuse reuse c c
+<, ==, >
+const =
+grad_hist[0]
+hist_addr
+Filter
+strm
+grad
+hist_update
+reuse
+c
+transform
+Main Memory
+setup
+dataflow
+strm
+grad_hist
+To/From Network
+node_ind[p][0:n],
+grad[0:n]
+Local
+Memories
+Indirect Update
+Stream
+Remote
+Mem.&
+Network
+Figure 13: Example SPU Program Transformation: GBDT (Each core
+gets a subset of features to process i.e. fid=tid)
+Programming Model: Programming SPU involves the following
+tasks: 1. partitioning work to multiple cores and data to the scratchpads to preserve locality, 2. extracting the dataflow graph, and possibly re-writing data-dependent control as a stream-join, 3. extracting
+streaming memory accesses, and 4. inserting communication/synchronization.
+In terms of programming abstractions, an SPU’s program consists of a dataflow graph language describing the computation
+(compiled to DGRA), along with a control program which contains
+the commands for streams (similar to stream-dataflow [65]). When
+a control program is instantiated, it is made aware of its spatial
+location, for efficient communication with its neighbors.
+Example Program: To explain how to map programs to SPU abstractions, we use the example of GBDT in Figure 13. We show the
+key kernel of this workload, which is a histogram over sparse lists.
+Figure 13(a) shows the original kernel’s C code. Figure 13(b) shows
+the extracted stream-join dataflow, and (c) shows the control program where memory accesses are represented as streams, which is
+expressed as C + intrinsics. Each stream loads (or stores) data to an
+input (or output) in the dataflow. Figure 13(d) shows how the SPU
+program is mapped to hardware for this algorithm. In hardware,
+the stream code executes on the control core, which creates streams
+to be executed on the scratchpad controller. In turn, the controller
+will deliver/receive data to/from the DGRA compute unit, which
+executes the dataflow.
+The basic parallelization strategy is that each SPU core independently builds histograms corresponding to its allotted subset of
+features. As for how memory is distributed, the dataset is stored
+in main memory in sparse CSR format (feat_ind and feat_val). Accessing these requires linear memory streams. The linear scratchpads store the subset of instances which belong to the current
+working node. As node indices are common across all features, the
+931
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+Mech./
+Wkld
+Indirect
+memory
+Stream join Work partition
+across cores
+Synchronization
+Machine Learning (ML)
+GBDT Create feature histogram
+Join train inst
+subset
+Split features Hierarch. reduce
++ broadcast
+KSVM — Matrix-mult
+for error calc
+Split training
+instances
+Hierarch. reduce
++ broadcast
+AC Read + update child
+parameters
+— Split DAG levels Pipelined communication
+FC Accumulate
+activations
+Resparsify Split weight
+matrix rows
+Broadcast of i/p
+activations
+CONV Accumulate
+activations
+Resparsify Split weight
+matrix rows
+Nearest neighbor
+comm.
+Database
+Merge
+Sort
+— Merge of 2
+sorted lists
+Uniform partition Hierarchical
+Merge
+Hash
+Join
+Cuckoo hash
+lookup
+— Smaller col replicated
+Barrier until each
+core completes
+Sort
+Join
+— Join sorted
+lists
+Equal-range
+partition
+Same as above
+Graph
+Page
+Rank
+Accumulate
+vert. rank
+— All vertices Remote ind. ’add’
+update
+BFS Relax vert.
+distance
+— Active vertices Remote ind. ’min’
+update
+Table 2: Mapping of Algorithms on SPU
+corresponding data is broadcast across all cores. This is done in
+synchronous phases: in each phase, the stream is loaded from a
+predetermined core. Phases are not shown in the figure for brevity.
+As for the dataflow, stream-join is used to iterate sparse feature
+indices and the indices generated due to subsetting the data at each
+decision tree node.
+Indirection is used for histogramming: the histogram address
+and update values are produced in the dataflow, which are then
+consumed by the indirect update stream. In hardware, the stream
+is mapped to the indirect stream table in the scratchpad controller.
+Workload Mapping: Table 2 details how we map each algorithm
+to the SPU architecture in terms of control, memory and communication ISA primitives, as well as the partitioning strategy.
+Framework Integration: We envision that SPU can be targeted
+from frameworks like TensorFlow [8], Tensor Comp. [97], TVM [21]
+for machine learning, or from a DBMS or graph analytics framework [3, 92]. For integration, a simple library-based approach can
+be used, where programmers manually write code for a given machine learning kernel. This is the approach we take in this work.
+Automated compilation approaches, eg. XLA [2] or RStream [78]
+are also possible if extended for data-dependent algorithms.
+6 METHODOLOGY
+SPU: We implemented SPU’s DGRA in Chisel [13], and synthesized
+using Synopsys DC with a 28nm UMC technology library. We use
+Cacti [60] for SRAMs and other components. When comparing to
+GPU power, we omit memory and DMA controllers. We built an
+SPU simulator in gem5 [14, 84, 94], using a RISCV ISA [11] for the
+control core.
+Architecture Comparison Points: Table 3 shows the characteristics of the architectures we compare against, including their on-chip
+memory sizes, FU composition, and memory bandwidth. As for
+SPU, we provisioned the size of the DGRA to match the combined
+throughput of the scratchpads. We provisioned the total amount
+Characteristics GPU [27] SPU-inorder SPU
+Processor GP104 in-order SPU-core
+Cache+Scratch 4064KB 2560KB 2560KB
+Cores 1792 512 64 SPU cores
+FP32 Unit 3584 2048 2432
+FP64 Unit 112 512 160
+Max Bw 243GB/s 256GB/s 256GB/s
+Table 3: Architecture characteristics of GPU, SPU-inorder and SPU
+Workloads CPU GPU
+GBDT LightGBM [49] LightGBM [49]
+Kernel-SVM LibSVM [18] hand-written [12]
+AC hand-written [87] hand-written [87]
+FC Intel MKL SPBLAS [1] cuSPARSE [61]
+Conv layer Intel MKL-DNN [4] cuDNN [24]
+Graph Alg. Graphmat [92] -
+TPCH MonetDB [15] -
+Table 4: Baseline workload implementations
+Dataset Size Density Dataset Size Density
+GBDT Cifar10-bn 50k,3k 1 Yahoo-bn 723k,136 0.05
+#inst,#feat. Higgs-bn 10M,28 0.28 Ltrc-bn 34k,700 0.008
+KSVM Higgs 10M,28 0.92 Connect 67k,700 0.33
+#inst,#feat. Yahoo 723k,136 0.59 Ltrc 34k,700 0.24
+CONV Vgg-3 802k,73k 0.47,0.4 Vgg-4 1.6M,147k 0.4,0.35
+#act,#wgt Alex-2 46k,307k 0.68,0.17 Res-1 150k,9.4k 0.99,0.1
+FC Res-fc 512,512k 0.26,0.84 Vgg-13 4K,16.8M 0.14,0.3
+#act,#wgt Alex-6 9K,37.7M 0.29,0.09 Vgg-12 25k,103M 0.42,0.06
+AC Pigs 622k NA Munin 3.1M NA
+#nodes Andes 727k NA Mildew 3.7M NA
+Graph Flickr 820K,9.8M 0.000015 NY-road 260K,730K 0.00005
+#node,#edge Fb-artist 50K,1.63M 0.0064 LiveJournal 4.8M,68.9M 0.000003
+Table 5: Datasets
+of memory on-chip for the working-sets of ML workloads, as they
+were our primary focus; this has some impact on workloads which
+have large working-sets and are expensive to tile.
+As for comparison to real hardware, the GPU is the most relevant. We choose the NVIDIA P4000, as it has a slightly larger
+total throughput and similar memory bandwidth to SPU. We do
+not include CPU-GPU data-transfer time.
+We also address whether an inorder processor is sufficient by
+comparing against "SPU-inorder", where the DGRA is replaced by
+an array of 8 inorder cores (total of 512 cores). For reference, we
+also compared against a dual socket Intel Skylake CPU (Xeon 4116),
+with 24 total cores.
+Workload Implementations: We implement SPU kernels for
+each workload, and use a combination of libraries and hand-written
+code to compare against CPU/GPU versions. We compared against
+the best implementation (that we were aware of) for each workload
+on real hardware (Table 4). We implement kernels using both
+dense and sparse data-structures wherever possible (shown as
+SPU-dense/sparse).
+Our choice of modest on-chip memory affects the implementations of graph processing and database workloads. For processing larger graphs, we follow a similar technique as proposed in
+Graphicionado [39] to split the graph into "slices" that fit in onchip memory. Edges with a corresponding vertex in another slice
+are instead connected to a copy of that vertex; duplicates are kept
+consistent. An architecture with a larger on-chip memory (such
+as Graphicionado [39], which has 32MB on-chip memory) means
+932
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+cif-b
+1.0
+hig-b
+0.28
+yahoo-b
+0.05
+ltrc-b
+0.008
+GM
+1
+101
+Normalized Speedup
+GBDT
+pigs andes muninmildew GM
+AC
+higgs
+0.85
+yahoo
+0.59
+connect
+0.33
+ltrc
+0.24
+GM
+KSVM
+CPU GPU-dense GPU-sparse SPU-inorder SPU-dense SPU-sparse
+Figure 14: Performance on GBDT, KSVM, AC. (Computation density under benchmark name)
+PR BFS GM
+Graph Alg.
+N-SH SH GM
+Databases
+FC CONV KSVM AC GBDT GM
+1
+101
+102
+Normalized Speedup
+Machine Learning
+CPU GPU SPU-inorder SPU ASIC
+Figure 15: Overall Performance
+less duplicates, and less overhead. The tradeoff is also relevant for
+database workloads. Hash-joins require the hash-table to fit on-chip
+to perform well.
+Benchmarks: We used the datasets specified in Table 5. The uncompressed DNN model is obtained from Pytorch model zoo and
+the compression is done as described in [41] using distiller [6].
+Domain-Specific Accelerator Modeling: We model all domainspecific accelerators using optimistic models appropriate to the
+domain, always considering memory and throughput limitations
+of actual data.
+(1) SCNN [72]: We use a compute-bound model of SCNN according to the dataset density, assuming no pipeline overhead besides memory conflicts.
+(2) EIE [40]: Mechanistic model of EIE at maximum throughput.
+We compare against the scaled version of EIE with 256 cores.
+(3) Graphicionado [39]: We modeled a cycle-level approximation
+of its pipeline stages. We also compare against a version of this
+accelerator with the same peak-memory bandwidth as SPU by
+scaling Graphicionado to 32-cores and 32x32 crossbar.
+(4) Q100 [106]: For fair comparison to Q100, we restrict SPU to 4
+cores (approximately the same area as Q100). We hand-coded
+query plans for Q100, specified as a directed acyclic graph in
+which each node indicates a database operation (join, sort, etc.)
+supported by the Q100 hardware, and edges indicate producerconsumer dependencies. Our model of Q100 is an optimistic
+execution of this query plan under memory and compute bandwidth constraints, which we verified against baseline execution
+time and speedups given by Q100’s authors. This query plan
+is used as a reference for the SPU version, so SPU and Q100
+implement the same algorithm as much as possible.
+VGG-3
+0.34
+Alex-2
+0.14
+VGG-4
+0.1
+Res-1
+0.05
+GM
+CONV
+Res-1
+0.22
+Alex-6
+0.16
+VGG-13
+0.09
+VGG-12
+0.04
+GM
+1
+101
+102
+Normalized Speedup
+FC
+CPU
+GPU-dense
+GPU-sparse
+SPU-inorder
+SPU-dense
+SPU-sparse
+EIE-256/SCNN
+Figure 16: Performance on DNN. (Compute density under bench name)
+7 EVALUATION
+Our evaluation broadly addresses the question of whether datadependencies exposed to an ISA (and exploited in hardware) can
+help achieve general-purpose acceleration. Here are the key takeaways, in part based on the overall performance results in Figure 15.
+(1) SPU achieves high speedup over CPUs (for ML:16.5×,
+Graph:14.2× and DB:10.3×), and GPUs (ML:3.87×).
+(2) Performance is competitive with domain-accelerators.
+(3) Relying on inorder cores only for supporting data-dependence
+is insufficient.
+(4) Architectural generality provides the flexibility to choose algorithmic variants depending on the algorithm and dataset.
+7.1 Performance on Machine Learning
+Here we discuss the per-workload performance results on ML workloads, the breakdown for GBDT/KSVM/AC is in Figure 14 and for
+DNN is in Figure 16. During our analysis, we refer to Figure 17,
+which describes the utilization of compute, scratchpad, network,
+and memory within SPU.
+GBDT: Both GPUs and SPUs use a histogram-based approach, but
+SPU’s aggressive reordering of indirect updates in the computeenabled scratchpad far outperforms the limited reordering which
+GPUs can perform within a vector request. Further, SPU makes efficient use of multicast for communication of gradients. SPU-dense
+outperforms GPU dense, because histogramming is still required
+even with dense datasets. On a highly dense dataset like cifar, SPUdense outperforms SPU sparse because of the extra bandwidth
+consumed by sparse data structures, which is an example of the
+benefit of having a flexible architecture.
+KSVM: SPU’s network enables efficient broadcast and reduction.
+933
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+FC CONV GBDT KSVM AC PR BFS 0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Resource Utilization
+comp_util spad_bw_util net_bw_util mem_bw_util
+Figure 17: SPU Bottleneck on Machine Learning/Graph Workloads.
+Since the dense version of KSVM is quite regular and the datasets
+are not sufficiently sparse, SPU-dense is generally better than its
+sparse version.
+Arithmetic Circuits: AC heavily uses indirect memory in the
+DAG traversal and data-dependent control (actions depend on node
+type) that we support efficiently. SPU’s network enables efficient
+communication for model parallelism, which would otherwise need
+to go through global memory on a GPU.
+Sparse Fully Connected Layers: Figure 16 shows the perworkload performance for DNN. Using the alias-free indirection
+approach, we achieve high hardware utilization of the computeenabled scratchpad. SPU outperforms GPU-sparse because it can
+also exploit dynamic sparsity of activations using stream-join.
+Domain-accelerator Comparison: Compared to the EIE accelerator,
+SPU devotes more area to computation bandwidth and for providing
+high-throughput access to banked scratchpad, thus attaining similar
+performance at around half the area. Since the primary design goal
+of EIE is energy, it stores all weights in SRAM to save DRAM access
+energy; SPU trades-off lower area for higher energy.
+Sparse Convolution: The best GPU algorithm was a dense
+winograd-based CNN. SPU is able to save computations by
+exploiting sparsity through the outer-product convolution using
+indirect memory, and dynamic resparsification.
+Domain-accelerator Comparison: The performance of SPU on average is 0.76× that of SCNN. This is due to bandwidth sharing of the
+compute-enabled-memory scratchpad between computation and
+re-sparsification, whereas SCNN uses a separate non-configurable
+datapath. The performance difference increases for layers where
+re-sparsification is more intense. While comparing area is difficult,
+a simple scaling of SCNN’s area suggests only 1.5× higher area for
+SPU (Section 7.5), a small price for significant generality.
+SPU’s Performance Bottleneck: Figure 17 shows the utilization
+for primary bottlenecks in SPU. Bank conflicts are the bottleneck for
+DNN workloads, and the effect is reduced for the fully-connected
+layer. GBDT is bottlenecked by scratchpad and memory bandwidth.
+Since AC uses model parallelism, it is bottlenecked by the network.
+7.2 Performance on Graph and Databases
+Here we discuss the per-workload performance results on graph
+(Figure 18) and database (Figure 19) domains.
+Graph Workloads: SPU specializes the alias-free indirect updates
+to the destination vertices which would otherwise both be stalled
+due to load-store dependencies, and limited by inefficient bandwidth
+utilization due to accessing whole cache line for single accesses.
+Flickr
+9.8M
+Fb-artist
+1.64M
+NY-road
+0.73M
+GM
+BFS
+Flickr
+9.8M
+Fb-artist
+1.64M
+LJ
+69M
+GM
+1
+101
+102
+Normalized Speedup
+PR
+CPU SPU Graphicionado Graphicionado-32
+Figure 18: Performance on PR, BFS. (Edges under benchmark name)
+q1
+q2
+q3
+q4
+q5
+q6
+q7
+q10
+q15
+q16
+q17
+GM
+1
+101
+102
+Normalized Speedup
+CPU
+SPU Dense
+SPU Sparse (Join Only)
+SPU Sparse (Join + Ind.)
+Q100
+Figure 19: TPCH Performance comparison
+For SPU, the network experiences high traffic because of remote
+indirect updates (Figure 17).
+Domain-accelerator Comparison: While the designs are quite different, SPU’s performance is similar to Graphicionado (8-cores) as
+it is exploiting similar parallelism strategies: both have a way to
+efficiently execute indirect memory access on a globally-addressed
+scratchpad. Even for the scaled-up version of Graphicionado (32-
+cores), it only exceeds SPU slightly for road graph due to the network contention on SPU’s mesh. LiveJournal graph is an example
+where the graph fits in on-chip memory of Graphicionado but
+needs to be broken in 10 slices to be able to run on SPU. Here,
+SPU is 57% slower than the scaled-up Graphicionado due to both
+network contention and extra memory accesses for vertices which
+are duplicated while slicing.
+TPCH Queries: Our primary goal in evaluating TPCH was to
+demonstrate generality. Figure 19 shows the per-query speedups
+of a 4-core SPU versus Q100, with three versions. SPU-dense allows only data-dependent discards (no joins or indirect memory
+on CGRA). Here, Joins and Sorts are performed on the control core.
+SPU-sparse (Join only) adds support for using the compute fabric
+for accelerating Sort (using merge-sort) and Join. When indirectmemory support is added, we additionally support hash-join if
+the smaller column fits within the scratchpad. With indirection
+enabled, we use a sort algorithm which applies radix-sort locally
+within local scratchpads, then use a merge-sort to aggregate across
+cores. Compared to CPU, SPU is significantly faster (10×), which is
+sensible given the significant data-dependence in queries, which
+serializes CPU execution.
+Domain-accelerator Comparison: In queries which are non-sort
+heavy (Q1,Q2,Q6), the dense version of SPU performs adequately,
+and similar to the accelerator. On sort-heavy queries, stream-join
+within DGRA significantly reduces computation overhead, allowing
+SPU to catch up to Q100. Indirect access support helps to slightly
+improve sort’s performance. Hash joins are significantly faster, but
+934
+MICRO’19, October 12-16, 2019, Columbus, OH, USA Dadu et al.
+0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+Density
+10-1
+100
+101
+102
+103
+Normalized speedup
+CPU-dense
+CPU-sparse
+GPU-dense
+GPU-sparse
+SPU-dense
+SPU-sparse-SJ
+SPU-sparse-AF-Ind
+Figure 20: Performance Sensitivity (Matrix Multiply, dim: 9216×4096)
+do not contribute much to speedup due to limited applicability
+(because of limited scratchpad size).
+7.3 Sensitivity to Dataset Density
+We demonstrate that it is useful to have both non-data-dependent
+and data-dependent support by studying performance sensitivity
+of a FC layer (Alex-6). Specifically we vary the dataset density with
+synthetic data, assuming uniform distribution of non-zero values.
+Figure 20 shows the performance comparison of different architectures executing matrix-vector multiply using dense and sparse data
+structures. At densities lower than 0.5, sparse versions perform
+better as they avoid superfluous computation and memory access.
+However, for densities greater than 0.5, extra memory accesses due
+to using sparse data-structures reduces the benefit.
+As for the different sparse implementations for SPU, alias-free
+indirection outperforms stream-join at low densities, because it can
+avoid unnecessary index loads. Their performance converges at
+higher densities when this overhead is relatively less important.
+We observe that for the problems which can be expressed using
+indirection or stream-join, it is often the case that indirection works
+better. We believe this is the reason why recent accelerators which
+exploit sparsity use alias-free indirection [39, 40, 72]. However,
+there are kernels which might have an algorithmic advantage when
+expressed as a stream-join (examples in Table 1, Page ). Indirection
+can also be inferior if there is not enough on-chip memory to hold
+the working-set, especially if the data is difficult to tile effectively.
+7.4 Benefit of Decomposability
+The speedup from decomposability is given below in Table 6.
+Alg. GBDT Conv. FC KSVM AC BFS PR
+Speedup 2.27 2.67 2.67 2 3 2 1
+Table 6: Perf. Speedup With Adding Decomposability
+To explain, GBDT uses 16-bit datatypes and gets 2.27× speedup,
+because although we can increase the compute throughput by 4,
+memory bandwidth becomes a bottleneck. Conv, and FC use 16-bit
+datatypes, but only see a 2.6× improvement: although the multiplications could be done using subword-SIMD alone, decoding
+run-length encoding of indices involves control serializing computation, which needs decomposability. AC involves various bitwidths
+Area (mm2
+) Power (mW)
+Control Core 0.041 10.1
+SRAM (banked+linear) 0.196 21.2
+Data Vector ports 0.012 1.4
+Scratchpad Controller 0.094 18.1
+Network 0.107 130.2
+DGRA FUs (4x5) 0.124 115.9
+Total DGRA 0.230 246.1
+1 SPU Total 0.573 297.0
+Table 7: Area and Power breakdown for SPU (28nm)
+64 bits
+Trad.
+32bits
+Trad.
+16bits
+Trad.
+8bits
+Trad.
+64 bits
+Meta-R
+32bits
+Meta-R
+16bits
+Meta-R
+8bits
+Meta-R
+30k
+60k
+90k
+120k
+Area (um2)
+0
+40
+80
+120
+160
+Power Consumption (mW)
+Area (¹m2)
+Power (mW)
+Figure 21: DGRA Area and Power Sensitivity
+(ranging from 1-bit boolean to 32-bit fixed point) coupled with
+control flow. As DGRA allows bitwidths as small as 8-bit, we can
+merge instructions with smaller bitwidths even if their control
+flow is different, to achieve 3× throughput. As BFS and KSVM use
+32-bit datatypes, they can be fully combined using DGRA, for 2×
+improvement.
+7.5 Area and Power
+Sources of area and power: Table 7 shows the sources of area
+and power for SPU at 28nm. The two major sources of area are the
+scratchpad banks and DGRA, together occupying more than 2/3 of
+the total; DGRA is the major contributor to power (assuming all
+PEs are active).
+Overhead with decomposability: Figure 21 shows the power
+and area cost of implementing the stream-join control and decomposability (simplest design is a standard 64-bit systolic CGRA). The
+stream-join control model costs about 1.7× area and power, and this
+is mostly due the complexity of dynamic flow control (rather than
+the control table). On top of this, decomposability costs around
+1.2× area and power. Overall these are reasonable overheads given
+the performance benefits.
+SPU’s power and area comparison to the GPU: Estimates below show SPU has 4× lower power.
+Alg. GBDT Conv. FC KSVM AC
+SPU (W) 21.16 20.73 21.18 21.43 16.48
+GPU (W) 84.87 84.02 84.92 85.42 75.60
+8 RELATED WORK
+Table 8 gives a high-level overview of how we position SPU relative
+to select related work. In general, domain-specific accelerators
+target up to one form of data-dependence, while SPU has efficient
+support for both, and a domain-agnostic interface.
+935
+Towards General Purpose Acceleration by Exploiting Common Data-Dependence Forms MICRO’19, October 12-16, 2019, Columbus, OH, USA
+Architecture Domain StreamJoin
+Alias-free
+Ind.
+Non-datadependent
+Scnn/EIE[40, 72] Sparse-NN - Very-High -
+Q100 [106] DB Very-High - -
+Graphicion. [39] Graph Alg. - Very-High -
+Sparse ML [59] Sparse-MM Very-High - -
+PuDianNao [54] NN - - Very-High
+Outersp [70] Sparse-MM - Very-High -
+LSSD [66] Agnostic Low Low Very-high
+Plasticine [76] Agnostic - High Very-high
+SPU (ours) Agnostic VeryHigh
+VeryHigh
+VeryHigh
+VT [52, 53] Agnostic High High High
+Dataflow [16, 93] Agnostic Medium Medium High
+GPU Agnostic Low Medium High
+CPU Agnostic Low Medium Medium
+Table 8: Analysis of Related Works (roughly least to most general)
+Domain-specific Accelerators: Pudiannao [54] is an accelerator
+for multiple dense ML kernels. Several designs specialize sparsematrix computations, including many for FPGAs [34, 38, 111].
+Nurvitadhi et al. propose a sparse-matrix accelerator specialized
+for SVM [68]. Mishra et al. develop an in-core accelerator for sparse
+matrices, and demonstrate generality to many ML workloads [59].
+From the database accelerator domain, we draw inspiration from
+Q100’s ability to perform pipelined join and filtering [106] to create our general purpose stream-join model. DB-Mesh [17] is a
+systolic-style homogeneous array for executing nested-loop joins.
+WIDX [50] is database index accelerator focusing on indirect memory access. UDP [32] targets encoding and compression workloads,
+which both express data-dependence.
+Domain-agnostic Vector Accelerators: Vector-threads (VT)
+architectures [52, 53, 82] have a flexible SIMD/MIMD execution
+model, where vector lanes can be decomposed into independent
+lanes to enable parallel execution for data-dependent codes.
+(GANAX [107] applies some of the same principles, but is
+specialized to ML). VT does not have spatial abstractions for
+computation, which SPU uses to expose an extra dimension of
+parallelism: pipeline parallelism. For example on VT, stream-joins
+would not execute at one item per cycle due to instruction
+overhead, but these computations can be pipelined on SPU. There
+are other less fundamental differences like SPU’s support for
+programmer-controlled scratchpads with global address space.
+Domain-agnostic Spatial Architectures: LSSD is a domainagnostic multi-tile accelerator with CGRAs and simple control
+cores [66]. However, it lacks support for data-dependent control or
+memory, so is far less general.
+General spatial-dataflow architectures (eg. WaveScalar [93],
+TRIPS [16]) can perform stream joins, but at much lower throughput (due to control dependence loop, see Figure 4). Triggered
+instructions [71] and Intel’s CSA [104] can perform pipelined
+stream-joins, but require much more complex non-systolic PEs
+(>3× higher area [81]), and are also not capable of decomposability.
+They are also not specialized for alias-free indirection, and require
+parallel dependence checking. In concurrent work, Master of
+None [55] proposes a programmable systolic-style homogeneous
+reconfigurable array that can execute general database queries, as
+well as pipelined stream-join through a dedicated control network.
+Plasticine [76, 77] is a tiled spatial architecture, composed of
+SIMD compute tiles and scratchpad tiles. Plasticine does not support
+stream-join dataflow, so would not be able to efficiently execute algorithms with this form of control-dependence. Plasticine also does
+not have compute-enabled globally-addressed scratchpads for highbandwidth atomic update and flexible data sharing. Plasticine uses
+a parallel pattern programming interface [51, 75], while SPU provides a general purpose dataflow ISA, based on stream-dataflow [65].
+While lower-level, SPU’s ISA can more flexibly implement various
+computation/communication patterns. Recent work demonstrates
+efficient hash-joins for Plasticine [89]; such techniques could improve the performance and applicability of hash-joins in SPU.
+Finally, lower precision control divergence is not supported in
+these architectures; SPU has the strongest support for arbitrary
+datatypes through its decomposable CGRA and memory. Note that
+while decomposability has been applied in other contexts, e.g. supporting multiple datatypes on a domain-specific CGRA [46, 86],
+we believe we are the first to apply decomposability to preserve
+independent flow-control.
+General Purpose Processor Specialization: The decoupledstream ISA [101] allows expression of decoupled indirect streams
+for general-purpose ISAs. It also enables decoupling of memory
+from control flow in stream-joins. However, it does not specialize
+for the stream-join computation or high-bandwidth indirect access.
+9 CONCLUSION
+This work identifies two forms of data-dependence which are
+highly-specializable and are useful enough to be applicable to a variety of algorithms. By defining a specialized execution model and
+codesigned hardware, we enabled efficient acceleration of a large
+range of workloads. Overall, we observed up to order-of-magnitude
+speedups and significant power reductions compared to modern
+CPUs and GPUs, while remaining flexible.
+More broadly, this work shows that data-dependence does not
+necessitate fixed-function hardware or massive arrays of inorder
+processors – many algorithms are fundamentally data-parallel and
+can be specialized provided the right architecture abstractions. We
+believe that an important implication of this work could be to
+inspire the communities in different domains (eg. machine learning
+and databases) to explore the use of less regular data-structures
+and novel algorithms with codesigned hardware.
+10 A

@@ -1,0 +1,549 @@
+Coflow scheduling can effectively improve the application performance and has been studied a lot in cooperative environments (e.g., private datacenter networks), where fairness is not the primary concern. In non-cooperative environments (e.g., multi-tenant datacenter networks), coflow scheduling should be strategy-proof; otherwise, some tenants could unfairly acquire more resources by cheating the scheduler. As minimizing coflow completion time (CCT) must prioritize coflows based on some specific rules (e.g., shortest-coflow-first, smallest-effective-bottleneck-first), tenants can raise the priority of their coflows by lying about the coflow information. Thus, it is a common belief that optimizing coflow performance can inevitably violate strategy-proofness.
+
+In this paper, we argue that the average CCT can be reduced without violating strategy-proofness. Our key insight is that prioritization can inherently achieve better CCT even without those specific rules such as smallest-effective-bottleneck-first. We propose RICH, a coflow scheduler in non-cooperative environments. At its heart, RICH splits the time into multiple rounds. In each round, RICH ensures that the total data transmitted by each tenant can provide optimal isolation guarantee. Among different rounds, RICH prioritizes coflow transmission among tenants in a round-robin manner. In this way, all tenants are fairly prioritized, and tenants do not necessarily gain more bandwidth by cheating. Extensive simulations show that RICH outperforms other strategy-proof mechanisms by up to 39.3% in terms of average CCT.
+Keywords
+Coflow scheduling
+Datacenter networks
+Data-intensive applications
+
+1. Introduction
+Data-parallel applications such as MapReduce (Dean and Ghemawat, 2008) and Spark (Zaharia et al., 2010) that are widely applied to cloud computing are very common in the datacenters. In these applications, a job usually contains communications between various pairs of servers, generating several parallel end-to-end flows. Generally, the communication does not finish until all flows have finished their transmissions. Therefore, optimizing the performance of individual flows does not necessarily improve application performance. Thus, the coflow abstraction (Chowdhury, 2015a) has been proposed to narrow down the mismatch. Coflow refers to a collection of parallel flows with the same objective. A coflow does not complete until all its constituent flows have finished. Minimizing the coflow completion time (CCT) can truly accelerate the corresponding job. To this end, tremendous efforts have been made to optimize coflow performance (Chowdhury et al., 2014, Chowdhury and Stoica, 2015, Zhang et al., 2016, Wang et al., 2017, Wang et al., 2018a).
+
+Most of these works focus on minimizing the average CCT in cooperative environments like private datacenter networks. In these environments, it is feasible to let different jobs collaborate to improve the overall application performance. Specifically, coflow scheduling algorithms prioritize some coflows against others to minimize the average CCT. For example, Varys (Chowdhury et al., 2014) preferentially allocates the bandwidth to the coflows with the smaller bottleneck’s completion time.
+
+However, the same mechanisms cannot directly be employed in non-cooperative environments like multi-tenant datacenter networks. In these environments, various tenants from different entities share the same resources. A tenant is not willing to yield resources to other tenants. In such environments, prioritizing coflows among different tenants according to a specific rule like smallest-coflow-first can encourage tenants to lie about their demands. Thus, a scheduling algorithm should be strategy-proof — a tenant should not be able to obtain more bandwidth by lying (Chowdhury et al., 2016). In fact, it has been long believed that strategy-proofness and minimizing CCT are conflicting objectives (Chowdhury et al., 2016).
+
+Recent works on coflow scheduling in non-cooperative environments either give up prioritization to ensure strategy-proofness (Chowdhury et al., 2016, Ghodsi et al., 2011) or trade off strategy-proofness for performance (Wang et al., 2017). DRF (Ghodsi et al., 2011) and HUG (Chowdhury et al., 2016) equally split the bandwidth among the competing coflows in a max–min fair manner. However, without prioritization, they cannot achieve satisfactory performance in CCT. For example, HUG sustains 1.45 longer average shuffle completion time of MapReduce against Varys (Chowdhury et al., 2016). On the other hand, a series of mechanisms (Wang et al., 2017, Wang et al., 2018a, Wang and Jin, 2016) show that CCT can be significantly reduced by trading off the strategy-proofness. For example, Coflex (Wang et al., 2017) uses a tunable fairness knob to flexibly offer a tradeoff between fairness and efficiency. Utopia (Wang et al., 2018a) can achieve near-optimal CCT performance with provable isolation guarantee. However, even though these mechanisms are designed with long-term fairness in mind, they can suffer from serious unfairness in some specific situations (Section 2).
+
+In this paper, we argue that the CCT can be further reduced without violating strategy-proofness. This is based on two insights. First, prioritization does not necessarily result in the violation of strategy-proofness. The violation of strategy-proofness only happens when the rules of prioritization are merely determined by the properties of the coflows (e.g., size, length, width) and can be successfully speculated by the tenants. As long as the tenants are not able to discover the rules of prioritization, they cannot obtain more bandwidth by cheating. Second, regardless of the scheduling order, prioritizing coflows inherently achieves lower CCT than the max–min division of bandwidth. In other words, even prioritization without some specific rules such as smallest-coflow-first, the CCT can still be reduced compared with DRF and HUG.
+
+We propose RICH, a Round-robIn Coflow scHeduler. RICH splits the time into multiple rounds. Similar to HUG, RICH ensures that the overall bandwidth allocated to each tenant in each round can provide the optimal isolation guarantee. Different from HUG, RICH prioritizes coflows inside each round to minimize CCT. Among different rounds, the prioritization is conducted in a round-robin manner among all tenants. For example, if tenant A is prioritized against tenant B in the first round, tenant B is prioritized against tenant A in the second round. In this way, all tenants are fairly prioritized. Furthermore, as the prioritization order is irrelevant to the coflow properties, a tenant cannot gain more bandwidth by lying about its coflow information.
+
+We evaluate RICH through extensive trace-driven simulations with realistic settings. RICH outperforms HUG by up to 2 in terms of average CCT. Meanwhile, RICH can ensure fair bandwidth allocation among tenants at the granularity of one round.
+
+2. Background and motivation
+In this section, we begin by presenting the background of the coflow abstraction and the non-cooperative environment. Then we show the problems of existing coflow schedulers in non-cooperative environments.
+
+2.1. Coflow scheduling in non-cooperative environments
+2.1.1. Coflow abstraction
+Data parallel computation frameworks that are widely used for cloud computing and machine learning are very common in datacenters (e.g., MapReduce (Dean and Ghemawat, 2008), Spark (Zaharia et al., 2010), Tensorflow (Abadi et al., 2016)). In these frameworks, a job contains multiple computation and communication stages. The communication stage usually involves many parallel data transmissions. The coflow abstraction is proposed to express the communication requirements of the communication stage.
+
+MapReduce is a cluster computing framework implemented in Apache Hadoop that is widely applied to cloud computing. As shown in Fig. 1, in MapReduce, mappers running on a group of machines process data from the distributed file system (DFS) (Chowdhury, 2015a), sort key/value pairs in the data by the key, and use them as the intermediate data that will be inputted to reducers; each reducer distributed on another group of machines fetches the data with the same key from all the mappers, which is called as “shuffle”; finally, the reducers merge the data and produce the final result written to the DFS.
+
+We assume a MapReduce job involves  mappers (
+) in machine group  and  reducers (
+) in machine group , as shown in Fig. 1. In the data shuffling phase,  flows (
+) are generated from intermediate data between these mappers and reducers in the network. The collection of these parallel flows is often referred to as a  which can be denoted as 
+, where  is the cardinality (i.e., the number of flows and ) in  [3]. Coflow  will not complete until all flows (
+) have finished.
+
+
+Download : Download high-res image (140KB)
+Download : Download full-size image
+Fig. 1. Communication pattern in MapReduce.
+
+Thus, a coflow is defined as a collection of parallel flows that are semantically-related and have the same object (e.g., minimizing completion time of a job in cluster computing applications, making sure a job meets the deadline).
+
+2.1.2. Non-cooperative environments
+In public clouds, various tenants from different entities share the same network. Unlike in private datacenters, a tenant is usually not willing to compromise on its bandwidth to accelerate the shorter coflows of another tenant, even though it can reduce the overall coflow completion time. Therefore, such environments are called non-cooperative environments.
+
+Traditional coflow scheduling algorithms in cooperative environments do not apply to such environments, because these algorithms prioritize coflows according to the coflow attributes (e.g., smallest-effective-bottleneck-first). This may encourage tenants to cheat the scheduler, as tenants can acquire more bandwidth by lying about their coflow information. For example, a tenant can cut its coflow into multiple short sub-coflows. By reporting these sub-coflows instead of its actual coflow, it can raise its priority of occupying bandwidth.
+
+2.1.3. Objectives
+According to the above characteristics, an ideal coflow scheduler in non-cooperative environments should have the following properties.
+
+Strategy-proofness. A tenant should not obtain more bandwidth by lying about its bandwidth demands. This can prevent tenants from cheating the scheduler and incentivize tenants to report their actual coflow information.
+
+Efficient Performance. A coflow scheduler should achieve high-performance coflow scheduling by minimizing the average CCT. This can accelerate the completion of jobs of datacenter applications.
+
+Isolation Guarantee. In non-cooperative environments, multiple tenants share the same network and contend for bandwidth together. To provide predictable performance for tenants, an ideal coflow scheduler should also guarantee performance isolation among tenants.
+
+2.1.4. Existing approaches
+A great deal of works about coflow scheduling in non-cooperative environments has been proposed. Fair schedulers (Chowdhury et al., 2016, Ghodsi et al., 2011, Wang and Jin, 2016, Popa et al., 2012) provide isolation between tenants, which assign each coflow a fair share of bandwidth and isolate the completion of each coflow from another. Among them, HUG (Chowdhury et al., 2016) is a state-of-the-art scheduler. HUG provides optimal isolation guarantee among tenants while preserving strategy-proofness. However, it is not performance-efficient in terms of CCT. To improve HUG, Coflex (Wang et al., 2017) attempts to flexibly adjust the balance between isolation guarantee and high efficiency, and Utopia (Wang et al., 2018a) also attains near-optimal performance with provable isolation guarantee by a novel bandwidth allocation algorithm based on super-coflow. Coflex and Utopia can substantially improve the efficiency of coflow performance. However, as shown below, they are not strategy-proof and can result in unfair scheduling.
+
+2.2. Problems of existing approaches
+In this subsection, we show the limitations of the state-of-art coflow schedulers in non-cooperative environments.
+
+2.2.1. Poor efficiency of HUG
+HUG partitions the bandwidth among tenants in a max–min manner. It can provide the optimal isolation guarantee. However, without prioritization, its coflow performance is poor.
+
+To show this, we consider the example in Fig. 2. Two coflows are contending on two 1 Gbps links. Coflow  needs to transmit 300 Mb on link-1 and 100 Mb on link-2, respectively. Its demand can be denoted by 
+. Coflow  needs to transmit 400 Mb on link-1 and 300 Mb on link-2, respectively. Its demand can be denoted by 
+.
+
+With HUG, the bandwidth allocation is shown in Fig. 2(a). The CCTs of coflow  and coflow  are 600 ms and 700 ms, respectively. In comparison, for performance-efficient coflow scheduling like shortest-coflow-first, the bandwidth allocation result is shown in Fig. 2(b). As coflow  is smaller than coflow , coflow  is transmitted first. The CCTs of coflow  and coflow  are 300 ms and 700 ms, respectively. Compared with the shortest-coflow-first algorithm, HUG extends the CCT of coflow  by 2 without improving the CCT of coflow  at all. Overall, the coflow performance of HUG is 23% worse than that of the shortest-coflow-first algorithm in terms of the average CCT. Note that even if the larger coflow (i.e., coflow ) is prioritized, the CCT performance can still be improved upon HUG. Thus, there is much room for improving the efficiency of HUG.
+
+2.2.2. Strategy-proofness violation of Coflex and Utopia
+Unlike HUG, Coflex and Utopia argue that the constraint on strategy-proofness should be relaxed so that the coflow performance can be significantly improved. Specifically, Coflex schedules all coflows according to the smallest-effective-bottleneck-first (SEBF) heuristic after assigning each coflow a tunable fraction of its DRF allocation. As a result, the coflow with the smallest bottleneck’s completion time has a higher priority to obtain unused bandwidth. Similarly, with Utopia, the coflow that completes earlier with DRF can get bandwidth preferentially.
+
+However, because of the absence of strategy-proofness for Coflex and Utopia, a tenant can acquire more bandwidth by cheating. To show this, we consider the previous example. Fig. 3(a) and Fig. 3(c) show the bandwidth allocation of Coflex and Utopia, respectively. The fairness knob  of Coflex is 0.5. Coflex fairly allocates 0.5 Gbps bandwidth on link-1 to coflow  and coflow . Then, to improve the CCT performance, Coflex allocates the remaining 0.5 Gbps bandwidth to the smaller coflow (i.e., coflow ). On the other hand, Utopia prioritizes coflow  over coflow . Both of them can achieve better CCT than HUG.
+
+However, assume that coflow  and coflow  belong to different tenants (i.e., tenant  and tenant , respectively). Then tenant  can acquire more bandwidth by cheating. Specifically, if coflow  is divided into multiple short coflows, say, coflows 
+ and 
+. Their demands are 
+. As shown in Fig. 3(b), with Coflex, tenant  can get extra 0.5 Gbps bandwidth at 0 ms, 183 ms and 300 ms, respectively. As shown in Fig. 3(d), with Utopia, tenant  can occupy all of the bandwidth that should have been allocated to tenant .
+
+
+Download : Download high-res image (469KB)
+Download : Download full-size image
+Fig. 3. Illustration of strategy-proofness violation of Coflex and Utopia .
+
+2.2.3. Summary
+In summary, HUG is strategy-proof and can provide optimal isolation guarantee. However, its CCT performance is poor and still has much room for improvement. Coflex and Utopia dramatically optimize the CCT performance. However, they are not strategy-proof. A tenant can acquire much more bandwidth by cheating. This will incentivize tenants to lie about their actual bandwidth demands, which prevents schedulers from optimizing performance.
+
+3. RICH design
+Due to the limitations of existing approaches, we design RICH, a strategy-proof scheduler aiming to efficiently schedule coflows.
+
+3.1. Assumptions and model
+Network Model. As in previous works Chowdhury (2015a) and Chowdhury et al., 2014, Chowdhury et al., 2016, we model the datacenter fabric as a non-blocking switch as shown in Fig. 4. We assume that there are  physical machines connected through the network. Machine  () is connected to other machines through full-duplex uplink- and downlink-.
+
+Coflow Scheduling Model. Each coflow may have data transmission demand on uplinks (i.e., link-, , link-) and downlinks (i.e., link-, , link-). For a coflow , we use a demand vector 
+ to describe the transmission demand of coflow  on  links, where 
+ represents the amount of data to be transmitted on link-i.
+
+
+Download : Download high-res image (122KB)
+Download : Download full-size image
+Fig. 4. An  datacenter fabric with  ingress/egress ports connecting to  machines.
+
+We assume there are  tenants in the network and each tenant may have multiple coflows. The demand for each tenant is the sum of the demand of all its coflows. Specifically, we assume that tenant 
+ has 
+ coflows (denoted by 
+). For tenant 
+, the demand vectors of its coflows are denoted by 
+. Then the demand vector of tenant 
+ is given by (1)
+
+Finally, we let 
+ be the bandwidth allocated to tenant 
+ on every links by the scheduler, where 
+ is the allocated bandwidth on link-i.
+
+3.2. Basic idea
+RICH is based on two key ideas. First, regardless of the order, prioritizing coflows inherently achieves better CCT performance than splitting bandwidth. Splitting bandwidth extends the CCTs of all tenants. Consider an extreme example where all CCTs are of the same length. Equally splitting the bandwidth makes all CCTs the same. Instead, if the coflows are transmitted one by one, the majority of coflows can finish earlier, significantly reducing the average CCT. Of course, when coflows are not uniform, prioritizing long coflows penalizes short coflows. We argue that this can be avoided by painstakingly splitting time into multiple rounds and limiting the size of the data transmitted by long coflows in each round.
+
+Second, prioritization does not necessarily result in the violation of strategy-proofness. The violation only happens if the prioritization rule is purely based on the coflow properties and thus can be inferred by the tenants. For example, if the scheduler always prioritizes short coflows, the tenants can infer that cutting coflows into short ones can acquire more bandwidth.
+
+Combining the above two ideas, we propose to schedule coflows through multiple rounds and prioritize coflows in a round-robin manner among different tenants in each round. In this way, each tenant has the same opportunity to prioritize its coflows over other tenants’, and the bandwidth can be fairly allocated in the long run. Meanwhile, the tenant does not benefit from cheating the scheduler. Specifically, we use two mechanisms to bring the above ideas into practice and illustrate them through a simple example where tenant 
+, tenant 
+ and tenant 
+ have one coflow (
+, 
+ and 
+) on one 1 Gbps link, respectively, as shown in Fig. 5.
+
+3.2.1. Splitting time into multiple rounds
+As shown in Fig. 5(a), RICH splits the time into three rounds (Round 1, Round 2, and Round 3). In each round, RICH limits the total amount of data transferred by tenant so that the overall bandwidth allocation is max–min fair. And RICH assigns enough amount of data transmission only for one shorter coflow so that it can complete in a round and other coflows cannot finish. Then RICH prioritizes the coflows to optimize the CCT performance.
+
+3.2.2. Round-robin prioritizing
+To further ensure that coflow scheduling is strategy-proof, RICH adopts a round-robin way to prioritize coflows of each tenant. Tenant 
+ is prioritized against tenant 
+ in the first round, but tenant 
+ takes precedence over tenant 
+ in the second round, as shown in Fig. 5(a). This mechanism effectively ensures that all tenants can be fairly prioritized. It fundamentally prevents tenants from gaining more bandwidth by lying since the prioritization order is irrelevant to the coflow properties.
+
+Prioritization for coflows also speeds up their completion since every coflows dominate the bandwidth in turn in a round. Since RICH prioritizes coflows in a round-robin manner and constrains the amounts of data transferred for coflows of tenants in each round, the bandwidth occupied by the high-priority coflow is used by the low-priority coflow after high-priority coflow consumes its amount of data transmission. Therefore, in each round, a shorter coflow with sufficient bandwidth and amount of data transmission is more likely to complete before the end of the round, which accelerates the completion of coflows.
+
+In Fig. 5(a), coflow 
+, coflow 
+ and coflow 
+ arrive at 0 ms and transmit 200 Mb, 100 Mb and 400 Mb, respectively. They are prioritized in the order of their tenants in each round. In the first round, we assume that the order of tenants is 
+, 
+, 
+, so the order of coflows is 
+, 
+, 
+. Each coflow is allowed to transfer 100 Mb in this round. Coflow 
+ of tenant 
+ can get the full 1 Gbps bandwidth and complete at 200 ms before the end of the round. However, under HUG, as all coflows equally share the entire link and each one has the same bandwidth of 1/3 Gbps from 0 ms to 300 ms, so coflow 
+ has to complete at 300 ms later than under RICH, as shown in Fig. 5(b). The performance of coflows has been significantly improved with RICH.
+
+3.3. Design details
+In this subsection, we present the overall architecture of RICH and how it works with three details.
+
+Architectural Overview. RICH is a coordinated coflow scheduler consisting of two components: the master and the daemon, as shown in Fig. 6. The master is deployed on a controller, and the daemons run on every end host. The master integrates the information (e.g., tenants’ status and network bandwidth) provided by daemons and schedules coflows for tenants in the global view of the network. RICH master computes the allowed transmission volume for tenants and rates of flows within coflows for tenants and distributes the decision to end hosts at the beginning of each round. The master updates bandwidth allocation to coflows if the transmission volumes are exhausted by tenants in a round. Besides, the master achieves the management of registration for tenants through a client library. The daemons monitor coflows’ status (e.g., the demand vectors and the number of bytes sent by each coflow) on API and report it to the master periodically. End hosts allocate bandwidth for flows within coflows using the rate limiter.
+
+RICH works by following these steps: First, at the beginning of each round, RICH calculates the overall bandwidth allocation for each tenant in this round with HUG. Then RICH determines the round duration based on the shortest completion time among all coflows with HUG. Second, given the bandwidth and the round duration, RICH assigns each coflow the number of bytes that can be transferred in this round. Finally, RICH schedules coflows based on prioritization.
+
+
+Download : Download high-res image (222KB)
+Download : Download full-size image
+Fig. 6. RICH architecture.
+
+Next, we show the details of the above three steps. We start with an offline problem which involves scheduling  coflows within  tenants. These coflows arrive at time 0.
+
+Setting the round duration. The round duration is crucial to the performance of RICH. We have investigated several approaches (more details in A) and choose the most efficient one as follows.
+
+At the beginning of each round, we obtain the different completion times of all coflows under HUG and set the round duration as the completion time of the coflow that can finish the fastest to ensure that only one coflow can complete in a round.
+
+We assume there are  tenants in the network and tenant 
+ () has 
+ coflows (
+). First, we obtain the bandwidth allocation for tenants with HUG. Specifically, given the demand vectors of coflows in tenant 
+, the demand vector 
+ of the tenant is calculated according to Eq. (1). With this demand vector, we obtain the bandwidth allocation vector 
+ of tenant 
+ with HUG. Second, we compute the completion times of all coflows with the bandwidth vector and choose the shortest completion time  as the round duration by (2) 
+ 
+ (3)
+ 
+ 
+where 
+ is the completion time of coflow 
+, 
+ is its demand on link-j, and 
+ is the bandwidth allocated to tenant 
+ on link-j. In this way, RICH ensures that a coflow can complete its transmission in this round.
+
+Allocating the allowed transmission size of each tenant. The allowed transmission size 
+ for tenant 
+ in a round depends on bandwidth allocation 
+ and round duration , namely, (4)
+Given 
+ for tenant 
+, the sizes 
+ of data transferred by every coflows 
+, , 
+ within this tenant are assigned in turn in ascending order of their completion time under HUG.
+
+Scheduling the coflows. RICH ranks the coflows in a round-robin manner among different rounds. Then we use the “super-coflow” (inspired by Utopia) to calculate the bandwidth for each coflow.
+
+Specifically, all coflows are classified into two categories: the coflows that can complete in this round and the coflows that cannot complete in this round. Intuitively, we hope that the former can complete earlier, so we give them the higher priority. As the latter cannot accomplish in the current round, we therefore give them the lower priority. We prioritize the former in a round-robin manner according to their tenants’ order which keeps changing across multiple rounds for strategy-proofness. And we sort the latter in ascending order of their completion time under HUG.
+
+We illustrate this mechanism through an example in which tenant  and tenant  have three coflows, respectively, as shown in Fig. 7. We prioritize all coflows in ascending order of their completion time under HUG. The sorted sequence is 
+ in Round 1. The ordered sequences of tenant A and tenant B are 
+ and 
+, respectively. In this sequence, coflow 
+ can complete in this round while others cannot.
+
+Next, we rank coflows among different tenants according to the following rules:
+
+•
+We take a coflow from each tenant to participate in sorting during the single distribution. As long as there is one coflow that does not finish in the current round in the extracted coflows, they are sorted according to the tenant order. As shown in Fig. 8, though coflow 
+ cannot finish in the round, we still let it be involved in sorting to guarantee fair bandwidth allocation. We assume that the order of tenants  in this round. Thus we get the order (
+) in the first distribution by the order .
+
+•
+When coflows that can complete in the round do not exist in the single distribution, the remaining coflows that are not involved in the sorting are arranged in ascending order of their completion time under HUG. In the second distribution, the remaining coflows (
+, 
+, 
+, and 
+) cannot finish in this round, so they are sorted as follows: 
+, 
+, 
+, 
+ according to the sequence .
+
+Finally, we obtain a sequence 
+ after merging the above distribution results.
+
+For the scheduling in Round 2, as coflow 
+ has completed in Round 1, we rearrange all coflows by the ascending order of their completion time with HUG and have a new sequence 
+. We assume the order for tenants is , . In Round 2, the coflows are therefore arranged as follows: 
+, 
+, 
+, 
+, 
+.
+
+Following this approach, we aggregate prioritized coflows 
+ into a set of super-coflows 
+, where 
+ () is the th super-coflow that is gathered by the first  coflows 
+, …, 
+. We denote the demand vector of 
+ as 
+, where 
+ is the size of data sent by coflow 
+ in a round. We denote a flow in coflow 
+ transmitting data from uplink- to downlink- in the fabric as 
+. Its bandwidth is allocated as (5)
+ 
+ 
+ 
+where 
+ is a ramp function, 
+ is the amount of data transferred from uplink- to downlink- in a round, 
+ is the amount of data transferred of super-coflow 
+ on the bottleneck link, i.e., 
+, and 
+ and 
+ are the remaining bandwidth on link- and link-, respectively.
+
+Each coflow transfers data at the rate calculated above and does not stop transferring data until its amount of data transmission is exhausted. We refer to AllocBandwidthForCoflows( ,Rem(  ), 
+ ) in Algorithm 1 as a summary of the entire process.
+
+
+Download : Download high-res image (697KB)
+Download : Download full-size image
+3.4. Example
+We explain how RICH works using a simple example where two tenants competing for two 1 Gbps links. Fig. 9 shows the bandwidth allocated by RICH algorithm for three coflows among tenants (
+, 
+) with and without cheating. Tenant 
+ has coflow  with demand 
+, and tenant 
+ has coflow  with demand 
+ and coflow  with demand 
+. We assume that the order of tenants is 
+ in the first round.
+
+Without cheating. When tenants are both honest, their coflows complete through three rounds, as shown in Fig. 9(a). At the beginning of each round, given the demands of coflows, RICH determines the round duration, the transmission volume, and the order for coflows listed in Table 1. Then RICH allocates bandwidth to coflows using the “super-coflow” based on the above information.
+
+Let us take the first round of scheduling as an example to illustrate the scheduling process. We have the tenants’ demand vectors at 0 ms, i.e., 
+ and 
+ according to Eq. (1). Given the demand vectors of tenants, we have the bandwidth allocated to tenant 
+ and tenant 
+ under HUG, i.e., 
+ and 
+. We obtain the completion time (
+=600 ms, 
+=360 ms, 
+=240 ms) for coflows under HUG in Eq. (3) and have a sequence  in ascending order of their completion time. Then we set the round duration as 240 ms using Eq. (2) and determine the transmission sizes of tenant 
+ and 
+ in this round using Eq. (1), i.e., 
+ and 
+. According to the sequence  and the transmission sizes of tenants, we assign the transmission sizes for coflows, i.e., 
+, 
+ and 
+. Since coflow  can complete in this round and the order of tenants is 
+, we obtain the coflows scheduling priority 
+. Finally, given the sequence 
+ and the transmission volume 
+, 
+ and 
+, we allocate bandwidth for coflows, as shown in Fig. 9(a). Coflow  is scheduled first and occupies the entire two links. After coflow  consumes the transmission size 
+, coflow  and  are allowed to monopolize link-1 and link-2, respectively. Because of sufficient transmission size, coflow  completes on link-2 in the round.
+
+
+Download : Download high-res image (340KB)
+Download : Download full-size image
+Fig. 9. Illustration of RICH with and without cheating. R1, R2, R3, and R4 represent Round 1, Round 2, Round 3, and Round 4, respectively.
+
+
+Table 1. Transmission size and priority for coflows and tenants in each round without cheating.
+
+Round ID	Transmission size	Tenants priority	Coflows priority
+A	B	C		
+1				
+  > 
+A > C > B
+2				
+  > 
+B > A
+3				
+  > 
+A
+In the second round, tenant 
+ has the higher priority, thus coflow  in tenant 
+ obtains bandwidth first and completes. Since coflow  is constrained by the transmission size 
+ in the second round, it cannot finish transferring until the third round.
+
+With cheating. When tenant 
+ is dishonest, coflow  in the tenant is divided into three short coflows, say, coflows 
+, 
+, and 
+, as shown in Fig. 9(b). Their demands are 
+. RICH schedules coflows (
+, 
+, 
+, , and ) through four rounds and allocates the transmission sizes for them in each round listed in Table 2.
+
+
+Table 2. Transmission size and priority for coflows and tenants in each round with cheating.
+
+Round ID	Transmission size	Tenants priority	Coflows priority
+A
+A
+A
+B	C		
+1						
+  > 
+  >   > 
+  >   > 
+2						
+  > 
+  > 
+  >   > 
+3						
+  > 
+  > 
+4						
+  > 
+Though coflow 
+ in tenant 
+ has the highest priority and completes in the first round, coflow 
+ and coflow 
+ do not complete in the second round because tenant 
+ cannot decide how many data coflow 
+ and coflow 
+ send in the round by cheating. Moreover, in the second round, coflow 
+ and coflow 
+ cannot be prioritized for bandwidth allocation because the order of their priority is 
+. And they complete in the third and fourth round, respectively. Whether tenant 
+ cheats the scheduler or not, the completion time of coflow  is 480 ms. Tenant 
+ thus cannot improve the performance by cheating.
+
+3.5. Effective guarantee for high performance
+RICH ensures the high performance of coflows: each coflow is guaranteed to complete no later than its completion in HUG. Formally, we give the following theorem and prove it.
+
+Theorem 1
+
+Assume that  coflows 
+ among all tenants arrived at time 0. For coflow 
+ , we define 
+ and 
+ as its CCT under RICH and HUG, respectively. Then, we have 
+.
+
+Proof
+
+HUG schedules coflows as shown in Fig. 10(a). The bandwidth of all coflows is allocated at time 0 or when a coflow completes. We assume that with HUG, coflow 
+ complete at time 
+, respectively. RICH schedules coflows in m rounds, as shown in Fig. 10(b). As the round duration is set as the completion time of the coflow that can finish fastest under HUG, coflow 
+ can complete in Round , …, Round . In the th () round, regardless of the scheduling priority of coflow 
+, it can accomplish before the end time 
+ of the round, so we have 
+. The theorem is proved. □
+
+3.6. From offline to online
+We implement the easy generalization of RICH from offline to online scheduling by maintaining two lists which record the information (e.g., the size and the order) about tenants and coflows. When a tenant or a coflow arrives or departures, it is inserted into or removed from lists and its correlated demand is updated which triggers the bandwidth redistribution. After the amount of data transferred for all tenants is exhausted, a new scheduling round starts and the orders of tenants and coflows are updated. See Offline() and Online() in Algorithm 1 for details.
+
+
+Download : Download high-res image (237KB)
+Download : Download full-size image
+Fig. 10. Coflow scheduling under HUG and RICH.
+
+3.7. Analysis of strategy-proofness
+In this part, we analyze the strategy-proofness of RICH. RICH is strategy-proof if a tenant cannot get more data transmitted in a round by lying about its demand or cannot obtain more bandwidth in each round.
+
+On the one hand, RICH restricts the amount of data transferred for each tenant in each round. Suppose that tenant 
+ tries to transfer more data in a round, then it needs to increase its allocated bandwidth 
+ or round duration  according to Eq. (4). Because 
+ is calculated by HUG that is strategy-proof, tenant 
+ cannot get extra bandwidth by misreporting demand. If tenant 
+ wants to increase the round duration , it needs to dominate the round duration using a very short coflow that can complete faster than coflows in other tenants under HUG, resulting in the shorter duration of the round contradicting the tenant’s expectation. Even if tenant 
+ raises the round duration , the amounts of data transferred for other tenants would also be increased, which extends its waiting time for being scheduled when other tenants have priority over this tenant for bandwidth allocation. Thus the tenant cannot promote the round duration.
+
+To prevent the tenant from occasionally succeeding in cheating, RICH takes the following measures. RICH monitors the frequency of completion of coflows in each round and the change of coflows’ size submitted by tenants. If a tenant’s coflows complete in many consecutive rounds (e.g., they complete in 90 of 100 rounds) and their size changes frequently, RICH decreases the allocated bandwidth for the coflows, which forces them to give up cheating by reducing the frequency of their completion in one round. If the above behavior characteristics of the tenant disappear, RICH eliminates the restriction on the bandwidth allocation. However, if the tenant continues to cheat, its coflows become smaller and more because of the constrained bandwidth, further reducing its chance of success.
+
+On the other hand, the round-robin mechanism in RICH prevents tenants from preempting more bandwidth. Let us take an example to illustrate this. Assume there are  tenants in the network, and each Tenant 
+ () initiates a coflow 
+ at time 0, and tenant 
+ lies to the scheduler. Tenant 
+ divides coflow 
+ into  small coflows 
+ prioritized according to the ascending order of their completion time under HUG as the order 
+. The probability is 1 in  that each tenant is allocated bandwidth first in each round. We assume the order of tenants is 
+. All coflows are sorted as follows: 
+ according to the round-robin mechanism in RICH. This means that no matter how high the priority of tenant 
+ is, its coflows 
+, …, 
+ still have lower priorities except for its first coflow 
+. The lower the priority, the less likely it is to be allocated more bandwidth.
+
+In the next round, the priority of the last tenant 
+ in order  is raised to the highest level, but the priority of the rest of the tenants is reduced by one level, which prevents high-priority tenants from constantly gaining more bandwidth in each round.
+
+In summary, we see that a tenant should not be able to get more data transmitted and preempt more bandwidth by lying. So we consider RICH is strategy-proof.
+
+4. Evaluation
+We evaluated RICH through extensive simulations using realistic Hive/MapReduce traces collected from a large production cluster at Facebook. The main results are listed as follows:
+
+•
+[CCT Performance] RICH outperforms other strategy-proof mechanisms by up to 39.3% in terms of average CCT.
+
+•
+[Strategy-proofness] RICH can prevent tenants from gaining more bandwidth by cheating, effectively ensuring strategy-proofness.
+
+•
+[Fairness] RICH is able to fairly allocate bandwidth to different tenants at the time granularity of round duration. This indicates that RICH can provide isolation guarantee between tenants.
+
+•
+[Parameter Settings of Round Duration] Our dynamic adaptive method can achieve better performance than fixed parameter settings. Specifically, our method speeds up the completion of all coflows by more than 26.6% against the fixed setting mode.
+
+4.1. Simulation setup
+4.1.1. Platform and topology
+We evaluate RICH on CoflowSim (Chowdhury, 2017), a simulator for coflow scheduling. We compare it with two schedulers HUG (Chowdhury et al., 2016) and Utopia (Wang et al., 2018a) as they are the state-of-art coflow schedulers. The DC fabric we adopted in our simulations is a 150 ×150 non-blocking switch with 150 ingress/egress ports corresponding to the uplinks/downlinks of 150 racks connected to it.
+
+4.1.2. Workload
+We use CoflowBenchmark (Chowdhury, 2015b) as our workload in the evaluation. The CoflowBenchmark contains a set of traces from a real production environment. It records information about 526 coflows from a 3000-machine Hive/MapReduce cluster with 150 racks at Facebook in one hour (Chowdhury et al., 2014). The coflows are scaled down to a 150-port fabric, where mappers (reducers) in the same rack are combined into one rack-level mapper (reducer).
+
+According to their length and width, the coflows are divided into four categories, as shown in Table 3. Specifically, a coflow is considered to be small (long) if its longest flow is smaller than 5 MB and narrow if the number of its constituent flows is less than 50 flows (Chowdhury et al., 2014, Chowdhury et al., 2016).
+
+4.2. Overall performance
+First, we measure the CCT performance with slowdown. The slowdown of a coflow is its CCT achieved by a scheduler normalized by its minimum possible CCT as if it were running alone. Specifically, (6)
+ 
+ Fig. 11 shows the statistical results of CCT slowdown. RICH can significantly improve the CCT performance. Specifically, RICH reduces the average slowdown by 2, and 95th percentile slowdown by 1.7 compared with HUG. Since HUG does not focus on the reduction of the CCT, Utopia and Varys significantly outperform it in terms of performance. While RICH lies in the middle of them, it is closer to Utopia and Varys than to HUG in terms of the average slowdown.
+
+We further evaluate the performance of RICH with the CCT of different coflow types. Table 4 shows the average CCT of SN (Short Narrow), LN (Long Narrow), SW (Short Wide), and LW (Long Wide) coflows. RICH can reduce the average CCT of (SN, LN, SW and LW) coflows by 45.5%, 54.8%, 45.3% and 39.9%, respectively, compared with HUG. Besides, RICH can reduce the average CCT by 6.69% compared with Varys. This is because RICH speeds up the completion of large coflows by allocating a certain amount of bandwidth to them in each round.
+
+
+Download : Download high-res image (195KB)
+Download : Download full-size image
+Fig. 11. Statistical summary of slowdown.
+
+
+Table 3. Coflows binned by their lengths (Short and Long) and widths (Narrow and Wide).
+
+Coflow Bin	SN	LN	SW	LW
+%Cofows	60%	16%	12%	21%
+
+Table 4. Average CCT (in seconds) of different types of coflows.
+
+Coflow Bin	ALL	SN	LN	SW	LW
+HUG	41.78	0.22	5.66	2.78	312.28
+RICH	25.38	0.12	2.56	1.52	191.02
+Varys	27.20	0.08	1.84	1.07	206.66
+Utopia	22.58	0.08	1.83	1.01	170.97
+4.3. Strategy-proofness
+In this part, we evaluate whether RICH is strategy-proof by judging whether tenants can improve their performance by cheating. If the tenants cannot decrease their CCTs by cheating RICH, tenants will give up cheating, so RICH is strategy-proof. We thus measure the strategy-proofness of a scheduler using a metric called normalized CCT. Normalized CCT is defined, for each coflow within the dishonest tenant under the compared scheduler, as the CCT with cheating normalized by that without cheating, i.e., (7)
+ 
+Intuitively, if the normalized CCT is greater (smaller) than 1, the coflow within the dishonest tenant finishes slower (faster) and the tenant obtains (loses) the benefit under the scheduler. We use a snapshot with 100 concurrent jobs collected from CoflowBenchmark. There are 100 tenants, each of whom has one coflow. We measure the CCT of the coflow within a randomly selected tenant with and without cheating. The tenant cheats the scheduler by dividing its coflow into several smaller ones whose size is about 1 MB and lies about their demand.
+
+We measure the average normalized CCT under RICH, Utopia and Varys in all coflow bins, as shown in Fig. 12. We see that RICH decelerates the completion of coflows within dishonest tenants with cheating by about 2 in all the bins, which obliges tenants to abandon cheating, so that RICH can ensure strategy-proofness. On the contrary, Utopia and Varys speed up the completion of these coflows by 32% and 39%, respectively, incentivizing tenants to keep lying.
+
+4.4. Fairness
+In this part, we evaluate if RICH can fairly allocate bandwidth between tenants. To show this, we calculate the progress of each tenant. The progress of tenant  is defined as (8)
+ 
+ 
+The progress indicates how fast a tenant is sending data. Then, we use Jain’s fairness index (Jain et al., 1984) to quantitatively show the progress fairness of RICH. Jain’s fairness index is given by (9)
+ 
+The fairness index ranges from  (worst case) to 1 (best case).
+
+The fairness index is nearly 1 when time granularity is equal to the round duration. This is because restricts the total amount of data transmitted by different tenants in a max–min fair manner in each round RICH. Only inside a round are tenants allowed to preempt other tenants. Therefore, the unfairness is confined inside a round. At the granularity of round duration, RICH can fairly allocate bandwidth among tenants.
+
+4.5. Parameter settings of round duration
+The setting of round duration is crucial to the performance of RICH. In this part, we show the effectiveness of our heuristic method that dynamically sets the round duration. We evaluate the performance of RICH with a fixed round duration ranging from 0.01 s to 10000 s. The results are shown in Fig. 14.
+
+5. Discussion
+We consider a special case: a tenant can somehow divide its large coflow into a set of smaller coflows, such that each smaller coflow can finish within one round in HUG for most rounds, then this tenant can always get itself prioritized over other tenants’ coflows which mostly cannot finish in one round in the long run.
+
+5.1. Viability analysis
+The “theoretical” attack is viable in the coflow scheduling, but it is too difficult for the tenant to improve its performance by cheating RICH in practice, especially in the dynamic scene.
+
+Since the tenant does not know the bandwidth and its prioritization order allocated by the scheduler, to complete in most rounds when other tenants cannot complete, it has to divide the large coflow into enough smaller coflows to dominate the allocation of the duration of a round, that is, its coflows’ completion time by calculated in HUG is set as the round duration by RICH. The smaller the size of the coflows, the greater the number of coflows. That results in more scheduling rounds. However, even if smaller coflows can complete in most rounds, too many rounds may extend the total completion time of all smaller coflows, i.e., increasing the CCT of the actual large coflow.
+
+Fig. 15 shows the scheduling for coflow  under RICH without and with cheating. In Fig. 15(a), for an honest tenant, its coflow  is scheduled for n rounds and completes at time 
+. As shown in Fig. 15(b), coflow  is divided into  smaller coflows by the dishonest tenant and completes through k rounds. With the increase of the number  of smaller coflows, the duration of each round is shorten. Compared with the longer duration of the round without cheating, the shorter duration of each round has more possibilities to cause the completion time 
+ of the last smaller coflow 
+ to approach the end time 
+, i.e., the completion time of coflow  is extended. Therefore, this attack does not work well in practice.
+
+
+Download : Download high-res image (207KB)
+Download : Download full-size image
+Fig. 15. Illustration of coflow scheduling under RICH in the special case.
+
+Besides, we consider the worst-case scenario: the dishonest tenant completes first in the last round while the honest tenant finishes at the end of the round. Even in this case, the dishonest tenant completes at most one round duration in advance. The round duration is reduced as the number of smaller coflows is increased. If  coflows are scheduled in the round-robin manner in the last round, the probability of this case is 
+. Therefore, this case rarely occurs since the number of coflows is enormous in the datacenter.
+
+5.2. Solution
+To prevent the tenant from occasionally succeeding in cheating, RICH takes the following measures. RICH monitors the frequency of completion of coflows in each round and the change of coflow sizes submitted by tenants. If coflows in a tenant complete in many consecutive rounds (e.g., they complete in 90 of 100 rounds) and their size changes frequently, RICH decreases the allocated bandwidth for the coflows, which forces them to give up cheating by reducing the frequency of their completion in one round. If the above behavior characteristics of the tenant disappear, RICH eliminates the restriction on the bandwidth allocation. However, if the tenant tries to continue cheating, its coflows become smaller and more because of the constrained bandwidth, further reducing its chance of success.
+
+6. Related work
+In cooperative environments, many coflow schedulers have been proposed to optimize the CCT performance. Orchestra (Chowdhury et al., 2011) and Baraat (Dogar et al., 2014) improve the average CCT based on FIFO. Varys (Chowdhury et al., 2014) improves performance by using SEBF heuristics for inter-coflow scheduling and minimum-allocation-for-desired-duration (MADD) for intra-coflow scheduling. For minimizing the total weighted completion time of coflows, Qiu et al. (2015) proposed the first polynomial-time deterministic approximation algorithm. Rapier (Zhao et al., 2015) and OMCoflow (Li et al., 2016) reduce the average coflow completion time by the better combination of routing and scheduling for coflows. Unlike the clairvoyant scheduler, PIAS (Bai et al., 2015), Aalo (Chowdhury and Stoica, 2015), CODA (Zhang et al., 2016), MCS (Wang et al., 2018b) and PHILAE (Jajoo et al., 2019) are designed for scheduling flows or coflows without prior knowledge. Stream (Susanto et al., 2016) is a readily deployable coflow scheduling scheme, which opportunistically exploits the many-to-one and many-to-many communication patterns in a decentralized manner and minimizes the average CCT by emulating the conditional Shortest Job First (CSJF) heuristic algorithm like the key idea of Aalo and CODA. SmartCoflow (Li et al., 2018, Li et al., 2020a) minimizes the average CCT of coflows across geo-distributed datacenters by jointly considering endpoint placement and coflow scheduling. Li et al. (2020b) proposed a new performance metric—coflow age (CA) for coflows generated by distributed streaming applications and addressed the problem of minimizing the average long-term CA while simultaneously guaranteeing the throughput requirements of coflows. DeepAalo (Wang et al., 2020) applies Deep Reinforcement Learning techniques to information-agnostic coflow scheduling and minimizes CCT by automatically adjusting thresholds. Fai (Liu et al., 2020) employs bottleneck-aware scheduling and improves the overall coflow performance by accelerating the bottleneck flow without prior knowledge.
+
+In non-cooperative environments, many fair network schedulers are proposed to allocate bandwidth between tenants. DRF (Ghodsi et al., 2011) can allocate bandwidth on different links in a max–min manner. FairCloud (Popa et al., 2012) discusses tradeoffs and proposes several allocation policies. HUG (Chowdhury et al., 2016) and its variant HUG+ (Wang and Jin, 2016) are developed to provide optimal isolation guarantee with high network utilization. However, these schedulers are not efficient in terms of CCT performance. Coflex (Wang et al., 2017) attempts to navigate the tradeoff between performance and isolation using a tunable fairness knob. Utopia (Wang et al., 2018a) can achieve near-optimal performance with provable isolation guarantee by aggregating coflows into a super-coflow. Both Coflex and Utopia can achieve much better CCT performance than HUG. However, they are not strategy-proof.
+
+7. Conclusion
+In this paper, we have proposed a new coflow scheduler RICH for non-cooperative multi-tenant datacenter networks. RICH is strategy-proof and can reduce the average CCT of coflows. To prevent tenants from gaining more bandwidth by cheating, RICH employs multi-round scheduling, distributes a certain amount of data transferred for tenants in each round in a max–min manner, , and prioritizes coflow transmission among tenants based on a round-robin manner among different rounds. To guarantee optimal isolation, RICH ensures that the overall bandwidth allocated to tenants in each round is similar to HUG. Moreover, RICH dynamically adjusts the round duration, which significantly speeds up the completion of coflows. The trace-driven simulations have demonstrated that RICH can significantly improve the CCT performance.

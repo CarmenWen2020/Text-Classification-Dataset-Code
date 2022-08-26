@@ -1,0 +1,195 @@
+Abstract
+In the past few decades, general matrix multiplication (GEMM), as the basic component of the Basic Linear Algebra Subprograms (BLAS) library, has played a vital role in various fields such as machine learning, image processing, and fluid dynamics. Because these fields tend to deconstruct the problem into multiple smaller sub-problems, today’s BLAS libraries have implemented batched GEMM routines to achieve high performance in this scenario. MAGMA proposes a vbatch routine to calculate batched GEMM with variable size on GPU, but unbalanced input will cause some workgroups and threads to be idle, thereby affecting performance. In addition, unbalanced input will also affect the load balancing of the Computing Unit in GPU, and extreme input will lead to insufficient utilization of hardware resources. In this paper we proposes a high-performance batched GEMM computing framework on GPU. For a large batch of small matrices with variable sizes and unbalanced distribution, the proposed framework considered the hardware architecture and the possible data distribution, and adopted three methods (flexible tile, sort-up and split-down) to improve hardware utilization and achieve better load balancing. Experimental results show that our framework has a 3.02× performance improvement compared to the latest MAGMA implementation on AMD Radeon Instinct MI50 GPU, and 3.14× speedup on MI100.
+
+Introduction
+Numerical libraries have been proposed for decades and become an important part of high-performance computing, scientific computing, and even general-purpose software. As the architecture of computers and the needs of scientific research continue to evolve, numerical libraries have developed like a technological epic and continue to drive progress in both industry and computational science. Today, well-optimized libraries can make full use of the computing power of the hardware for large-scale linear algebra problems. However, currently in high-performance computing, large problems are often decomposed into many sub-problems and then solved in parallel [1]. In addition, in many fields such as machine learning [2] and tensor computations [3, 4], their matrix dimensions are usually relatively small, but the total number can be extremely large. This has led vendors and library developers to extend traditional numerical libraries to take full advantage of the computational power of hardware resources in these new challenges. Therefore, many popular Basic Linear Algebra Subprograms (BLAS) libraries such as rocBLAS [5], cuBLAS [6], MKL [7] and MAGMA [8] provide batch routines to solve these types of problems. Among these batch routines, batched general matrix multiplication has received the most attention and has been widely used in industry for its applicability. Both NVIDIA’s cuBLAS and AMD’s rocBLAS support fixed-size batched GEMM where all the GEMMs have the same matrix size. MAGMA supports more features and is more flexible, allowing batched GEMM with variable sizes to efficiently accelerate applications and higher-level algorithms in a variety of domains [9].
+
+In this paper, we design and implement a batched GEMM framework, which uses multiple fine-grained tile strategies, a sort-based algorithm, and a strategy-splitting algorithm to improve performance. When the matrices are small and of different sizes with unbalanced distribution, this framework can improve hardware utilization and achieve better load balancing.
+
+The following parts of the paper will be arranged as follows: In Sect. 2 we present the GPU architecture and introduce the background of GEMM and batched GEMM. In Sect. 3 we introduce our motivation for our framework. In Sect. 4 we demonstrate and detail our framework and methods. In Sect. 5 we evaluate the performance and analyze the results. In Sect. 6 we discusses the related work. In Sect. 7, we offer a conclusion to the paper.
+
+Background
+GPU architecture
+The emergence of programmable Graphics Processing Unit (GPU) nearly a decade ago has led developers to focus on using GPUs instead of traditional CPUs for high-performance parallel computing. With its remarkably high parallel computing power, GPU increasingly plays an important role in general purpose computing areas [10,11,12].
+
+GPU is designed for high parallelism and consists of multiple Compute Units (CU) as basic computing components. In AMD’s MI50, each CU includes four independent SIMD units and contains four 64KB vector General Purpose Registers. In addition, each CU has a 64KB Local Data Share (LDS) and can execute multiple groups of 64 threads at the same time, called wavefronts [13]. To allow developers to give full play to AMD GPUs and create portable applications, AMD Radeon Open Compute Platform introduces the Heterogeneous-compute Interface for Portability programming model [14], which is also used on our kernel implementation.
+
+GEMM and batched GEMM
+Today’s scientific applications run efficiently on massively parallel architectures through high-performance BLAS libraries. These libraries express as many computational phases as possible through basic routines, such as GEneral Matrix Multiplication (GEMM), to achieve high performance. Under the standard BLAS interface, GEMM can be expressed as , where ,  are scalars, A, B and C are , , and  dense matrices. As the most basic and important Level 3 routine in the BLAS library with high computational density and high parallelism, it also has a wide range of applications. For example, in machine learning, fully connected layers and convolutional layers are implemented by using GEMM, and these layers usually dominate the training time [15,16,17,18]. In addition, GEMM also occupies more than 90 of the time in High Performance Linpack (a high-performance benchmark program officially used in supercomputer rankings) [19, 20], and has become the most critical part of measuring the performance of a supercomputer.
+
+Currently, the community is working to extend the BLAS standard and implement high-performance routines to support batch processing in order to address the challenges of many modern applications that require solving many independent problems in small sizes. Therefore, batched GEneral Matrix Multiplication (batched GEMM) has also been proposed as a very important operation and as a performance key for advanced algorithms such as batch matrix decomposition. Batched GEMM is similar to classic GEMM and can be regarded as a collection of independent dense matrix multiplications in the form of 
+ 
+,  where N refers to the batch size. Obviously for the special case of , the batch operation will degenerate to classical GEMM. In batched GEMM, matrices can be represented in different precision and stored in transposed or non-transposed format, and the matrix dimensions in the batch can be fixed or variable.
+
+Although the batched GEMM was only proposed within a decade, its importance goes beyond the boundaries of dense linear algebra to affect other scientific domains. According to previous research, the performance could be greatly improved by using batched GEMM in quantum chemistry [21], metabolic networks [22], deep learning [15, 23,24,25,26], and so on, which makes batched GEMM an important complement of the new BLAS proposal [27].
+
+Motivation
+Although classic GEMM tends to perform well when the matrix size is large, it always perform poorly when the matrix size is extremely small, because the computing resources of the hardware are difficult to fully utilize. Unfortunately, research shows that currently in the fields of machine learning [2, 23, 25], astrophysics [28], signal processing [29] etc., the dimensions of the matrices are usually small and different. In addition, in some high-performance computing fields, it is more efficient to decompose the problem into many small matrix calculations and solve them independently [3, 4, 30], which poses a higher challenge to the numerical libraries.
+
+To improve performance by increasing hardware utilization and parallelism, today’s numerical libraries usually group multiple independent small operations into large batches [31, 32]. Vendor-optimized GPU computing libraries such as rocBLAS and cuBLAS can compute batches of GEMM with fixed size and obtain very substantial performance gains. However, the uniform-sized matrix size greatly limits its applicability. Therefore, MAGMA explores and proposes a vbatch routine () to support the batched GEMM with variable sizes, which can make efficient use of GPU computing ability [9]. As shown in Fig. 1, it uses a 3D grid to specify each independent GEMMs for parallel computing. Although vbatch routine can calculate GEMMs of variable sizes, the grid dimension must be related to the largest matrix C’s size in the batch, which results in some workgroups being idle (black workgroups in Fig. 1) when the matrix size distribution is unbalanced. At the same time, owing to the coarser-grained tile strategy, idle threads (gray parts in Fig. 1) will appear in the workgroup, which also causes a waste of resources. In addition, large and fixed tile size will result in a small number of workgroups, which is difficult to meet the parallel requirements of the GPU, especially when the matrix size and batch size are small.
+
+Fig. 1
+figure 1
+MAGMA vbatch implementation
+
+Full size image
+
+Fig. 2
+figure 2
+vbatch GEMM routine compare with default GEMM routine
+
+Full size image
+
+To understand the relationship between MAGMA’s vbatch performance and the size of input matrices in variable size scenario, we analyzed the advantages of MAGMA’s vbatch GEMM compared to the rocBLAS’s default GEMM routine(by traversing the entire batch). We randomly generated each GEMM’s M, N, K and used the maximum M and N (, ) in the batch as the abscissa, and tested the average speedup of vbatch GEMM with maximum K () from 128 to 1024 and batch size from 8 to 256. As shown in Fig. 2, the advantages of vbatch routines gradually decrease as the matrix size increases and disappear when the matrix size is greater than 1024. This is because the allocated tiles are already sufficient to meet the parallelism of the GPU when the matrix dimensions become larger. However, the excessive number of tiles makes the resource waste introduced in vbatch become more and more nonnegligible. Besides, the optimized default GEMM routine has obtained sufficient parallelism in thread-level parallelism (TLP), instruction-level parallelism (ILP), and memory-level parallelism (MLP) for large GEMMs. The results show that the MAGMA’s vbatch GEMM routine is more suitable for a large batch of small size matrices.
+
+In summary, although batched GEMM plays a crucial role in many domain areas, the existing support of batched BLAS is still not sufficient to cover diverse application scenarios. MAGMA has made a new attempt in this area and succeeded in achieving high performance when the matrix size is small and variable, but still cannot fully utilize the GPU capabilities when the input distribution is unbalanced due to the waste of computational resources. To address these problems, we propose a batched GEMM framework for GPU, which will be detailed in the following.
+
+System overview
+In this section we will introduce our optimized framework, which is mainly divided into four parts. The first part is kernel design, which shows the main implementation of our batched GEMM kernel function; this will be called from the host and executed on the device. The second part presents flexible tile, which includes a variety of fine-grained strategies to greatly reduce the waste of resources and provide more optimization space. The third part introduces our sort-up method, which can reduce the uneven resource allocation caused by the randomness and uncertainty of matrix size distribution, and achieve better load balancing on the GPU. The fourth part presents our split-down method, which split some GEMMs’ current tile strategies into more fine-grained strategies to improve TLP and GPU utilization under extreme input conditions.
+
+Kernel design
+Just like the classic GEMM kernel, we divide each matrix C into many tiles, then use a 2D grid to make each workgroup correspond to a tile and calculate a sub-part of the matrix, so as to use GPU computing resources and capabilities more efficiently with high memory locality.
+
+Fig. 3
+figure 3
+Tiles in 2D grid
+
+Full size image
+
+As shown in Fig. 3, matrix C in the batch is divided into multiple 
+ tiles and forms a 2D grid, and each workgroup is responsible for one tile, processing entire slice of A and entire slice of B. Each workgroup loads 
+ elements in A and 
+ elements in B into LDS and performs the necessary multiplications, before accumulating the results along the K dimension to get the final result. Each thread in the workgroup can use LDS and registers, which are faster than global memory, and threads can be packaged into wavefronts to execute the same instructions in parallel, thereby achieving greater MLP and ILP. Different workgroups can also be executed in parallel, which can also greatly improve TLP. Next, another dimension is used to specify different GEMMs to form all 2D grids into a 3D grid. In this way, all GEMMs can be batched and be loaded into the GPU for parallel calculation. In addition, the inner iteration over 
+ is unrolled to reduce the overhead, and the double buffer technology is used to hide the latency.
+
+Flexible tile
+Obviously, the tile size has a great influence on ILP and TLP. Generally speaking, a larger tile will have better data reuse and more effective use of LDS and registers; however, it will reduce the number of workgroups in each GEMM, which will make it difficult to hide the latency for small matrices. In addition, too many large tiles will take up precious LDS and register resources, resulting in a decrease in the total number of workgroups that can be executed in parallel in the CU. Smaller tiles can generate enough workgroups to improve TLP in most cases, and can effectively reduce the waste of idle threads; but smaller data reuse will seriously reduce performance. Therefore, for each GEMM in batch, the appropriate tile size can be different.
+
+Table 1 Tile strategies
+Full size table
+
+Inspired by Xiuhong Li et al. [33] we use multiple and fine-grained tile strategies to handle different instances in the batch, which are given in Table 1. Because the matrix size may vary greatly, we design three tile strategies to deal with the possible matrix input. The workgroup size is set to 128 threads, so for these three strategies, each thread will be responsible for E/T elements in the tile. 
+ determines the amount of LDS used in each workgroup, but the total amount of LDS in the GPU is limited, so we set it to 8 to strike a balance between LDS usage and parallelism. Note that in the kernel design, each 2D grid is independent, so each matrix C can be divided by tiles of different sizes, which allows us to use the most appropriate tile strategy for each GEMM. Considering that the number of batches is usually relatively large, for each batch of GEMM, we choose the largest possible tile here to improve parallelism. The aforementioned reduction in the number of workgroups will be optimized later. This design is very different from MAGMA. For the same input in Fig. 1, our result is shown in Fig. 4. Because we use a variety of fine-grained tile strategies, each GEMM can choose the most appropriate strategy and meet high parallelism while greatly reducing the waste of resources caused by idle threads and idle workgroups. In addition, our tile size has also been well thought out and is related to our further optimization.
+
+Fig. 4
+figure 4
+Using flexible tile for the same input in Fig. 1
+
+Full size image
+
+Sort-up
+We consider the hardware scheduling strategy and use a sort-based algorithm to reorder the input batch, thereby reducing the unbalanced hardware utilization caused by unbalanced matrix size distribution. Because of input uncertainty, the variable size poses greater challenges to hardware load. According to previous design, each GEMM will be divided into many workgroups for processing. Because K determines the total number of inner loops in the tile, it can be regarded as the workload of the corresponding workgroup. Obviously, the workload of workgroups between different GEMMs is independent and may be seriously unbalanced, which is completely different from the classic GEMM or the uniform batched GEMM scenario. Then, each workgroup will be scheduled to execute in the CU, which may cause imbalance in the workload between the CUs, thereby reducing performance.
+
+Fig. 5
+figure 5
+Before and after using sort-up method
+
+Full size image
+
+We give a simple example to illustrate this problem. For simplicity, we assume that there are only two CUs in the GPU, and 6 workgroups with different workloads are generated according to the different K of the input GEMMs, which will be loaded into the CU for execution. Because the SIMD unit in the CU is scheduled using round-robin scheduling policy [13], the final possible scheduling result is shown in Fig. 5a. Obviously, in this case, the workload between CUs is unbalanced, and the computing power of CU0 is not fully used. In addition, owing to the input uncertainty and the increase in the number of workgroups, this imbalance could increase and affect overall performance. In Fig. 5b, we use the proposed sort-up method before launching the kernel to reorder each batch by using the K as the primary key and the tile strategy as the secondary key (for split-down, which will be discussed later). This is equivalent to greedily selecting the workgroup with the largest workload to schedule into the lowest workload CU each time, which can effectively balance the workload between CUs. In addition, using the descending order helps reduce the fluctuations caused by workgroups with large workloads previously processed. Moreover, the overhead introduced by sorting is negligible compared to the complexity of batched GEMM itself.
+
+Split-down
+To avoid insufficient hardware resource utilization based on the low number of workgroups that may be caused by extreme input, we propose the split-down method. It uses an adaptive algorithm to split the specific GEMM tile strategy into smaller strategies, thereby increasing the number of workgroups and improving the resource utilization of GPU.
+
+Fig. 6
+figure 6
+Split-down method
+
+Full size image
+
+Suppose there are a batch of GEMMs, each of which has M = 32, K = 128 and N = 64, and the batch size is 20. They all use the medium strategy and generate 40 workgroups in total. However, there are 60 CUs on MI50. Even if each CU processes a workgroup, one third of the CUs will be wasted. In addition, the number of workgroups in each CU is too small to effectively hide the latency during execution, and the SIMD units inside the CU are not fully utilized. To solve this problem, the split-down algorithm splits some GEMMs’ batch strategies into more fine-grained strategies before kernel execution to increase the total number of workgroups, as shown in Fig. 6.
+
+We first defined the following split factor  to determine when to perform the split operation:
+
+
+ 
+ 
+ 
+
+(1)
+
+In the formula (1), c refers to the constant factor related to the workgroup size and CU design. In our framework, each workgroup is designed to be the size of two wavefronts (128 threads). In MI50, there are 4 SMID units in each CU, and each SIMD unit can be loaded with a wavefront. Therefore, c is set to 2 to avoid the SIMD unit being idle in each CU.  is a value factor greater than one and related to software and hardware design. In CU, each workgroup is executed in parallel in the unit of wavefront. Generally speaking, the more workgroups, the higher the parallel efficiency. Although split-down can increase the number of workgroups, too many workgroups will also introduce a lot of unnecessary software computing overhead and hardware scheduling overhead, so a reasonable  is needed. We find the optimal value by testing the performance with different , and this test only needs to be performed once for a specific GPU. 
+ is the total number of CUs in the GPU; B refers to the batch size; M and N refers to each matrix C size; 
+, 
+ stands for different tile strategies. When  is greater than 1, which means that there are not enough wrokgroups to occupy the the GPU, the split-down will be performed.
+
+Next comes the selection of specific GEMMs. Obviously, for GEMMs that use larger tile strategies and have larger K, they occupy a larger amount of calculation, which should keep using the largest possible strategy to maximize ILP while maintaining high parallelism for a long time. Conversely, for GEMMs that can only use smaller tile strategies and have smaller K, their calculation and time-consuming are relatively smaller, which means that they have better tolerance for different tile strategies. Based on this principle, our split-down method preferentially splits those GEMMs that use smaller tile strategies and have smaller K to minimize ILP drop. In addition, choosing this type of GEMM to split can better control the number of workgroups and reduce the additional scheduling overhead. Because the previous sort-up process has reordered the input according to the tile strategy and K, it is not difficult to select these specific GEMMs.
+
+figure a
+The algorithm flow of split-down is shown in Algorithm 1. It traverses the entire input batch, select the corresponding GEMMs to split and update the  until  is smaller than 1. By using split-down, enough workgroups can be generated to improve TLP while meeting high ILP, thereby improving GPU utilization and reducing waste. Thanks to the design in the flexible tile, different strategies’ tile size can be divisible, which means split-down will not introduce additional overhead and resources waste.
+
+Evaluation
+In this section, we analyze the performance of our proposed framework.
+
+The inputs include different M, N and K and different batch sizes of GEMM to meet the uncertainty and diversity in this scenario. For example, for a given , , , and batch size, we will generate a batch of matrices where the M, N and K in each GEMM are of random size and the upper limit is , , and . To cover a wide range of data possibilities and the problem scale we discussed in the background section, the  and  are set to be less than 1024, that is, 128, 256 and 512. The  are from 128 to 1024, and the batch size are from 8 to 256 to generate different inputs with variable matrix sizes. Matrices are stored in Non-transposed format and in single precision for simplicity.
+
+The results are compared with rocBLAS and MAGMA on MI50 GPU, as shown in Figs. 7 and 9, and our framework has an average speedup of 3.93× and 3.02×, respectively. We next detail the results and explore the advantages of our proposed framework.
+
+Fig. 7
+figure 7
+Compare with rocBLAS on MI50 (3.93× average speedup)
+
+Full size image
+
+Fig. 8
+figure 8
+Average speedup on MI50 using different M, N and K compared to rocBLAS
+
+Full size image
+
+We start by focusing on the comparison with rocBLAS. Since AMD’s rocBLAS does not support nonuniform matrix sizes, we use its default method () to traverse the batches to compute the results. We can obviously notice that as the batch size goes up, our method obtains a very large speedup over the default method. This is because the default method can only load one instance at a time for computation, and the small size of the matrices causes a lot of GPU computational resources to be wasted. Also, as only one instance in the batch is computed at a time, the excessive batch size leads to too many context switches and kernel executions, which greatly reduces the execution efficiency of the algorithm. Different from this, our method computes the whole batch simultaneously, which makes the GPU computational resource utilization much higher and thus has a greater advantage for this scenario.
+
+Furthermore, we can notice that the speedup ratio appears to decrease due to the rise in , , and . This is because the increase in the matrix size in each instance improves the GPU utilization in the default method, which allows the well optimized default algorithm to achieve good parallelism (Fig. 8). However, our batch processing framework still achieves higher computational performance because it is better at exploiting the parallelism of the GPU and solving these large batches of small matrix problems that often occur in various domain, as discussed in the motivation section (Fig. 9).
+
+Fig. 9
+figure 9
+Compare with MAGMA on MI50 (3.02× average speedup)
+
+Full size image
+
+Fig. 10
+figure 10
+Average speedup on MI50 using different M, N and K compared to MAGMA
+
+Full size image
+
+Next, We perform a detailed comparison and analysis with the MAGMA vbatch routine, which also uses batch processing and supports variable size matrix computation, to illustrate the effectiveness of our proposed framework.
+
+First, it could be found that for the given , , and , the smaller the batch size, the more obvious our speedup. This is because MAGMA uses a large and fixed tile size. In the case of small matrices and small batch size, the number of workgroups generated by the MAGMA cannot fully occupy the GPU, resulting in a large amount of waste of resources discussed earlier. Through the use of more fine-grained and flexible tile strategies and split-down method, our framework can effectively generate enough workgroups to achieve high ILP and TLP without introducing excessive overhead, and make full use of hardware computing resources and give full play to the computing power of GPU.
+
+Second, when , , and the batch size are the same, the smaller the , the greater the speedup (Fig. 10a). This is because  specifies the upper limit of K for each GEMM, which in turn determines the workload of each workgroup. For the smaller , the K of each GEMM is distributed in a relatively even range, and cause the generated workgroups to have similar workloads, which is more suitable for sort-up to balance the workload between CUs. For a larger , the matrix A and matrix B in batch will be more irregular, resulting in a greatly aggravated workload imbalance between workgroups. But our framework still performs better than MAGMA when the distribution is severely uneven.
+
+Third, we can find that as  and  increase, our overall average speedup will decrease (Fig. 10b). This is because with the larger  and , the size of each matrix in the batch will increase, and the large tile in MAGMA can also perform well. However, because of the increase in  and , the size distribution of each matrix becomes more and more unbalanced, causing greater size uncertainty in the batch. However, the 3D grid dimension in MAGMA is related to the largest matrix C’s size in the batch, so the size uncertainty has led to more and more threads and workgroups in smaller GEMMs become idle. The framework we propose allows each GEMM to select an appropriate tile strategy by using flexible tile, thereby having a better tolerance for input uncertainty. In addition, split-down helps to divide small GEMM into larger 2D grid, which smoothes the size fluctuations in all 2D grids and greatly reduce the idle threads and workgroups.
+
+Fig. 11
+figure 11
+Compare with rocBLAS on MI100 (4.97× average speedup)
+
+Full size image
+
+Fig. 12
+figure 12
+Average speedup on MI100 using different M, N and K compared to rocBLAS
+
+Full size image
+
+Fig. 13
+figure 13
+Compare with MAGMA on MI100 (3.14× average speedup)
+
+Full size image
+
+Fig. 14
+figure 14
+Average speedup on MI100 using different M, N and K compared to MAGMA
+
+Full size image
+
+To verify the performance of our framework on other GPU architectures, we also tested on AMD MI100 GPU. The experimental results obtained an average speedup of 4.97× against rocBLAS and 3.14× against MAGMA, as detailed in Figs. 11, 12, 13 and 14. We can find out that the speedup ratio of our framework is very stable on different GPU architectures, which means that it can be well ported to other GPUs and achieve good and consistent performance improvement.
+
+Related work
+In recent years, there have been some studies focused on optimizing batched GEMM at the application-driven level and the hardware architecture level, and many attempts have been made to extend high-performance batched BLAS on CPU and GPU. Considering the accuracy characteristics in AI domain, Abdelfattah et al. designed half-precision and half-complex precision batch GEMM algorithms using NVIDIA’s tensor core, and obtained 1.7× and 7× performance speedup, respectively [34]. For extremely small matrices (less than 32), Masliah and his colleagues considered the hardware hierarchy of hybrid heterogeneous systems and used multiple techniques to design and optimize Batched GEMM, which can achieve 95% peak performance on V100 GPU [35]. Considering the balance between TLP and ILP, Xiuhong Li et al. proposed a tiling engine and a batching engine to compute the variable-size batched GEMM, achieving a 1.4× performance improvement on NVIDIA GPU compared to the latest techniques. For FP64, Valero-Lara et al. propose the grouping method to group matrices and distribute them across different cores to achieve a more balanced cost for variable-size matrix computations on CPU architecture, achieving a 6× speedup ratio compared to Intel MKL’s batching routines [36]. There are also some researchers have attempted to implement GPU based batched GEMM on higher-level algorithms such as batched triangular dense linear algebra kernels [32], batched QR factorization and batched SVD kernels [37, 38], which achieved very significant speedups as well.
+
+Conclusion
+We designed and implemented a framework to perform batched GEMM for many small matrices with variable sizes and unbalanced distributions on GPU, which have great applications in machine learning, data mining, and other fields. We designed and used three methods to achieve better computing performance for this application scenario. Flexible tile provides multiple and fine-grained tile strategies, allowing each GEMM to use the most appropriate strategy to reduce hardware resources waste while maintaining high parallelism. Sort-up uses a sort-based greedy algorithm to rearrange the entire batch, thereby improving the internal load balance of the GPU. Split-down considers the matrix size distribution and splits some specific GEMMs into smaller tiles to increase the hardware utilization, thereby improving computing performance. The final experimental results show that our proposed framework has an average performance improvement of 3.02× on AMD MI50 GPU compared to SOTA MAGMA implementation, and 3.14× on MI100.
+

@@ -1,0 +1,1504 @@
+ABSTRACT
+Generalized tensor algebra is a prime candidate for acceleration
+via customized ASICs. Modern tensors feature a wide range of data
+sparsity, with the density of non-zero elements ranging from 10−6%
+to 50%. This paper proposes a novel approach to accelerate tensor
+kernels based on the principle of hierarchical elimination of computation in the presence of sparsity. This approach relies on rapidly
+inding intersectionsÐsituations where both operands of a multiplication are non-zeroÐenabling new data fetching mechanisms and
+avoiding memory latency overheads associated with sparse kernels
+implemented in software.
+We propose the ExTensor accelerator, which builds these novel
+ideas on handling sparsity into hardware to enable better bandwidth utilization and compute throughput. We evaluate ExTensor
+on several kernels relative to industry libraries (Intel MKL) and
+state-of-the-art tensor algebra compilers (TACO). When bandwidth
+normalized, we demonstrate an average speedup of 3.4×, 1.3×, 2.8×,
+24.9×, and 2.7× on SpMSpM, SpMM, TTV, TTM, and SDDMM kernels respectively over a server class CPU.
+CCS CONCEPTS
+· Computer systems organization → Special purpose systems.
+KEYWORDS
+Tensor Algebra, Sparse Computation, Hardware Acceleration
+1 INTRODUCTION
+Recently, there has been a surge of interest in generalized tensor algebra in the ields of deep learning [1, 15], machine learning [5], data
+science [7, 9, 27, 35, 48], physical sciences [18], engineering [20, 28],
+and graph analytics [34]. Tensors generalize vectors and matrices
+to N-dimensions, and tensor kernels combine two or more tensors
+using low-level computations similar to traditional 2-dimensional
+dense/sparse linear algebra, i.e., sequences of arithmetically intensive operations such as matrix multiplications.
+These tensor operations often operate on very sparse data (i.e.,
+with a small percentage of data which is non-zero). Figure 1 shows
+that the percentage of non-zero elements ranges from 10−6% to 50%
+depending on the problem domain, with many domains featuring
+tensors with density less than 0.1%. As a result, tensors are stored
+in compressed representations and looked-up via metadata, e.g.,
+compressed sparse row (CSR) or compressed sparse iber (CSF) [46],
+which indicate where non-zeros occur in the tensor.
+The variety of tensor kernels, their extreme sparsity, and their
+compressed representations make tensor algebra challenging on
+today’s platforms. On one hand, the architecture community has
+proposed accelerators for sparse linear algebra, but they deal with
+relatively dense data (e.g., deep neural networks [4, 13, 21, 42, 51])
+or speciic kernels (e.g., sparse matrix vector multiply [2, 8, 24, 33,
+36, 40, 41]). On the other hand, general purpose platforms such as
+CPUs and GPUs cannot reach peak performance for a variety of
+reasons, e.g., main memory latency [17, 38].
+This paper proposes a novel approach for accelerating generalized tensor algebra that is eicient when handling very sparse
+tensors. At a basic level, the main opportunity provided by sparsity
+in tensor operations is the potential to exploit the axiom 0 · x = 0
+for any x. For a scalar x, various platforms have exploited this opportunity to remove inefectual computation. For example, we can
+avoid delivering x to the staging bufers and performing a multiply [4, 12, 13, 21, 26, 31, 40, 42, 50, 51]. Our key insight is that in
+319
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+Dense linear algebra
+Dense neural networks
+Sparse neural 
+networks
+Density: >10-6 % 10-5 % 10-4 % 10-3 % .01 % .1 % 1 % 
+(log scale)
+Internet & 
+Social media
+Recommendation 
+systems
+Fluid 
+Dynamics
+Computational 
+Chemistry
+Electromagnetics
+Proteins
+Problems in 
+statistics
+Circuit 
+Simulation
+Finite Element Methods
+Density: 0 % 10 % 50 % 100 %
+Figure 1: Tensor sparsity by workload domain.
+higher-order tensor algebra, this opportunity applies even when x
+is not a scalar. For example, x might be a tile, in which case recognizing that the other operand is 0 means we don’t have to transfer
+data (or metadata) for the entire tile. x might even represent an
+un-evaluated tensor computation, and recognizing that the other
+operand is 0 early can result in skipping all operations, data, and
+metadata transfers required to create x. These opportunities are
+even further magniied when the 0 corresponds to a tile or larger
+region of the tensor.
+Mathematically, to detect the work that will not be skipped, we
+can calculate the intersection of coordinatesÐlogical locationsÐof
+non-zero elements in each tensor operand. Importantly, coordinates
+can be associated with scalars, tiles, sub-computations, etc., allowing us to hierarchically eliminate work using these intersections.
+With this in mind, we propose ExTensor1
+, an accelerator architecture built around the idea of performing hierarchical compositions
+of intersections to eliminate inefectual computation. In ExTensor,
+tensor metadata and data processing are decoupled so that the
+metadata engines can aggressively look ahead in the computation
+to discover inefectual computation before they are delivered to
+the arithmetic units. This idea is applied to each level in the bufer
+hierarchy to stage sub-tiles and sub-computations at the next level
+so that, at the bottom level, the arithmetic units perform a minimal
+amount of work.
+Overall, we make the following contributions.
+(1) To the best of our knowledge, we propose the irst accelerator
+for general, sparse tensor algebra.
+(2) We describe a general abstractionÐbased on intersections
+between coordinates of non-zero dataÐfor describing intersections (opportunities to skip work due to sparsity) in
+sparse tensor algebra, that applies at diferent granularities
+in the problem (e.g., scalar level, tile level).
+(3) We propose a hardware mechanism, and optimizations, for
+performing these intersections at multiple levels of an accelerator’s memory hierarchy.
+(4) We extensively evaluate ExTensor over a range of tensor
+kernels, and implement a core hardware component in
+RTL. When bandwidth normalized, we demonstrate an average (geomean) speedup of 3.4×, 1.3×, 2.8×, 24.9×, and
+2.7× on SpMSpM, SpMM, TTV, TTM, and SDDMM kernels
+respectively over a server class CPU.
+1
+In biology, an extensor is a muscle whose contraction causes a limb to straighten,
+which we see as analogous to performing intersections that unravel a sparse tensor
+computation into a linear stream of the desired operations.
+2-tensor X
+I
+J
+point
+coordinate
+( i , j )
+i dimension
+• major dimension 
+• I+1 entries (dense)
+2-tensor X
+CSR compressed representation
+j dimension
+• minor dimension 
+• 1 entry per nonzero 
+(compressed)
+segment array
+coordinate array
+value array
+1 2 0 2 3 1 
+7 1 6 12 3 10
+0 2 2 5 6
+10
+6 12 3
+7 1
+position
+(a) (b)
+Figure 2: Tensor terminology & example compression using CSR.
+2 BACKGROUND
+We review the key details of tensor algebra that are relevant to
+computer architecture and our proposed approach. For additional
+information see [27]. When possible, we use terminology and mathematical notation from the TACO tensor algebra compiler [26].
+2.1 Tensor Terminology and Representation
+Tensors are multi-dimensional arrays of arbitrary order (dimensionality) N, and we use the notation N-tensor for brevity. For example,
+0-tensors are scalars, 1-tensors are vectors, 2-tensors are matrices.
+Figure 2 (a) shows an example tensor X ∈ R
+I×J
+, i.e., a 2-tensor (matrix) of real numbers (loats) of size I × J. Locations in a tensor are
+referred to as points, which are identiied by a tuple of coordinates,
+one for each dimension. Our notation for the coordinates of a point
+uses concatenated subscripts. For example, the element of tensor
+X at point (i, j) for i < I, j < J is written as Xij . In cases where
+concatenation introduces ambiguity we clarify with parentheses,
+e.g., the element at (i + 1, j) is X(i+1)j
+.
+Large tensors are frequently sparse (see Figure 1 and [26]), so
+compressed representations are used to avoid storing zero data
+values in memory. Various domain-speciic compressed representations exist to minimize storage while also enabling highperformance access to the non-zero data. Generally, all compressed
+formats store metadata for indexing the compressed data structure
+as well as the actual data (non-zero tensor values), each element of
+which is stored at a position in memory.
+For dense (uncompressed) tensors, there is an O(1)-cost translation from coordinate to data position, which permits eicient
+random access. In compressed representations, random access can
+require a search through a list of coordinates, but sequential traversal of the tensor can often leverage the metadata format to improve
+eiciency. For example, Figure 2 (b) shows a tensor represented in
+the Compressed Sparse Row (CSR) format. Note that access to a
+completely random point (i, j) requires a memory indirection in
+order to ind the row bounding positions (via the segment array),
+followed by a search to locate the appropriate inner dimension
+coordinate, if present (through the coordinate array). However, also
+note that once this search is performed, the position of the next
+non-zero in row i (if any) is derivable from the position found for
+(i, j), meaning that an operation acting on the subsequent non-zero
+in the row may be performed in O(1) time.
+In this paper, we support tensor representations where each dimension is stored either dense/uncompressed (U) or compressed
+320
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+Table 1: Example tensor kernels and BLAS routines. α, β, γ are
+scalars (0-tensors); A, B, C, Z, O, I, F are higher-order tensors. Symbols for convolution match [12] where possible for consistency.
+We note that Í
+has precedence, meaning GEMV should be read as
+α(
+Í
+k Ak Bk i ) + βCi
+.
+Name Tensor index notation
+GEMV Zi = α
+Í
+k AkBki + βCi
+GEMM Zij = α
+Í
+k AikBkj + βCij
+TTV Zij =
+Í
+k AijkBk
+TTM Zijk =
+Í
+l AijlBkl
+SDDMM Zij = Cij Í
+k AikBkj
+MTTKRP Zij =
+Í
+kl AiklBkjCl j
+2D Conv Oxy =
+Í
+r s I
+(x+r)(y+s)Fr s
+CNN layer Ozuxy =
+Í
+cr s Izc(γ x+r)(γ y+s)Fucr s
+(C) [26]. We refer to speciic formats in this family using notation deined by the following regular expression: łT-[uc]
++ž. In this
+taxonomy, a 2-tensor (matrix) in the CSR format is categorized as
+T-uc, corresponding to the irst dimension being uncompressed and
+second dimension compressed. The Compressed Sparse Column
+(CSC) format is also categorized as T-uc but with rows as the irst
+dimension and columns as the second dimension [14]. Many other
+representations are also possible. For example, the Compressed
+Sparse Fiber (CSF) [46] format corresponds to class of representations described by T-c
++.
+Given an N-dimensional tensor, choosing whether each dimension should be uncompressed or compressed is a trade-of between
+random access time and storage. In terms of random access, translating a tuple of coordinates to a data position is done dimensionby-dimension, where each uncompressed dimension is traversed
+in O(1) time and each compressed dimension requires a search. In
+terms of storage, an uncompressed dimension must allocate metadata proportional to the size of the dimension whereas a compressed
+dimension need only allocate storage proportional to the number
+of non-zero elements in the dimension. Importantly, representing
+a dimension in compressed form gives the opportunity to avoid
+storing any data and metadata for lower dimensions. For example,
+a 2-tensor compressed as T-cc stores no metadata/data for a row
+that contains only zeros.
+2.2 Tensor Algebra Kernels
+Tensor algebra is the process of performing binary operations (e.g.,
+multiplies and adds forming dot products) between tensors to produce new tensors. We follow the tensor index notation found in [26],
+which provides a compact way to describe a kernel’s functionality.
+For example, matrix multiply Z = AB can be written as:
+Zij =
+Õ
+k
+AikBkj (1)
+That is, the output point (i, j) is formed by taking a dot product of
+k values along the i-th row of A and the j-th column of B.
+We give more examples of important kernels written in this
+form in Table 1. Each kernel is useful in diferent problem domains.
+GEMV/GEMM are well known and have many applications [10, 34].
+The SDDMM kernel is used in machine learning [52] and triangle
+counting [6]. MTTKRP is used in tensor decompositions [27], 2D
+Conv is used in image processing applications, and CNN layers are
+the core kernels in state-of-the-art image recognition [22, 29].
+Tiled Tensor Algebra: Sparse tensors can be tiled to improve
+locality, by adding dimensions to the tensor representation. For example, to break a matrix represented in CSR into two-dimensional
+tiles, we add two dimensions to the representation, giving us T-?uc,
+where ‘??’ are two new outer dimensions which can be either u
+or c. Thus, each tile is represented in CSR, and we traverse outer
+dimensions to index into each tile. Importantly, compressed outer
+dimensions imply no storage for tiles that contain only zeros. Supporting multiple levels of tiles entails adding yet more dimensions.
+As the most eicient tiling is dependent on the traversal order of
+any given kernel, oline pre-processing is considered acceptable
+in the tensor community [26], as it can be thought of selecting the
+most appropriate compression format for the data.
+3 INTERSECTION OPPORTUNITIES
+From Table 1, we see that tensor kernels are a composition of computations on values generated by co-iterations through (possibly
+diferent) dimensions of two or more tensors. For example, in Equation 1 (matrix multiply) we perform co-iterations through the k dimension, which corresponds to traversing corresponding elements
+from rows of matrix A and columns of matrix B. The co-iterations
+merge the elements from the source tensors using either multiply
+or add, which is sometimes additionally reduced via accumulate
+(e.g., via dot product, min/max). An important observation is that,
+because 0 · x = 0, a co-iteration with multiplication is a merge
+intersection operation (intersection for short) between two sets
+of coordinates corresponding to non-zero values in each operand.
+Such intersections can enable skipping computation, data transfers,
+or both. We now describe diferent intersection opportunities for
+the matrix multiply example (Equation 1), using the matrices in
+Figure 3. The key takeaway is that, in all cases, intersection can be
+modeled as comparisons between sets of coordinates. This will allow
+us to build a single hardware mechanism to perform the diferent
+types of intersections we illustrate below.
+Matrix A Matrix B Matrix Z = AB
+f g
+h
+0
+1
+2
+0 1 2
+K
+J
+ah
+cf cg+
+dh
+0
+1
+0 1 2
+I
+J
+a b
+c d e
+0
+1
+0 1 2
+I
+K
+Figure 3: Example matrices.White space indicates zero value. Numbers along each dimension are coordinates for that dimension.
+3.1 Two-Operand Intersections
+For the following examples, we visualize tensors as N-level trees,
+where each level indicates the coordinates for one dimension, and
+each unique path through the tree represents a non-zero data element and its associated coordinates. (See Figure 4 for examples of
+the matrices in Figure 3.) Dimensions are labeled level by level, with
+the outermost immediately below the root of the tree. A subtree
+rooted at a coordinate represents a subtensor. When a subtensor
+321
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+contains only zero data elements, we omit its subtree. The order of
+dimensions (levels) in the tree corresponds to diferent data layouts,
+and is set oline based on the intended traversal order. For example,
+diferent datalows [12] such as output- and A-stationary (Figure 4,
+left and right) prefer matrix B to be stored in diferent layouts.
+0
+0 1
+1 2 0 1 2
+a b c d e
+A (Row major)
+0
+1 2
+0 0 1
+f g h
+B (Col major)
+I
+K
+0
+0 1
+1 2 0 1 2
+a b c d e
+A (Row major)
+for i in [0, I):
+ for j in [0, J):
+ for k in [0, K):
+ Zij += Aik * Bkj
+for i in [0, I):
+ for k in [0, K):
+ for j in [0, J): 
+ Zij += Aik * Bkj
+0
+0
+1 2
+f g
+1
+2
+h
+B (Row major)
+Output stationary A stationary
+I
+K
+J
+K
+K
+J
+Figure 4: Example datalows for matrix multiply. Intersections are
+between sets of coordinates for each datalow (red dashed ovals).
+Importantly, the tree representation conveys the same information as T-[uc]
++ representations such as CSR and CSF (Section 2.1),
+while hiding implementation details. Furthermore, in T-[uc]
++ formats it is generally the case that coordinates within a level are
+stored sequentially in memory, which means we have good spatial
+locality when traversing a level.
+Intersections Within Dot Products: Suppose the matrix multiply kernel is implemented using an output-stationary datalow,
+where each output Zij is computed one at a time, shown in Figure 4
+(left). In output stationary, we only need to do a multiply when
+corresponding values in the active row and column are both nonzero. These operations can be viewed as intersections of sets of
+coordinates between rows of A and columns of B.
+By laying out A and B in row- and column-major order, respectively, this corresponds to intersecting coordinates in the second
+level (dimension K) of each matrices’ tree representation. The coordinates involved in the intersection to compute Z02, a dot product,
+are shown in the igure as dashed red ovals. Because only coordinate 1 appears in both ovals, only data elements a from matrix
+A and h from matrix B need to be read and computed upon. Because the subtrees under each intersected coordinate are scalars,
+this intersection saves work (both loads of values and computes)
+associated with scalar operations.
+Intersections Across Dot Products: We can also intersect sets
+of coordinates in levels (tensor dimensions) closer to the root of
+the tree and between diferent levels of the tree, which eliminates
+work associated with entire subtensors with a single intersection.
+For example, consider the A-stationary datalow in Figure 4 (right),
+where Matrix B is laid out in row-major order. Intersections are
+now between sets of coordinates from the second level (dimension
+K) of A and the irst level (dimension K) of B. As we see in the
+example, the missing 0 coordinate in the second dimension of A
+eliminates a number of multiplies that would have been done with
+elements from the subtree with coordinate 0 in the irst dimension
+of B (broadcasting the scalar across the row of B). This can eliminate
+work fetching the data and metadata from the row of B as well as
+the multiplies themselves. Also, the missing coordinate 2 in the irst
+dimension of B (a zero row) eliminates work associated with the
+scalar b in matrix A.
+Intersections at Tile Granularity: Recall from Section 2.2,
+tiling can be implemented by adding additional dimensions to the
+compressed representation. Thus, the opportunities above apply
+when scalars a, b, c, etc. in matrices A and B are replaced with tiles
+(subtrees) of A and B, meaning we can perform intersections at
+the tile granularity to eliminate the work done to load/compute
+on tiles, when entire tiles contain only zero. That is, intersection
+opportunities are hierarchical.
+3.2 Compositions of Intersections
+More intersection opportunities arise in kernels involving more
+than two tensors. For example, the SDDMM kernel performs
+element-wise multiplications between matrix C and the results
+of a matrix multiplication between A and B (Table 1). This can
+be viewed as a composition of intersections, where we compute
+intermediate matrix D = AB and the coordinates of C and D are
+subsequently intersected. Suppose we intersect C and D before (or
+while) D is being computed. Since missing coordinates in A are
+known at the start, this early intersect tells us when a dot product in AB = D is inefectual and can be skipped. Likewise, if dot
+products in AB result in zero, which occurs if there is an empty
+intersection between corresponding rows and columns in A and B,
+we can eliminate work in fetching/computing on data in C.
+4 INTERSECTING STREAMS
+From the previous section, we saw multiple opportunities where
+intersection could save various types of work (arithmetic, data and
+metadata transfers, whole sub-computations, etc). A key observation is that these various intersection opportunities require the
+same computation: namely an intersection operation between sets
+of coordinates in the dashed red ovals. In hardware, we call the
+contents of these ovals streams of coordinates. In this and the next
+section, we design hardware to eiciently intersect these streams.
+4.1 Iterating over Streams
+A tensor kernel is made up of many streams which are hierarchically
+intersected as described in Section 3. For simplicity, we start by
+describing the simplest intersection: between coordinates of two
+streams. Before we consider intersection, however, we describe
+the unit that stores individual coordinate streams. It consists of
+metadata storage, that interfaces with a hardware FSM that iterates
+through the storage. We call the combined unit a Scanner, shown
+in Figure 5.
+Scanners must perform one operation: Iterate(), which outputs
+coordinates stored in the metadata storage, in increasing order by
+coordinate. (We denote explicit command interfaces supported in
+322
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+Iteration 
+FSM
+Metadata
+Storage
+Iterate()
+Read request
+Read response
+Fill path
+The coordinate stream: 
+Next coordinate (or EOS)
+Scanner
+Figure 5: Scanner hardware. Storage is shaded.
+the hardware with method call syntax.) For now, we assume each
+Iterate() call outputs all stored coordinates. Once the iteration is
+complete, the Scanner outputs the symbol EOS to indicate the end
+of the stream.
+The metadata storage can be implemented in multiple ways, e.g.,
+as cache, (double bufered) scratchpad, or bufet [43]. Depending
+on the implementation, a separate mechanism may be required to
+ill the coordinates into the metadata storage. For example, a cachebased or scratchpad-based storage ills through demand loads from
+the iteration FSM or an explicit fetch unit, respectively. To simplify
+the Iterate() command’s implementation, coordinates are illed
+and stored in increasing order.
+4.2 Intersecting Streams
+Intersecting two streams requires co-iterating over two Scanners
+in parallel and processing the resulting streams using a hardware
+block called Intersect, as shown in Figure 6. The design generalizes
+to intersecting any number of parallel streams, but we discuss two
+for simplicity.
+Scanner 
+B
+Scanner 
+A
+Intersect
+while (true)
+if (A.is_empty() || B.is_empty())
+{ A.flush(); B.flush(); break; }
+else if (A.peek() < B.peek())
+A.pop();
+else if (A.peek() > B.peek()) 
+B.pop();
+else // A.peek() == B.peek()
+{ B.pop(); C.push(A.pop()) }
+A B
+C
+Iterate() Iterate()
+Stream A Stream B
+Figure 6: Basic intersection hardware and algorithm.
+We use FIFO terminology: the current irst/last element in a
+stream as seen from a consumer is denoted head/tail, respectively.
+In each clock tick, the head coordinate of each stream A and B,
+generated by Scanner A and B, respectively, is checked by value
+(via peek). If the head coordinates of both streams match, those
+coordinates are both efectual, and the common coordinate is passed
+to the output C. Otherwise, if the head coordinate of one stream is
+less than the head of the other, the head of the lagging stream is
+inefectual and is dropped (via pop). In this case, no output is sent to
+C in that cycle. This is functionally correct because the coordinates
+in each stream are ordered. Finally, if one stream is empty, the
+intersection exits (via flush) as no more efectual coordinates will
+be produced.
+We note that it is straight-forward to employ a vector pipeline
+for Intersect by having each scanner read out vectors of coordinates.
+We assume each Scanner produces a single coordinate per cycle for
+simplicity.
+4.3 Eiciency
+In hardware, the Scanner is a simple pipelined iterator that produces one coordinate per cycle. Likewise, the Intersect block can
+be pipelined to perform one iteration of the while loop per cycle.
+Thus, the above design completes an intersection in O(|StreamA ∪
+StreamB|) cycles.
+From this, we see that our intersection hardware has a performance deiciency. Ideally, we want Intersect to take no more than
+|StreamA ∩ StreamB| cycles, as this is the minimum amount of
+time needed to output the common coordinates. Yet, even when
+|StreamA ∩ StreamB| is small, intersection time is still proportional
+to the sum of the length of both streams in the worst case. Consider
+two example streams in Figure 7 (a) and (b). Streams are given on
+the left, and timing of Intersect for each stream on the right.
+0 1 3 5
+5
+0 1
+3 4
+Head
+Stream B
+Stream A
+Tail
+Head Tail
+(a)
+(b)
+7 9
+9
+5
+0 1 3 5
+Stream B 5
+Stream A
+Time (cycles) 1 2 3 4
+5 5 5
+>
+>
+>
+=
+0 1 9
+Stream B 3
+Stream A
+Time (cycles) 1 2 3 4 5
+3 3
+Streams Intersect Time
+Stream B
+Stream A
+>
+>
+>
+4 5
+9 9
+>
+>
+Figure 7: Examples for the basic intersect architecture, with cyclelevel timing. Coordinates for each stream are shown in boxes. Lightened boxes indicate the value has not changed from the previous
+cycle (i.e., was not popped in the previous cycle).
+In Figure 7 (a), Stream B has fewer coordinates than Stream A,
+but the head of Stream B will not be dropped (which would terminate the intersection early) until Stream A has been iterated
+partially (or completely), because Stream B’s coordinate is greater
+than some (or all) of Stream A’s coordinates. This scenario occurs
+frequently when intersecting data from two tensors of highly diferent density, which occurs in important applications such as breadth
+irst search [34]. In Figure 7 (b), the two streams result in an empty
+intersection. One would like to detect this case and terminate intersection immediately, outputting the empty set.
+5 OPTIMIZED INTERSECTION
+In this section, we propose an optimized intersection architecture
+to remove the bottlenecks discussed in the previous section (Section 4.3). Our design is based on two key observations, which we
+illustrate using Figure 7.
+First, in Figure 7 (a), the only work necessary to complete the
+intersection is to determine if Stream A contains coordinate 5. More
+generally, intersection requires searching for coordinates in one
+stream (e.g., Stream A) which match those in the other stream (e.g.,
+Stream B). Semantically, this is a content addressable lookup which
+the strawman design implements in linear time (i.e., by iterating
+323
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+through coordinates 0, 1, 3, 5). Thus, to speedup intersections the
+core task is to architect a faster content addressable search.
+Second, since coordinates in streams are ordered, consecutive
+coordinates in one stream can be interpreted as a range of coordinates that will be inefectual in the opposite stream. For example,
+in Figure 7 (b), the consecutive coordinates 1, 9 in Stream A can
+be interpreted as a hint to Scanner B that all coordinates in the
+open interval (1, 9) ś namely coordinates 3, 4, 5 ś are inefectual
+and do not have to be output. Such a scheme can łrule outž a large
+number of coordinates in a single shot. Importantly, to eiciently
+skip through ranges of coordinates within a stream, we require a
+similar content addressable lookup, as in the previous paragraph,
+to identify the start and end of each range.
+5.1 Skip Mechanism Design
+Combining the above observations, we add a new functionality
+to scanners called SkipRange() which takes a (begin, end) tuple
+of coordinates as input. Scanners send each other SkipRange()
+commands in a bidirectional fashion to decrease the number of
+coordinates sent to the Intersect block and more quickly reach the
+end of their respective streams.
+Suppose a scanner is in the middle of an Iterate() operation (i.e.,
+has output some but not all of its stream). If that scanner receives a
+SkipRange() command, it is allowed to skip over (i.e., not output)
+coordinates in the range (begin, end). Depending on the value of
+coordinate coord at the head of the scanner’s stream, the scanner
+must handle three cases:
+(1) coord ≤ begin: Output coord as usual. Do not consume the
+SkipRange() command this cycle.
+(2) begin < coord < end: Do not output coord. Do not consume
+the SkipRange() command this cycle.
+(3) end ≤ coord: Output coord as usual. Consume the
+SkipRange() command.
+SkipRange() may have no efect, if the scanner’s head coordinate
+has already past end in the range (Case 3). Once the scanner enters
+Case 2, it may require multiple cycles to transition to Case 3 depending on the number of coordinates in the range. In Section 5.2,
+we architect an eicient content addressable lookup to jump immediately to Case 3 once we have reached Case 2.
+Intersect
+Scanner 
+A
+Scanner 
+B
+Iterate() Iterate()
+SkipTo() SkipTo()
+Coordinates 
+in Stream A
+Coordinates 
+in Stream B
+A B
+<
+Metadata 
+storage
+<
+Priority decoder
+Mux
+T
+Coordinates Addresses
++
+Read 
+request
+1
+scoord
+Read 
+response
+Figure 8: (Left) Intersection based on bidirectionally skipping
+ranges of coordinates. (Right) The SkipTo() implementation, with
+input coordinate scoord and CAM capacity T (Section 5.2). Double
+bufering the CAM registers is not shown. Storage is shaded.
+The overall design is shown in Figure 8. Iterate() is called on
+both scanners. Conceptually, each scanner initiates SkipRange()
+operations on its neighbor, for each pair of consecutive coordinates
+in its stream. SkipRange() internally performs the content addressable lookup to advance to the end of the range (Section 5.2). Notice
+that consecutive (begin, end) tuples share one coordinate. For example, Stream A in Figure 7 (b) might trigger SkipRange() calls with
+coordinate ranges (0, 1) and (1, 9) ś notice the ‘1’ is common. Thus,
+as an optimization we implement SkipRange() to take a single coordinate ś the next coordinate in the stream denoted scoord ś and call
+this variant SkipTo() for clarity. Importantly, for synchronization
+correctness, the scanner must not consume a SkipTo() command
+and its coordinate until the head of the stream is greater than or
+equal to the coordinate argument to the previous SkipTo() call.
+0 1
+3 4
+Head Tail
+9
+5
+0 9
+Stream B 3
+Stream A
+Time (cycles) 1 2 3
+Stream B
+Stream A
+>
+3
+>
+9
+eos
+Figure 9: Example timing using the optimized intersect architecture. For simplicity, the examples assumes SkipTo() skips through
+any range of coordinates in 1 cycle.
+Crucially, SkipTo() operations are only triggered by coordinates
+successfully output by each scanner. We show a timing example
+in Figure 9, which corresponds to Figure 7 (b), assuming we can
+implement the content addressable lookup in a single cycle. Scanner
+A need not initiate a SkipTo() operation on Scanner B for coordinate
+1, since Scanner B previously sent a SkipTo() command to Scanner
+A which skipped over coordinate 1 (and moved the iteration for
+Scanner A to coordinate 9).
+5.2 Content Addressable Lookup
+Given the coordinate input to SkipTo(), scoord, we wish to ind
+the address in the metadata storage corresponding to the largest
+coordinate tcoord such that tcoord < scoord. The ability to quickly
+ind tcoord when the head coordinate coord is in (begin, end) is
+critical to the efectiveness of SkipTo().
+There are diferent possible implementations for this search with
+diferent time/space trade-ofs, e.g., a binary search or a hash table.
+For simplicity, we implement the search using a hardware CAM
+with T parallel comparators, shown in Figure 8 (right), which we
+call the coarse-grain CAM. Each comparator tracks a coordinate
+and address (for that coordinate, in the metadata storage) in the
+stream. Given a stream with S coordinates: if S ≤ T , every coordinate is assigned a comparator; else the stream is partitioned into
+T + 1 regions of as close to equal size as possible. Note, the number
+of coordinates in each stream is pre-computed in the T-[uc]
++ representation. We assume the spacing between coordinates assigned
+to consecutive comparatorsÐi.e., ⌊S/T ⌋Ðis also calculated oline
+and stored in stream metadata.
+To perform a SkipTo() command, the Scanner advances the head
+of its stream to the largest coordinate associated with a comparator
+whose value is less than scoord. Since the comparators are parallel,
+324
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+this lookup takes a single cycle. T is a design-time parameter that
+controls SkipTo() efectiveness: smaller T yields a coarser-grain
+look-up (potentially skipping less), while larger T increases design
+area.
+Lastly, we note that the T coordinates must be loaded into registers connected to the comparators at the beginning of the Iterate()
+calls. Although we have discussed a single stream, Scanners process
+sequences of streams back to back. To hide comparator load time,
+we double bufer the registers associated with the comparators, and
+use a second read port into metadata storage to ill the registers
+while an earlier stream is being intersected.
+6 STAGING INTERSECTIONS
+So far, we have discussed how to intersect a single pair of coordinate
+streams. To evaluate a tensor kernel, we must intersect multiple
+pairs of streams, in a sequence, and stage the results of those intersections for use in subsequent intersections or arithmetic operations.
+We perform these tasks using a hardware unit called the Stream
+Coordinator (Coordinator for short). Shown in Figure 10, the Coordinator is made up of two Scanners (Sections 4.1, 5.1), an Intersect
+unit (Section 4.2), an FSM that schedules the order in which streams
+are produced by each Scanner (Section 6.1), and memories to store
+tensor data (Section 6.2). This logic corresponds to one or more
+levels in the loop nest representation of a tensor kernel.
+dataA
+dataB
+Sequencer
+Scanner A
+MD Storage
+Scanner B
+MD Storage
+Data 
+Storage A
+Data 
+Storage B
+Stream A
+(coord, pos)
+Stream B
+(coord, pos)
+Next child SkipTo()
+posA
+posB
+coord
+Configure()
+TCA
+TCB
+Complete 
+coord
+Output subtensors
+Input subtensors
+Figure 10: The Coordinator. Next child indicates the next nonempty child for Iterate() (Section 6.1). MD stands for metadata.
+TCA and TCB append tile-level coordinates to each output so that
+the point (Section 2.1) of any data value output can be derived later
+on.
+Throughout the section, we use Figure 4, output stationary, as a
+running example.
+6.1 Sequencing & Sourcing Streams
+Up to this point, we have assumed a single stream has been stored in
+each scanner’s metadata storage. We now generalize this to a multidimensional tile of coordinates which corresponds to a subtensor.
+Each tile is stored in a T-[uc]
++ representation (Section 2.1) and is
+conceptually a tree or subtree from Section 3.
+We add two arguments to the Scanner’s Iterate() functionality:
+level and parent_node, which represent a level (dimension) of the
+tree and a node (coordinate) whose child coordinates should form
+the stream.2 Level 0 is reserved for the root of the tree. For example, to iterate through the coordinates in row 0 of matrix A from
+2This new information may also be speciied as a list of coordinates forming the
+subpath from the root of the tile to the node whose children we are iterating over.
+Figure 4, we specify level 1 (for the I dimension) and parent_node 0
+(for the coordinate in level 1 with value 0, for row 0). If the child
+is not present, Iterate() returns an empty stream. For T-[uc]
++
+representations, the extra hardware needed per Scanner to support
+this feature is similar to simple tree traversal logic.
+A new unit called the Sequencer is responsible for calling Iterate() for each Scanner in the order required by the tensor kernel.
+For this purpose, the Sequencer is conigured with a table (indicated
+by Configure() in Figure 10) that is programmed at kernel start
+and stores a representation of the kernel loop nest. In our implementation, it stores the bound and stride of each loop in the kernel,
+a map which associates loop variables to tensor dimensions for
+indexing purposes, and counters to keep track of the current loop
+state. For example, for the output-stationary datalow in Figure 4,
+the Scanner for matrix A stores [I, J, K] to indicate loop bounds,
+[1, 1, 1] to indicate stride 1 in all dimensions, and [0, N/A, 1] to
+indicate that the outermost loop (I, index 0) corresponds to the
+outer dimension (0) in A, and that the innermost loop (K, index 2)
+corresponds to the inner dimension (1) in A.3
+a
+∩; [ϭ, Ϯ], [Ϭ] Ϳ ∩; [ϭ, Ϯ], [Ϭ, ϭ] Ϳ ∩; [Ϭ, ϭ, Ϯ], [Ϭ] Ϳ ∩; [Ϭ, ϭ, Ϯ], [Ϭ, ϭ] Ϳ
+Sparse loop nest skips Col 0 Sparse loop nest skips Col 0 
+Row 0, Col 1 Row 0, Col 2 Row 1, Col 1 Row 1, Col 2
+h
+c
+f
+c d
+g h
+Data storage A (reads):
+Data storage B (reads):
+Output coordinate: 1 0 0 1
+Time
+Figure 11: Sparse stream sequencing for Figure 4, output stationary.
+∩ is short for calling Iterate on each scanner and performing an
+intersection. The coordinates for each stream are shown in brackets,
+where the irst/second argument is for matrix A/B respectively.
+Eiciently Supporting Sparse Sequences: We optimize the
+Sequencer by adding support to traverse over sparse loop nests. For
+example, in Figure 4 for output stationary, a dense loop nest would
+call Iterate() J = 3 times for each row of matrix A, or once for each
+column of matrix B. Yet, the column with coordinate 0 in matrix B is
+empty. This case is common in sparse tensors, whose matricizations
+are often hypersparse (have empty rows or columns) [16, 45]. We
+would like to exploit this fact and skip a call to Iterate() to save
+cycles.
+To skip Iterate() calls when we encounter runs of empty
+streams, we add a feedback path from each Scanner back to the
+Sequencer to inform the Sequencer of the next value of parent_node
+(in increasing order) that has a non-empty stream in the current
+level (or that there are no such streams left in the current level). This
+is efective because tensor representation and tensor kernel loop
+nest are co-designed so that tensor dimensions are iterated over in
+order, level by level. For example, output stationary iterates over
+matrix B column by column. The resulting sequence of intersection
+operations for Figure 4, output stationary, is shown in Figure 11.
+3We note that many of the kernels in Table 1 require only this simple logic, but several,
+e.g., convolution, require support for simple aine expressions. While straightforward
+to add, we do not discuss those here for simplicity.
+325
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+Determining the next parent_node with a non-empty stream is
+straightforward. For example, using the CSF representation (compressed in each dimension; c.f., Section 2.1) the sequence of coordinates corresponding to non-empty streams is stored sequentially
+in memory for each dimension.
+Sequencing Tiles: The above discussion concerns sequencing
+streams within a tile. To run the entire kernel, we add state in the
+Sequencer for the outer loops that sequence over tiles. Depending on the Scanner implementation, the next tile is illed based on
+how the metadata storage is implemented (see Section 4.1). As it
+is loaded, each tile is tagged with coordinates that identify the tile.
+The Sequencer uses this information to adjust its internal counters, which enables sparse loops (Section 6.1), and passes tile-level
+coordinates along with the results of each intersection (see below).
+6.2 Using Intersected Streams
+Post-intersection, surviving coordinates are used to lookup and
+output tensor data for both tensors. For example, the intersection
+between row 0 of matrix A and column 2 of matrix B in Figure 4
+(left) has the common coordinate 1, which is associated to data a in
+A and h in B.
+To complete these data lookups, we transport data along with
+coordinates and other T-[uc]
++ metadata in each tile. When a tile is
+initially loaded (illed) into the Coordinator, coordinate and other
+metadata is stored in the metadata storage while data is stored
+in a separate memory called data storage, shown in Figure 10. To
+reduce inefectual data storage reads, we only fetch stored data
+after intersections have been performed, as shown for our running
+example in Figure 11.
+Implementing this scheme naively requires a contentaddressable lookup (by coordinate) into the data storage. We
+eliminate this expensive lookup by generating a pointer (a position
+or pos) into the data storage for each coordinate that is used in
+an intersection. Positions are generated on the ly, as each tensor
+is illed into metadata/data storage. Now, the intersection unit
+operates over tuples of (coordinate, position). The positions of
+coordinates that survive the intersection are used to lookup the
+data memory.
+As discussed in Section 3.1, tensor data may correspond to scalars
+or subtiles containing coordinates, other metadata, and data. In both
+cases, the Coordinator outputs only efectual data, and tags that
+data with all coordinates required to identify it in the overall tensor
+(i.e., provides suicient information to form points; c.f., Section 2.1).
+In the next section, this will be important when calculating partial
+outputs.
+Pre- vs. Post-Intersection Fills: As an optimization, tensor
+data within a tile need not be illed into the Coordinator (or fetched
+at all) unless at least one intersection for that data deems it efectual. We call this scheme post-intersection ill, whereas the original
+scheme ills tensor data pre-intersection.
+Post-intersection ill can save bandwidth at the Coordinator
+input (by fetching less data) and storage (as only post-intersection
+data need be loaded into data memory). To support such a scheme,
+we need mechanisms to hide the latency of fetching data later, and
+a new level of indirections to store the post-intersected data in
+contiguous positions in the data memory. This makes it diicult to
+implement close to the arithmetic units, where data per coordinate
+is small (e.g., a scalar) and latency is critical. Yet, we can implement
+such a scheme close to DRAM, as latency and indirection cost is
+amortized by the tile ill time and size.
+7 ACCELERATOR-LEVEL DESIGN
+Finally, we discuss how to integrate Coordinators into the ExTensor
+accelerator architecture to evaluate tensor kernels. The main new
+idea is to hierarchically intersect streams by placing intersection
+logic (Sections 4-6) at diferent levels of an accelerator’s memory hierarchy. Coordinators closer to the main memory perform coursergrain intersections, e.g., at tile-level, and pass on efectual work
+to the next level (closer to the arithmetic) which performs inergrain intersections, e.g., on scalars, before it is inally computed
+on. Precisely what intersections occur where, in our current design, is discussed in Section 7.4. The resulting architecture streams
+data from main memory to compute, reducing inefectual work and
+data/metadata transfers at multiple granularities as soon as each
+granularity of inefectual work is detected.
+7.1 Macro Architecture
+The architecture we evaluate is shown in Figure 12. DRAM channels connect to a last-level bufer (LLB), which stores input tensors,
+and a partial output bufer (POB), which stores partial outputs (e.g.,
+partial sums). These bufers connect over a NoC to processing elements (PEs), each of which have PE-level bufers (PEBs), arithmetic
+units and datapath-level registers for performing efectual scalar
+computations. Sequencers, Scanners and Coordinators (Sections 4-
+6) are instantiated between each level of the memory hierarchy to
+sequence and intersect streams of coordinates, which correspond
+to diferent levels of tiles. We use a NoC that is conigurable to unicast, multicast and broadcast data, similar to previous accelerator
+proposals [23, 30].
+ExTensor Accelerator
+PE:
+PE Coordinator
+(contains PE buffers)
+Datapath
+PE array
++ x
+DRAM
+Sequencer + Scanners Coordinators
+Last level 
+buffer (LLB)
+Partial Output 
+Buffer (POB)
+Figure 12: The ExTensor accelerator.
+Support for sparse-sparse, sparse-dense and dense-dense
+computations. A tensor kernel is made up of two or more tensors.
+We optimize the accelerator for a common case where two sparse,
+one sparse and one dense, or two dense tensors are the operands
+of a computation. When evaluating sparse-sparse problems (both
+tensors are sparse), we perform intersection as described previously.
+When evaluating a sparse-dense problem, intersection is degenerate
+as all coordinates of the sparse operand are efectual and those
+coordinates are used (as positions) to access the values of the dense
+operand. For dense-dense, intersection is disabled.
+326
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+Some kernels, e.g., SDDMM in Table 1, beneit from performing
+analysis across more than two tensors simultaneously, e.g., to intersect un-evaluated subtensors (Section 3.2). For these cases, we
+allocate an additional Scanner at each PE which shares metadata
+storage with other Scanners and is idle if not needed.
+7.2 Datalow and Tiling
+Coordinators have coniguration-time lexibility to support different datalows by coniguring Sequencer state as described in
+Section 6.1. Figure 13 (right) shows, to continue our running example, a speciic datalow used for matrix multiply that we use in our
+evaluation. Datalows for other kernels look similar.
+Matrix A Matrix B
+1
+1
+2 3
+4
+4
+5
+6
+7
+7
+LLB tile
+PE tile
+LLB tile 
+MD
+LLB tile Data
+PE tile MD
+PE tile Data
+Scalars
+I
+K
+K J
+Datapath MD
+Figure 13: (Left) Tiled matrix representation. (Right) Datalow for
+matrix multiplication. MD stands for metadata. Circled numbers indicate loop order, ① in the innermost loop; ⑦ in the outermost loop.
+In our datalow, input matrices A and B are broken into LLB tiles,
+which are broken into PE tiles, which are broken into datapath
+tiles. Datapath tiles (a row or column of scalars in the PE) are
+output stationary (i.e., dimension K is iterated for both matrices
+simultaneously ①). PE tiles are matrix A-stationary, since we move
+across all columns in the LLB tile of B before switching to the next
+PE tile of A ③. LLB tiles are matrix B-stationary, as we move down
+all LLB tiles of A within a column before going to the next LLB tile
+of B ⑤.
+7.3 Data and Tile Representations
+Input tensors are stored in T-[uc]
++ representation at all levels of the
+memory hierarchy. For the rest of the paper, we assume CSF (T-c
++).
+To tile at each level, we pre-process each tensor (oline), adding
+levels of compressed metadata for each level of tiling, as discussed
+in Section 2.2. The fully tiled representation is shown for matrix
+A in Figure 13 (left). There are two levels of coordinates, which
+specify a rectangular subtile, in each level (LLB, PE and datapath).
+As tiles are broken into subtiles and stored closer to the arithmetic,
+outer levels of metadata are dropped. For example, only PE tile data
+is stored in the PEs (PE tile metadata and above is not).
+7.3.1 Choosing Tile Sizes. Since tile sizes are chosen in the coordinate space, one tile may contain more non-zeros than another tile.
+We select the LLB tile size such that each LLB tile its in the LLB in
+the worst case. For the tensors we evaluate (Section 8), we found
+this conservative strategy untenable at the PEs, without incurring
+a large PEB size. Thus, we size the PEB tile to it into the PEB in the
+common case. In the uncommon case, we split the tile across two or
+more PEs to emulate a larger PEB. Since this design is distributed,
+our SkipTo() architecture (Section 5) is no longer efective, thus we
+perform intersections using the baseline scheme (Section 4).
+7.4 Staging Data Transfers and Intersections
+Sequencers, Scanners and Coordinators between each level of the
+memory hierarchy perform intersections and stage work to the
+next level of the hierarchy. We continue our example for matrix
+multiply; see Figure 13 for terminology.
+1.) DRAM-level: Closest to DRAM, a Sequencer and Scanners
+(i.e., without intersection logic or data memories) bootstrap the
+kernel by traversing LLB metadata to determine the sequence of
+LLB tiles to send to the LLB. As they are closest to DRAM, we
+implement these Scanners’ metadata storage as cache memory
+backed by DRAM.
+2.) LLB-level: A Coordinator at the LLB intersects PE tile
+metadata and ills data post-intersection (Section 6.2). Each intersected coordinate corresponds to a PE tile. Since this level is
+post-intersection ill, the design avoids reading inefectual PE tile
+data from DRAM, within each LLB tile.
+3.) PE-level: A Coordinator intersects Datapath metadata and
+ills Datapath tiles (scalars) pre-intersection (Section 6.2). In our
+datalow, each datapath tile is a row or column of scalars in the
+PE tile for each matrix. Results from each intersection read scalars
+which are sent to arithmetic units.
+The Sequencers traverse their respective loop nests sparse (Section 6.1) at all levels (1)-(3) above, to avoid spending cycles iterating
+over empty streams. Aside from the DRAM-level Scanners (1), all
+Scanner metadata storage is implemented as a bufet [43], and tiles
+from memory closer to DRAM are pushed to lower levels, closer to
+compute, as they are needed.
+7.5 Partial Output Management
+After computation (e.g., a dot product in matrix multiply) is performed at the PEs, we need a mechanism to store and combine
+partial outputs (e.g., partial sums) generated by those computations.
+Storage for partial outputs is complicated because, unlike input
+tensors, their sparsity changes dynamically (i.e., the output starts
+completely empty, but becomes more dense as the computation
+proceeds).
+We make two observations about partial outputs which simpliies
+their handling. First, if all inputs are sparse tensors, computing on
+a PE tile will likely generate sparse partial outputs. For example,
+in output-stationary matrix multiply (Figure 4 (left)) a new partial
+output will only be generated if the intersection between streams
+corresponding to a row and column of that PE tile was non-empty.
+PE tiles are small relative to the overall matrix, thus computations
+at the PE have a smaller chance to generate a partial output. Second,
+co-iterations in tensor kernels are reduced via associative operators
+(e.g., sum reduction as in Table 1, max/min [34]), meaning such
+partial output reductions can be reordered.
+Putting the observations together, ExTensor manages partial
+outputs as follows. First, partial outputs are stored using a content
+addressable memory alongside the LLB called the partial output
+bufer (POB), which loads/unloads output tiles from DRAM. Output
+tiles are stored un-ordered in the COO format [14] in contiguous
+327
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+Table 2: Real-world tensors used in the evaluation. The top group is
+matrices from SparseSuite [16]. The bottom group are higher order
+tensors from FROSTT [45].
+Tensor
+(Domain)
+Dimensions Non-zeros
+(Density)
+mbeacxc (Economic Problem) 496 × 496 49.9k (20.3%)
+bcsstk13 (Structural) 2k × 2k 83.9k (2.09%)
+bcsstk10 (Structural) 1.1k × 1.1k 22k (1.87%)
+bcsstk17 (Structural) 11k × 11k 428.6k (0.356%)
+pdb1HYS (Protein Data Bank) 36.4k × 36.4k 4.3M (0.328%)
+rma10 (Fluid Dynamics) 46.8k × 46.8k 2.3M (0.106%)
+cant (FEM cantilever) 62.5k × 62.5k 4M (0.103%)
+consph (FEM concentric spheres) 83.3k × 83.3k 6M (0.087%)
+pwtk (Pressurized wind tunnel) 217.9k × 217.9k 11.5M (0.024%)
+shipsec1 (FEM Ship section / detail) 140.8k × 140.8k 3.6M (0.018%)
+mac_econ_fwd500
+(Macroeconomic model)
+206.5k × 206.5k 1.3M (0.003%)
+Higher order tensors
+Chicago Crime Data (Security) 6.2k × 24 × 2.5k 5.3M (1.46%)
+Uber Pickups (Transportation) 4.4k × 1.1k × 1.7k 3.3M (0.0385%)
+NIPS Publications (Academia) 2.5k × 2.8k × 239k 3.1M (0.0002%)
+regions of DRAM.4 Each DRAM region is allocated based on the
+worst-case output tile size. When output tiles are illed to the POB,
+the COO is converted to a content addressable hash table representation; the hash table is iterated sequentially to unload back to
+DRAM. Partial outputs produced by the PEs are sent to the POB,
+along with their coordinates (Section 6.1), where the coordinates
+are hashed to locate the old output value and the new value is locally accumulated. If the hash table contains no entry (coordinate)
+for the given output, one is allocated. Note, accumulations occur in
+the background, of the critical path.
+7.6 Programming Model
+The complete ExTensor accelerator is conigured to run a speciic
+tensor algebra kernel, e.g., kernels like those discussed in Section 2.2.
+A coniguration speciies the number of input tensors, the tiling for
+each tensor, a representation of the kernel loop nest/datalow and
+connectivity between bufers, intersection units and math datapaths.
+Details of the low-level speciication are omitted, but involve coniguring DMA engines, partitioning bufers, setting control FSMs, and
+deining on-chip network routes between physical components.
+The accelerator is not Turing complete, but is designed to compute all algebra equations accepted by the TACO Tensor Algebra
+Compiler [26]. Generating conigurations directly from TACO is
+future work.
+8 EVALUATION
+We now evaluate the inal ExTensor design proposed in Section 7.
+In this evaluation, we compare ExTensor variants to optimized
+CPU codes, perform a design space exploration for ExTensor, and
+provide hardware area igures for the ExTensor Scanner unit.
+8.1 Methodology
+Tensors. We evaluate performance using real-life tensors from the
+FROSTT [45] tensor data set and the SuiteSparse matrix collection [16] shown in Table 2. These datasets span multiple domains
+4
+In COO, each output is stored alongside its point/coordinates, which is lattened to
+save space.
+(from luid dynamics to macroeconomic models), non-zero densities, and number of dimensions. The tensors are pre-processed into
+the T-[uc]
++ representation T-c
++, also known as CSF (Section 7.3).
+We also evaluate several layers of pruned AlexNet [29] with their
+densities taken from [42].
+Tensor kernels. We evaluate these tensors on kernels selected
+from Table 1, including GEMM, TTV, TTM, and SDDMM. Of these,
+TTV and TTM compute on 3-dimensional tensors. SDDMM computes on 3 matrices. All the tensors used in the evaluation use
+double precision data.
+Simulation framework. We evaluate ExTensor using a model
+written in Python that evaluates performance for a given tensor kernel and input tensors. The performance model has two components.
+First, the core intersection logicÐthat includes the Coordinator and
+ALUsÐare modeled at cycle level for high idelity. This evaluates
+the number of cycles required to intersect two PE-level tiles (Section 7.3). Second, the rest of the accelerator componentsÐsuch as
+the LLB, NoC, DRAM interface, and scheduling logicÐare modeled
+analytically. These components evaluate data accesses, scheduling,
+output handling, and the on-chip datalow (Section 7.2).
+DRAM and NoC use a queuing model where data transfers are
+not allowed to exceed a peak bandwidth. We believe this queuing
+model should be suicient to model DRAM and NoC because of
+ExTensor’s data access/movement patterns. Speciically, since ExTensor accesses data at tile granularity, we achieve good spatial
+locality (at DRAM burst- and row bufer-granularity) and therefore achieve high DRAM utilization during periods where data
+is being read. Similarly, based on our datalow (Section 7.2), we
+multicast/unicast tiles across PEs in a ixed and regular order. This
+allows us to model NoCs analytically such that the peak bandwidth
+is never exceeded.
+Baseline platform. We compare ExTensor against an Intel
+Xeon E5-2687W v4 part, a high-end server CPU which has 12/24
+cores/threads running at 3 GHz (Turbo 3.5 GHz) with a 30 MB LLC.
+The CPU has 4 DRAM channels, providing a theoretical maximum
+bandwidth of 68.256 GB/s. For each kernel, we compare to either Intel’s MKL library [49] or the TACO tensor compiler [26], depending
+on which one gives better performance.
+8.2 Main Result
+We now present our main result: ExTensor performance relative
+to the CPU baseline from Section 8.1 on all tensor kernels. We
+compare two design variants:
+ExTensor-skip. Our inal design from Section 7, assuming a
+1 GHz clock.5 To make the comparison apples-to-apples, we set
+ExTensor’s LLB size and DRAM bandwidth to match the CPU. Based
+on design space studies, we use 128 PEs with 64 KB of PEB (local
+bufer including metadata and data storage for all Scanners) each.
+Each Scanner uses a coarse-grain CAM with T = 32 entries.
+ExTensor-no-skip. Same as ExTensor-skip, but without the
+intersection optimizations described in Section 5. We note that this
+version still performs intersection; a design that does not intersect
+would perform the computation dense.
+5Note, this is lower than the CPU clock. Increasing ExTensor’s clock frequency would
+signiicantly improve performance.
+328
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+0
+2
+4
+6
+8
+mac_econ
+shipsec1
+pwtk
+consph
+cant
+rma10
+pdb1HYS
+bcsstk17
+bcsstk10
+bcsstk13
+mbeacxc
+alexNet_L2
+alexNet_L3
+alexNet_L4
+geomean
+Speed-up Over CPU
+MKL ExTensor-No-Skip ExTensor-Skip
+Figure 14: ExTensor speed-up relative to MKL (SpMSpM).
+0
+1
+1
+2
+4
+8
+16
+32
+64
+128
+256
+512
+1,024
+0.02 0.03 0.06 0.13 0.25 0.50 1.00 2.00 4.00 8.00 16.00 GMACCs/sec
+Intensity (MACCs/Byte)
+CPU Roofline
+ExTensor Roofline
+ExTensor
+MKL
+Figure 15: Rooline analysis of ExTensor and CPU (SpMSpM).
+0
+1
+2
+3
+mac_econ
+shipsec1
+pwtk
+consph
+cant
+rma10
+pdb1HYS
+bcsstk17
+bcsstk10
+bcsstk13
+mbeacxc
+geomean
+Speed-up Over CPU
+MKL
+ExTensor
+Figure 16: ExTensor speed-up relative to MKL (SpMM).
+8.2.1 GEneralized Matrix Multiplication (GEMM). GEMM is a core
+kernel in linear algebra and continues to remain as one of the most
+widely used kernels in modern computing with its applications
+ranging from deep learning to graph processing. We evaluate two
+variants of GEMM:
+Sparse-Sparse GEMM (SpMSpM, or SpGEMM): In this kernel, a sparse matrix is multiplied by a sparse matrix. SpMSpM has
+a wide range of applications, including linear algebra based graph
+processing [34] and deep learning with sparse neural networks [21].
+We evaluate SpMSpM by multiplying matrices from the SuiteSparse
+collection by themselves, similar to graph algorithms such as inding nearest neighbors and triangle counting [34].
+Figure 14 compares ExTensor variants and MKL for SpMSpM.
+ExTensor-skip is 3.4× faster than the CPU on average and outperforms the CPU for every matrix. ExTensor improves performance
+in two ways. First, logic close to the memory (Sequencers and
+Scanners, hierarchical Coordinators; Section 7) look ahead in the
+computation to ensure the DRAM bus is highly utilized. Second,
+intersection logic at each level (e.g., between DRAM and the LLB,
+between the PE and datapath) removes inefectual data reads (e.g.,
+using tile metadata) Ð thus removing redundant bandwidth utilization. ExTensor-skip is more efective than ExTensor-no-skip
+in workloads with higher sparsity, evident from the results where
+66.11
+0
+1
+2
+3
+4
+5
+6
+nips uber chi-crime nips uber chi-crime pwtk cant pdb1HYS
+TTV TTM SDDMM
+Speed-up Over CPU
+TACO
+ExTensor
+Figure 17: Performance comparison between ExTensor variants
+and TACO for generalized tensor algebra.
+ExTensor-skip outperforms ExTensor-no-skip in all workloads
+other than AlexNet, which has higher density. Figure 15 presents
+the rooline analysis, which shows that MKL is memory latency
+bound on SpMSpM while ExTensor is close to memory bandwidth
+bound.
+Interestingly, speedup is not a function of matrix sparsity. This is
+because the core strength of ExTensor is intersection. Intersection
+eliminates work based on the sparsity pattern, not simply the sparsity, at both the LLB at PE tile granularity and within the PE at scalar
+granularity (Section 7.4). In particular, we see a ∼ 3.1× performance
+improvement for ExTensor-skip relative to ExTensor-no-skip,
+which illustrates the importance of sparsity pattern at the PE level
+where the kernel is sensitive to intersection time.
+Sparse-Dense GEMM (SpMM): In this kernel, a sparse matrix
+is multiplied by a dense matrix. ExTensor evaluates SpMM by multiplying each matrix in Table 2 by a randomly generated dense
+matrix with 32 columns. The multiplication of a sparse matrix by a
+tall-and-skinny dense matrix is a key kernel in several applications
+such as algebraic graph algorithms [3, 47].
+Figure 16 compares ExTensor variants and MKL for the SpMM
+kernel. ExTensor-skip performance improves the performance
+by 1.3× over the CPU on average. The performance gap between
+ExTensor and CPU is narrowed in SpMM compared to SpMSpM
+kernel because SpMM is more DRAM bandwidth bound and ExTensor is provisioned with the same bandwidth. Recall from Section 7,
+intersection of streams of coordinates from a sparse and a dense
+tensor simply yields the coordinate stream from the sparse tensor.
+Thus, our performance improvement comes from higher DRAM
+utilization using Scanners close to memory. We performed an analogous rooline analysis (not shown for space) which shows both
+the CPU and ExTensor DRAM bandwidth bound for SpMM, which
+points to the memory-bound nature of SpMM for both CPU and
+ExTensor leaving little room to improve over the CPU.
+8.2.2 Generalized Tensor Algebra. Figure 17 evaluates higher-order
+tensor kernels TTV and TTM, along with the SDDMM kernel,
+against TACO, a state of the art compiler for tensor algebra [26].
+TTV and TTM contract a 3-dimensional sparse tensor with a dense
+vector or matrix, respectively. SDDMM computes a iltered matrixmatrix product, i.e., a Hadamard product between a sparse matrix and a product of two smaller dense rectangular matrices. The
+Hadamard product in SDDMM provides opportunity for intersection to avoid computation of whole dot-products.
+We see 2.8×, 24.9×, and 2.7× average speedups for TTV, TTM,
+and SDDMM kernels respectively. In TTM and TTM kernels, ExTensor uses a 3-level tiling strategy to improve data reuse. TACO is
+329
+MICRO-52, October 12–16, 2019, Columbus, OH, USA Hegde, et al.
+1
+2
+4
+8
+16
+32
+64
+128
+mac_econ
+shipsec1
+pwtk
+consph
+cant
+rma10
+pdb1HYS
+bcsstk17
+bcsstk10
+bcsstk13
+mbeacxc
+geomean
+Speed-up Over CPU
+Model 4 Model 3 Model 2 Model 1 Model 0
+Figure 18: ExTensor bottleneck study with design variants.
+slower for all the kernels, mainly due to its lack of tiling and inability to eiciently avoid inefectual work. Hierarchical intersection
+permits ExTensor to avoid inefectual tiles being scheduled to the
+LLB/PEs, which is pronounced in these extremely sparse higher
+order tensors. Similarly in SDDMM, most of our beneit comes from
+the ability to skip entire dot products/tiles based on the sparsity of
+the C matrix (Table 1).
+8.3 Bottleneck Analysis
+Figure 18 studies a set of ExTensor variants, ranging in design
+realism, to give insight in what future changes can improve the
+design by how much. This methodology is similar to the Eyexam
+in [13]. We study the following design variants:
+• Model 0 (most idealized) takes into account only the number
+of MACC units available in ExTensor. For each matrix, the number
+of efectual multiplications is calculated. Then, runtime calculated
+by dividing the number of multiplications by available MACC units.
+• Model 1 adds DRAM bandwidth constraints to the previous
+model. Speciically, runtime is calculated as the maximum of model
+0’s time and the time it takes to read/write back the input matrices/result matrix once over the DRAM bus.
+• Model 2 adds a realistic LLB tiling scheme to the previous
+model. LLB tiling is modeled accurately, while on-chip behavior is
+idealized. PE tiles are distributed to PEs in an idealized fashion that
+tries to minimize load imbalance (as opposed to being constrained
+to a speciic on-chip datalow) and intersection time is calculated
+as the number of efectual MACCs.
+• Model 3 adds a realistic CAM-based PE intersect unit to the
+previous model.
+• Model 4 (most realistic) is the ExTensor model we evaluate in
+Section 8.2, which adds a realistic PE tile distribution unit to the
+previous model.
+Model 0 shows the performance ceiling given any accelerator.
+Model 0 and 1 are likely un-implementable. We believe Models 2 and
+3 may be implementable with improved methods for distributing
+PE tiles and performing intersection. On average, there is a 1.8×,
+1.4× and 1.2× performance gap between Model 1-2, Model 2-3 and
+Model 3-4, respectively.
+8.4 Synthetic Data Studies
+In Section 8.2, we presented results for real-life matrices. This makes
+analyzing ExTensor’s eiciency hard, because each real-life matrix
+has diferent dimensions, sparsity, and sparsity pattern. To isolate
+performance efects, Figure 19 shows a study on synthetically generated matrices using a uniform sparsity distribution, varying sparsity
+and matrix dimension. Speciically, for ixed numbers of non-zeros
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1024 2359 3695 5030 6366 7702 9037 10373 11709 13044 14380 15716
+Runtime (ms)
+Matrix Dimension Size (I=J=K)
+5k NNZ 10k NNZ
+25k NNZ 50k NNZ
+Figure 19: ExTensor’s SpMSpM performance across varying dimension sizes with constant number of non-zeros (NNZ) per matrix.
+(NNZ), we generate square matrices (I = J = K) of diferent dimension sizes and evaluate runtime on SpMSpM. For all points, we set
+PE tile size to a constant 128x128 elements in coordinate space.
+For each NNZ count, we observe three performance regimes.
+First, when the dimension sizes are small and sparsity is low (e.g.,
+when I < 3600 for 50k NNZ), the matrices only contain empty
+scalars but not empty PE tiles or empty rows/columns within a tile
+(on average). In this case, as we increase the dimension size, the
+runtime increases because the number of non-empty tiles increases,
+outweighing the beneit of scalar-granularity skips. Second, once
+we reach a suiciently high sparsity (namely, when NNZ = O(I) per
+tile), the trend reverses. During this phase, although the number
+of non-empty tiles continues to increase, we begin to see empty
+rows/columns within a PE tile which means the sparse loop optimization (Section 6.1) activates, which reduces overall runtime.
+Third, once the sparsity is high enough to see empty PE tiles, the
+runtime lattens with increasing sparsity as any non-empty tile is
+likely to have very few (e.g., 1) non-zeros.
+8.5 Area and Bandwidth Studies
+In the previous sections, we normalized ExTensor on-chip storage
+and DRAM bandwidth to exemplify the beneit of our intersection
+technique and architecture. We now perform two studies showing
+design sensitivity to these parameters.
+Sweep DRAM bandwidth, ixing area. First, Figure 20 shows
+the impact of increasing DRAM bandwidth for ExTensor running
+SpMSpM while keeping the same on-chip area as in the previous
+section. We sweep from the baseline bandwidth to ∼ 550 GB/s,
+which is more representative of (but still less than) modern GPUs.
+We found that ExTensor Model 4 (the complete design) has bottlenecks that prevent performance scaling with DRAM bandwidth.
+Speciically, increasing DRAM bandwidth to ∼ 550 GB/s improves
+performance by 3% only for Model 4. Thus, the results in Figure 20
+are for ExTensor Model 2, which idealizes intersection and PE tile
+distribution (Section 8.3). At this idelity, large matrices that do
+not it into the LLB see performance scaling. Small matrices (e.g.,
+mbeacxc) see less beneit, as those kernels are dominated by other
+factors such as latency. Average performance improvement is 2.1×
+for an 8× bandwidth increase. We consider addressing the bottlenecks in Model 4 that prevent scaling to be future work.
+Fix DRAM bandwidth, sweep area. Second, Figure 21 shows
+the impact of changing total LLB size, which is a dominant source of
+overall area. Once a kernel’s runtime levels of, we stop increasing
+the LLB. The takeaway is that for many matrices, performance is
+not sensitive to LLB size until the LLB shrinks to 5-10 MB. Similar
+330
+ExTensor: An Accelerator for Sparse Tensor Algebra MICRO-52, October 12–16, 2019, Columbus, OH, USA
+1.0
+2.0
+4.0
+8.0
+16.0
+32.0
+mac_econ
+shipsec1
+pwtk
+consph
+cant
+rma10
+pdb1HYS
+bcsstk17
+bcsstk10
+bcsstk13
+mbeacxc
+geomean
+Speed-up Over CPU
+baseline 2x baseline 4x baseline 8x baseline
+Figure 20: ExTensor (Model 2) SpMSpM speed-up over the CPU,
+scaling ExTensor DRAM bandwidth.
+0
+10
+20
+30
+40
+50
+0 2 4 6 8 10 12 14 16
+Runtime (ms)
+LLB Size (MBs)
+mac_econ
+pwtk
+consph
+cant
+rma10
+bcsstk17
+bcsstk10
+Figure 21: Pareto frontiers for SpMSpM design space. Performance
+per area optimal points are shown with a black outline.
+to the efectiveness of intersection, this highly depends on exact
+sparsity distribution in each matrix as opposed to absolute matrix
+size, as even a small matrix can generate a relatively dense output
+depending on non-zero distribution.
+8.6 Hardware Implementation
+We focused our RTL implementation on the novel parts of the accelerator, in particular the Coordinator, since the rest of the modules
+(ALUs [19], NoC [30], and bufers [37], etc.) are already well studied. We implement the Coordinator design in Verilog, assuming a
+64 KB PE bufer and a content addressable memory with T = 32
+entries with 8-bit coordinates (suicient to represent the tile sizes
+used in our evaluation). We synthesize the design using a 32 nm
+commercial process, which meets timing at 1 GHz to match our
+performance evaluation. Area numbers for SRAM were obtained
+from CACTI [37] and for compute were taken from [19] scaled to
+32nm [11]. Area for intersection is taken from synthesis. Overall,
+we ind that PE SRAM bufer takes 79% of the area, double precision
+arithmetic takes 12% and logic for intersection takes 9%.
+Extrapolating from PE area plus projected LLB+POB area, we
+estimate total chip area (using the parameters in Section 8.2) to be
+96.89mm2
+, with the intersection logic across PEs consuming only
+2.38mm2
+(2.46% of total) in 32nm. The main take away is that the
+Coordinator logic does not dominate the accelerator area budget.
+9 RELATED WORK
+Accelerator designs targeting tensor algebra [2, 8, 24, 33, 36, 40, 41]
+and machine learning [4, 12, 13, 21, 25, 32, 42, 44, 51] are receiving
+signiicant attention. Furthermore, these accelerator designs also
+exploit sparsity to reduce both time and energy. We now compare
+ExTensor to tensor algebra and machine learning accelerators.
+Tensor Algebra Accelerators. The ubiquity of matrix operations in big data applications has spurred research work on accelerating sparse matrix-dense vector (SpMV) and SpMM kernels [2, 8, 24, 33, 39]. Intersecting coordinates from sparse matrices
+to dense data is trivial, and these works skip inefectual computations (e.g. single multiplications or entire dot products based on
+empty rows/columns) as a side efect of the compressed format
+for the sparse matrix (e.g., CSR/CSC). Yet, none of these designs
+extend to tensors with degrees higher than two or to compound
+expressions such as SDDMM, which is the focus of ExTensor.
+Recent work has investigated accelerators for sparse matrix
+sparse vector (SpMSpV) multiplication and SpMSpM [41, 50]. Several works perform inner-product matrix multiplication by loading
+the entire sparse matrix B into the processor and then processing
+sparse matrix A on a row-by-row basis [31, 40, 50]. These proposals apply coordinate intersection after fetching the values and
+meta data from memory, which leads to cases where data loaded is
+never used. ExTensor avoids this memory traic by hierarchically
+intersecting tiles and subtiles at each level of the memory/bufer
+hierarchy and lazily loading values after intersection. Alternately,
+accelerators have focused on outer-product multiplication to avoid
+the need for coordinate intersection [36, 41]. With this approach,
+each column in sparse matrix A is multiplied by the elements in each
+row of sparse matrix B to generate partial products. In essence, this
+approach improves memory traic eiciency for the multiplication
+step but introduces an additional merge step where the many sets
+of partial products are read from memory and reduced into the inal
+products. ExTensor performs eicient inner-product multiplication
+that achieves similar memory traic by using intersections, skips,
+and tiling to reduce value and meta data memory traic.
+Machine Learning Accelerators. Recent CNN accelerators
+have also recognized the prevalence of inefectual computations
+(e.g., [4, 12, 13, 21, 42, 51]). While these designs focus on saving
+energy and time by skipping single multiplications, they still incur
+memory access overhead of bringing the operands on-chip. ExTensor can skip entire dot products when a tensor row/column/tile is
+zero. In doing so, ExTensor reduces time and energy by avoiding
+memory accesses associated with inefectual computations.
+10 CONCLUSION
+General tensor algebra represents a ripe domain for contributions
+from computer architects. This paper presented ExTensor, a new
+approach for performing general tensor algebra using hierarchical
+and compositional intersection. There are multiple avenues for
+future work. For example, eicient conversion between compressed
+formats on the ly, online as opposed to oline tiling, support for
+SIMD datapaths, and how to address the performance artifacts
+hindering bandwidth scaling (Section 8.5). In the long run, we
+believe that the broad applicability of algebra on compressed tensors
+means that they should become a foundational building block of
+accelerator construction.

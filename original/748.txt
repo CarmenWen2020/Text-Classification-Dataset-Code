@@ -1,0 +1,660 @@
+Abstract
+K Nearest Neighbor (KNN) joins are used in scientific domains for data analysis, and are building blocks of several well-known algorithms. KNN-joins find the KNN of all points in a dataset. This paper focuses on a hybrid CPU/GPU approach for low-dimensional KNN-joins, where the GPU may not yield substantial performance gains over parallel CPU algorithms. We utilize a work queue that prioritizes computing data points in high density regions on the GPU, and low density regions on the CPU, thereby taking advantage of each architecture’s relative strengths. Our approach, HybridKNN-Join, effectively augments a state-of-the-art multi-core CPU algorithm. We propose optimizations that  maximize GPU query throughput by assigning the GPU large batches of work;  increase workload granularity to optimize GPU utilization; and,  limit load imbalance between CPU and GPU architectures. We compare HybridKNN-Join to one GPU and two parallel CPU reference implementations. Compared to the reference implementations, we find that the hybrid algorithm performs best on larger workloads (dataset size and K). The methods employed in this paper show promise for the general division of work in other hybrid algorithms.
+
+Keywords
+GPGPU
+Heterogeneous systems
+In-memory database
+Nearest neighbor search
+Query optimization
+
+1. Introduction
+This paper studies the KNN self-join problem, which is outlined as follows: given a database, , of points, find all of the  nearest neighbors of each point. We focus on the self-join because it is a common task in scientific data processing workflows (e.g., within an astronomy catalog, find the closest five objects of all objects within a feature space [51]). KNN searches are used in many applications, such as the k-means [23], and Chameleon [26] clustering algorithms. Consequently, KNN searches have been well studied [3], [38], [45], including algorithms targeting the Graphics Processing Unit (GPU) [39].
+
+There are several KNN research thrusts in the literature. KNN searches are employed in both low and high dimensional contexts. An example KNN query in the low dimensional case is as follows: find the closest  restaurants to my current position, where the feature vectors contain 2-dimensional coordinates of the locations of nearby restaurants. An example KNN search in the high dimensional context is image classification [29], where image pixel intensities are converted to feature vectors, which may contain hundreds or thousands of features.
+
+To find the KNN of each point (or feature vector) in a dataset, one option is to perform a brute force search between all data points, which yields a quadratic complexity. Another option is to use an indexing data structure (e.g., kd-tree [5], or R-tree [21]), which prunes the search for points which are nearby a given query point (we refer to a query point as a point being searched to find its  nearest neighbors). In low dimensionality, the indexing data structures perform quite well and are able to discern between data points in each dimension, which reduces the quadratic complexity of the brute force algorithm [3], [38], [39], [45].
+
+The high dimensional context leads to several problems concerning the “curse of dimensionality” [4]. In higher dimensionality, index searches typically become more exhaustive, where a KNN search for a given query point needs to compare to a substantial fraction of the points in the entire dataset. Thus, index searches become ineffective, and may even degrade performance relative to a brute force search, because searching the index incurs some degree of overhead. The exhaustive nature of high dimensional KNN searches led to the development of approximate algorithms [3], [38] that return  nearby neighbors of a given query point, but they may not be the exact  nearest neighbors.
+
+In this work, we focus on exact KNN searches in low dimensionality. The performance of low dimensional KNN searches is limited by the memory bottleneck. However, the high aggregate memory bandwidth of modern GPUs [40] results in roughly an order-of-magnitude increase in memory bandwidth over the CPU. Therefore, GPUs are well-suited to data-intensive workloads. However, data transfers to and from the GPU are a well-known bottleneck, which can decrease the performance advantages that are potentially afforded by the GPU. Additionally, many data-dependent workloads, such as the KNN-join studied in this work, have irregular execution patterns that make the GPU unsuitable for the algorithm due to thread divergence and serialization that degrades performance [22]. Thus, it is not clear that the GPU will lead to performance gains over multi-core CPU algorithms designed for KNN searches in low dimensionality.
+
+Despite the great potential of GPU-accelerated KNN algorithms, much of the literature focuses on optimizing brute force approaches which highlight performance in high dimensional feature spaces and often compute a distance matrix [2], [15], [24], [31]. The key idea is to compute the distance between a query point and all other points in , then select the  neighbors with the smallest distances to the query point.
+
+We depart from the distance matrix approach, and focus on low dimensional KNN searches within a dimensionality regime that can employ indexing data structures to prune the search for potential neighbors of each query point in the dataset. Given the above context, we summarize the goals of the paper as follows.
+
+Addressing Low-Dimensionality on the GPU: The abovementioned brute force KNN searches in high-dimensional feature spaces are clearly well-suited to the GPU as the many independent distance calculations can easily exploit the GPU’s massive parallelism. But, it is not clear that the GPU can significantly outperform parallel CPU approaches in low dimensionality. We address KNN searches in up to 6-D, which is largely the domain of CPU KNN algorithms that employ indexing data structures.
+
+Transforming the GPU-Accelerated Similarity Join into the KNN-Join: Recent work has proposed a similarity self-join for the GPU that finds all points within a search distance  of a query point using an index [19]. The similarity join can be used to construct part of a KNN search by searching within a distance  of a query point, and if there are  neighbors within , order the neighbors by distance and select the nearest  neighbors. We leverage an efficient GPU similarity join algorithm in our approach.
+
+Concurrent Exploitation of CPU and GPU Resources: In contrast to GPU-only approaches, we use both the CPU and GPU by assigning query points to either architecture to find their respective KNN. We leverage the distance similarity join described above for the GPU to process high data density regions, and a parallel CPU KNN algorithm for processing low density regions.
+
+To our knowledge, our algorithm is the first to split KNN searches between architectures as described above. The contributions and primary findings of the paper are outlined as follows:
+
+•
+We propose a hybrid CPU/GPU approach for solving the KNN self-join problem that combines a distance similarity join for the GPU with a multi-core CPU KNN algorithm.
+
+•
+The GPU component of our HybridKNN-Join algorithm solves the KNN problem using distance similarity searches. We show how to select a search distance, , such that the GPU join is likely to find at least  neighbors for each query point.
+
+•
+We present a work queue to distribute query points to the CPU and GPU. The work queue prioritizes assigning query points with significant computation to the GPU.
+
+•
+The throughput-oriented GPU requires processing large quantities of query points in batches to achieve peak performance. This can lead to load imbalance between the CPU and GPU. We propose methods to mitigate load imbalance between architectures.
+
+•
+We compare the hybrid approach to one GPU and two multi-core CPU reference implementations. We find that HybridKNN-Join outperforms the reference implementations on most scenarios, particularly at larger values of .
+
+The paper is organized as follows. Section 2 presents background material. Section 3 recaps leveraged GPU self-join literature. Section 4 presents the hybrid KNN self-join and optimizations. Section 5 evaluates our approach. And finally, Section 6 concludes the paper and discusses future work directions.
+
+2. Background
+2.1. Problem statement
+The KNN self-join is outlined as follows. Let  be a database of -dimensional points (or feature vectors) denoted as 
+, where . For each point in the database, 
+, we find its  nearest neighbors, excluding the point itself. To compute the distance between two points, 
+ and 
+, we use the Euclidean distance as follows: 
+, where 
+ and 
+ denote the coordinates in dimension  of point  and , respectively. The KNN self-join is denoted as 
+. However, the KNN self-join problem and optimizations are also directly applicable to the case where there are two datasets  and  that are joined, 
+. Table 1 summarizes notation that is used throughout multiple sections of the paper (notation that is self-contained within a section is not reported in the table).
+
+Many data analytic and machine learning algorithms assume that processing can occur entirely in-memory. We make the same assumption here, and do not consider out-of-core (disk-based) solutions. For KNN searches, the result set size increases with ; therefore, the result set typically has the largest memory footprint of the algorithm. Since the result set may exceed GPU global memory capacity, we batch the execution across multiple GPU kernels to ensure that global memory is not exceeded. This allows our algorithm to process result set sizes that would otherwise exceed global memory capacity. We assume that the entire dataset can fit within the global memory of the GPU because the size of the dataset is much smaller than the result set.
+
+
+Table 1. Algorithm components and summary of notation.
+
+Names of algorithms/components
+HybridKNN-Join	The proposed CPU/GPU approach.
+Hybrid-CPU	Parallel CPU component of HybridKNN-Join.
+Hybrid-GPU	GPU component of HybridKNN-Join.
+Notation
+The input dataset.
+Data points in the dataset.
+The dimensionality of the data.
+The number of nearest neighbors found for each 
+.
+The search distance for Hybrid-GPU that may be dynamically expanded.
+The initial search distance selected by Hybrid-GPU.
+Initial monolithic batch size for Hybrid-GPU.
+Small batch size for Hybrid-GPU.
+Window size of reserved queries for Hybrid-CPU during monolithic batch rounds.
+Batch size for Hybrid-CPU.
+Number of threads assigned to each query point for Hybrid-GPU.
+2.2. Related work
+We present an overview of several categories of related work below.
+
+2.2.1. Hybrid algorithms
+A significant fraction of research on GPU algorithms and applications compares CPU vs. GPU approaches. However, many GPU algorithms are unsuitable for all application scenarios, where parallel CPU algorithms may outperform the GPU in some instances. Consequently, using both multi-core CPUs and the GPU is needed to achieve peak performance in heterogeneous systems (see [37] for a survey of hybrid algorithms). Thus, hybrid CPU/GPU algorithms aim to maximize resource utilization in computer systems, and/or are designed such that they can take advantage of the relative strengths of each architecture. This paper is one such example of a hybrid algorithm that both splits the work between the CPU and GPU which maximizes resource utilization and also assigns work to each architecture to exploit the CPU and GPU’s relative strengths.
+
+Several works split the work between the CPU and GPU at runtime. For instance, Li et al. [33] parallelize Cryo-EM 3D reconstruction, and assign tasks to the CPU or GPU depending on the workload. Deshpande et al. [10] filter images based on the degree of parallelism that varies across image regions, where the GPU is assigned the highly parallel regions and the CPU is assigned the remaining regions. Similarly to the abovementioned works, HybridKNN-Join dynamically schedules the query points onto the architecture most suitable for the workload. To our knowledge, our preliminary work [18] on hybrid KNN-joins is the only such KNN algorithm that uses a hybrid approach. This comprehensive paper extends our preliminary work [18].
+
+2.2.2. KNN searches and joins
+KNN searches are a fundamental machine learning algorithm. Consequently, there have been many works on optimizing the KNN search and join [1], [2], [3], [15], [17], [24], [31], [32], [38], [39], [43], [45], [46], [47], [48], [49]. In this section, we discuss the related work on KNN searches. For clarity, we note that we only consider those algorithms that are capable of performing exact searches. Approximate KNN searches are typically employed at higher dimensionality than that addressed in this paper.
+
+We describe several KNN algorithms designed for the CPU as follows. An R-tree is used to find the KNN in [45] that prunes the search for nearby candidate points to a given query point. The algorithm performs a branch-and-bound tree traversal, which first gets an estimate of the KNN and then performs backtracking on subtrees to find the exact neighbors. Backtracking in tree-based solutions [45] is used to ensure that at least  nearest neighbors are found.
+
+The Approximate Nearest Neighbors (ANN) algorithm can be used to efficiently find both the approximate and the exact neighbors [3]. Approximate solutions are motivated by prohibitively expensive high-dimensional exact KNN searches. Related to ANN is the Fast Library for ANN (FLANN) [38], which achieves good performance using a parallel search over a randomized kd-forest. While FLANN outperforms ANN for one scenario in [38], the comparison was between a parallel (FLANN) and sequential (ANN) algorithm. Since ANN is considered a state-of-the-art exact KNN algorithm, we parallelize and incorporate it into HybridKNN-Join.
+
+There have been several efforts on parallelizing KNN searches on the GPU. We omit discussing the distance matrix based approaches [2], [15], [24], [31] described in Section 1, as we focus on lower dimensionality where indexing data structures are effective at pruning KNN searches. A KNN GPU implementation is presented by Nam et al. [39] that employs an R-tree index. Their algorithm performs backtracking in the R-tree to guarantee that  neighbors are found for each query point. The algorithm is optimized to reduce warp divergence that occurs when executing branch instructions that are necessitated by tree traversals.
+
+A grid-based indexing solution for 3-dimensional KNN searches on the GPU was proposed by Leite et al. [32]. For a given query point, the algorithm expands the number of grid cells searched to ensure that at least  neighbors are found. While the approach in [32] has some similarity to the work in this paper (both use a grid-based index), the algorithm uses a query-centric approach that expands the search radius when  neighbors are found. In contrast, in this paper, we avoid using a query-centric approach and instead elect to execute all KNN searches in a given batch of queries with a fixed search distance to minimize warp divergence. Our batched execution relaxes the constraint that  neighbors need to be found by each query point computed by the GPU.
+
+Reference Implementation: A GPU KNN search algorithm that uses a buffer kd-tree has been proposed by Gieseke et al. [17]. Similarly to the R-tree algorithm described above [39], the buffer kd-tree algorithm [17] avoids several drawbacks of the GPU’s architecture. In particular, they search for queries in batches that are co-located within the same leaf. The algorithm delays execution by waiting for sufficient work to be accumulated into a buffer before accessing leaf nodes. This improves the SIMT parallelism of the algorithm. Their algorithm also focuses on improving the fraction of coalesced memory accesses by having threads within a warp access either consecutive or nearby memory addresses. In our experimental evaluation, we compare our hybrid algorithm to this GPU algorithm that we denote as BufferKDTree.
+
+Table 2 categorizes related work on KNN searches by the target dimensionality of the algorithm, whether the algorithm uses an indexing data structure to prune the search, or uses a brute force approach, the accuracy of the search (exact or approximate), and the target architecture (CPU, GPU or hybrid CPU/GPU). From Table 2, we observe that the majority of the low/moderate dimensionality works use indexing schemes, whereas the high dimensional algorithms focus on brute force approaches. As described in Section 1, this is because the efficacy of indexing schemes to prune the search degrades at high dimensionality.
+
+
+Table 2. Categorization of several KNN search algorithms in the literature. Categories: dimensionality, use of indexing methods, brute force searches, exact and approximate solutions, and architecture.
+
+Reference	Low to moderate dimensionality	High dimensionality	Indexing	Brute force	Exact	Approx.	CPU	GPU	Hybrid CPU/GPU
+Roussopoulos et al. [45]	✕		✕		✕		✕		
+Arya et al. [3]	✕		✕		✕	✕	✕		
+Gieseke et al. [17]	✕		✕		✕			✕	
+Nam et al. [39]	✕		✕		✕			✕	
+Patwary et al. [43]	✕		✕		✕		✕		
+Ryoo et al. [46]	✕		✕		✕			✕	
+Leite et al. [32]	✕		✕		✕	✕		✕	
+Gowanlock [18]	✕		✕		✕				✕
+Muja & Lowe [38]		✕	✕			✕	✕		
+Garcia et al. [15]		✕		✕	✕			✕	
+Arefin et al. [2]		✕		✕	✕			✕	
+Jian et al. [24]		✕		✕	✕			✕	
+Komarov et al. [31]		✕		✕	✕			✕	
+2.2.3. Indexing techniques
+Central to our approach is using an appropriate index for the architecture. Indexes for the CPU have been designed to be work-efficient and data-aware, where spatial partitions are computed based on the input data. Examples include well-known tree-based indexes, such as kd-trees [5], quad-trees [12], and R-trees [21], [44]. In contrast, there are data-oblivious methods, such as statically partitioned grids [19].
+
+With the proliferation of general purpose computing on graphics processing units (GPGPU) there has been debate whether the community should use the tree-based approaches, or data-oblivious methods for the GPU. The disadvantage of index-trees is that searching the index using tree traversals requires performing many branch instructions, which can reduce the parallel efficiency of the GPU due to the SIMT architecture. Consequently, the abovementioned GPU KNN algorithms that employed index-trees [17], [39] were optimized to avoid divergence.
+
+While there is little consensus regarding the type of index that should be employed on the GPU, we highlight two results. A GPU R-tree [28] was proposed and optimized to reduce thread divergence. Later, the same research group showed that it is better to perform the tree traversal on the CPU and perform the scanning of the leaf nodes on the GPU [30]. This shows that the GPU should be leveraged through the use of regularized instructions, yielding low thread divergence. Therefore, we elect to use a non-hierarchical indexing technique for the GPU component of our KNN-join algorithm.
+
+2.2.4. Range queries and joins
+Our hybrid approach uses range queries (distance similarity searches) on the GPU to perform KNN searches. A join operation with a distance predicate can be implemented as several range queries. The multi-core CPU join algorithm in [25] uses a non-materialized grid, and exploits the data distribution to efficiently perform a similarity join over a search distance, , and the algorithm was shown to outperform the E
+LSH [1], and LSS [34] algorithms. A GPU self-join was presented in [19] that was shown to be efficient on low-dimensional data. We leverage some of the optimizations in the GPU self-join work [19] as they are effective for executing range queries that can be used to solve KNN searches on the GPU.
+
+2.2.5. Distributed memory KNN searches
+Distributed-memory approaches have been proposed to improve the performance of KNN searches. For instance, MapReduce [9] implementations for KNN joins [35], [50] have been proposed. The authors in [35] optimize the mapping function to prune distance calculations, which reduces the cost of the shuffling operation and computation. The authors in [50] propose exact and approximate KNN join solutions, where they show that in their approximate solution, only a linear number of reducers are needed, which is a prerequisite for achieving good scalability. In contrast to scaling out the computation using distributed memory, we scale up the computation using the GPU.
+
+2.3. Application scenario of this paper
+There is a wide range of related work and application scenarios for KNN searches. In this paper, we focus on low to moderate dimensionality KNN searches (2–6 dimensions), where the curse of dimensionality [4] does not prohibit indexing schemes from being effective at pruning KNN searches. This scenario is common in the literature (e.g., see the KNN search papers in Table 2 by Roussopoulos et al. [45], Arya et al. [3], Gieseke et al. [17], Nam et al. [39], Patwary et al. [43], Ryoo et al. [46], and Leite et al. [32]). Additionally, we focus on exact and not approximate searches, as the approximate searches are designed for much higher dimensionality than that considered in this paper. Furthermore, we reiterate that we depart from the literature by splitting the work between CPU and GPU architectures.
+
+3. Recap of previous self-join work
+HybridKNN-Join leverages the distance similarity self-join work of Gowanlock & Karsin [19], which was evaluated on up to  dimensions. The authors used an efficient indexing scheme and batching scheme from [20], and proposed a technique to reduce the number of duplicate distance calculations. The approach was shown to outperform a state-of-the-art multi-core approach across many experimental scenarios; therefore, we employ their work in the GPU component of HybridKNN-Join. We outline the optimizations from [19], that we use to efficiently solve the KNN-join on the GPU.
+
+3.1. Indexing technique
+We use a grid-based indexing scheme for the GPU (see [19] for more detail) with cells of length . The index is constructed on the host/CPU, and only stores non-empty grid cells, as indexing all cells may exceed the memory capacity of the GPU. The index, denoted as , uses a series of lookup arrays to find relevant points in the index. A range query around a query point is carried out by performing distance calculations between points in each adjacent cell of the query point (and the cell containing the query point). The number of adjacent cells is 
+ (e.g., in 2-D there are 9 total adjacent grid cells). We make one minor change to the index described in previous work [19], by removing the masking arrays, which were used to filter out cells that did not contain any points in a given dimension. While the masking arrays may be useful in some scenarios (such as datasets with a bimodal distribution in a single dimension), in practice, we find that they had a negligible impact on performance. The space complexity of the index is . This small memory footprint allows for larger datasets and result set sizes to be processed on the GPU. While we use this grid-based indexing technique, we modify its construction, as discussed in Section 4.6.
+
+3.2. Batching scheme
+We give a brief overview of the GPU batching scheme in [19]. The size of the total result set for a join operation, which contains the neighbors of each point within a distance , can be larger than the GPU’s global memory capacity. To process large datasets or values of , a batching scheme is needed to incrementally process the join, by querying a fraction of  at each kernel invocation until range queries have been performed on all 
+. We select a number of batches to execute by first estimating the total result set size (using a lightweight kernel), which yields an estimate, , of the total result set size. Given a buffer size of 
+ (the size of a buffer to store the result set of a batch), we compute the total number of batches to be 
+. This obviates failure-restart strategies that can waste computation. We use 3 CUDA streams (a minimum of 
+), which overlaps the execution of the kernel and data transfers to exploit bidirectional PCIe bandwidth, and concurrent computation on the host. We use 
+ for each stream. In our experiments, on the larger workloads (higher dimensionality and ), using multiple streams is able to hide most of the host-GPU communication, whereas on the smaller workloads, the algorithm is bound by memory transfer operations.
+
+4. HybridKNN-Join and optimizations
+4.1. Splitting work between architectures
+As discussed in Section 1, we focus on a hybrid CPU/GPU approach that performs the KNN search using the CPU and GPU.
+
+A similarity search finds all points, 
+, within a search distance, , of a query point. Thus, to construct a KNN-join using a range query, there are several facets of the problem to consider. The  search distance is required to ensure that the nearest points from a query point are found. For a given search that returns  neighbors, the distances between points are compared to determine which of the points are nearest to the query point. However, while a range query will return all points within  of a batch of query points, there is no guarantee that all (or any) of the query points will have  neighbors. In principle, the selection of  could be large such that all points have at least  nearest neighbors; however, this would lead to significant computational overhead, as some points in the dataset may find a large fraction of the entire dataset necessitating a significant number of distance calculations.
+
+Fig. 1 shows an example of a spatially partitioned region with query points shown as larger red points. In Fig. 1(a), there are many nearby neighbors to the query point; thus, a significant number of distance calculations need to be computed to find the  nearest neighbors. However, in Fig. 1(b), the query point is located in a sparse region. Thus, a large range query would be needed to find at least  neighbors. Spatially partitioning the data using a grid in Fig. 1(a) is reasonable, as it is likely  neighbors will be found by checking adjacent cells (e.g., assume ). In contrast, in Fig. 1(b), the grid is not effective. Had a grid been used, the adjacent cells would not contain any nearby points. In this case, a data-aware index (e.g., kd-tree [5] partitioning shown in Fig. 1(b)) is better suited to finding data in sparse regions. Furthermore, as there are fewer points nearby the query point in Fig. 1(b), there is a low degree of candidate point filtering overhead.
+
+
+Download : Download high-res image (82KB)
+Download : Download full-size image
+Fig. 1. Example query points assigned to either the GPU or CPU and possible indexing strategies for each. (a) The GPU is proficient at processing high density regions with a non-hierarchical grid. (b) The CPU is proficient for low density regions with an index-tree (kd-tree partitioning shown). (For interpretation of the references to color in this figure legend, the reader is referred to the web version of this article.)
+
+Given this illustrative example, the GPU and associated indexing scheme in Section 3.1 is good for processing the scenario in Fig. 1(a) due to the large amount of filtering overhead needed (the massive parallelism of the GPU is well-suited to distance calculations), and low index search overhead; whereas the scenario in Fig. 1(b) is good for finding the KNN on the CPU due to the low degree of filtering overhead and associated data-aware indexing scheme for low density regions. Therefore, the motivation for splitting the work between CPU and GPU is based on the suitability of each architecture to find the KNN of a given query point.
+
+4.2. Hybrid KNN-Join overview
+We exploit the relative strengths of CPU and GPU architectures. The GPU is proficient at processing large batches of queries when the kernel can exploit the high memory bandwidth and massive parallelism afforded by the architecture. The CPU is better at processing irregular instruction flows, and thus, is well-suited to tree-based indexes that are comprised of many branch instructions.
+
+4.2.1. CPU KNN component (Hybrid-CPU )
+We use the publicly available1 ANN CPU implementation [3] that uses a kd-tree index. The algorithm is efficient for both approximate and exact solutions to the KNN problem, and we execute the algorithm such that we obtain the exact nearest neighbors. As noted in other work [43], ANN uses global variables in its functions, which are not conducive to shared-memory parallelism. We obviate this limitation by parallelizing ANN using MPI where the  nearest neighbors of query points are found independently by each process rank. The results are written directly to an MPI shared memory window and thus we avoid explicit communication between process ranks. We refer to the multi-core CPU approach of HybridKNN-Join as Hybrid-CPU.
+
+4.2.2. GPU-Join component (Hybrid-GPU )
+In CPU-based KNN searches [45], backtracking is used to ensure that  neighbors are found for each query point searched. Likewise, the E
+LSH [1] CPU algorithm for range queries has been used for KNN searches by expanding the search radius until  neighbors are found for each point. As an example of expanding the search radius, Fig. 2(a) shows where  neighbors are found when , whereas Fig. 2(b) shows an example where  needs to be expanded to  to find at least  neighbors. Backtracking or expanding the search radius is a query-centric approach that is beneficial for modern CPUs that can take advantage of the memory hierarchy (e.g., benefiting from locality during tree traversals), but is unsuitable for a batched GPU execution.
+
+To transform range queries with a distance  into a KNN search that considers the throughput-oriented nature of the GPU, we use a batched execution that allows our GPU component, Hybrid-GPU, to fail to find at least  points for each point searched. The overall idea that we will outline in Section 4.5 is the following:  the failed queries are added back to a work queue to be processed by either Hybrid-GPU or Hybrid-CPU in the future; and  we dynamically re-index Hybrid-GPU with an increased  value when it reaches a threshold number of searches that did not yield  neighbors per point. Thus, each query point assigned to Hybrid-GPU is not guaranteed to find its KNN because we use a single -distance when executing the kernel. Therefore, we refrain from using the query-centric approaches (e.g., backtracking, or increasing  for individual point searches) on the GPU because this would lead to increased divergence in the kernel and intra-warp load imbalance.
+
+
+Download : Download high-res image (101KB)
+Download : Download full-size image
+Fig. 2. A KNN search around two query points (larger red points at the centers) where . Shaded region denotes the range required to find  points. (a)  neighbors are found with . (b)  neighbors are found when the search distance is expanded to .
+
+4.3. Algorithm overview
+We present the pseudocode of HybridKNN-Join to provide an overview of the technical details of the algorithm which are described later in this section. We outline HybridKNN-Join in Algorithm 1 as follows. Obtaining the process rank and importing the dataset occurs on lines 2–3. We use an MPI implementation and have 1 master GPU rank and several CPU ranks which begin their primary execution on lines 4 and 23, respectively. For brevity, we do not show the work queue rank, as it simply assigns query points to the GPU and CPU ranks.
+
+The Hybrid-GPU rank initializes the result set (line 5), and query failure set (line 6). Next, the value of 
+ is selected (Section 4.4) on line 7, and then  is set using this value on line 8 (we use 
+ later, which is why we declare both  and 
+). Next, we construct the index, , as a function of , and  on line 9. Then, the algorithm gets a number of queries from the work queue rank on line 10 and stores them in 
+. A while loop is entered on line 11 that iterates until there are no more queries to compute (i.e., 
+). Using the batch estimator, the number of GPU batches is computed on line 12 (recall from Section 3.2 that the batch estimator computes the total number of batches so that Hybrid-GPU can process result sets larger than global memory). For clarity, note that these batches differ from the batches of queries obtained from the work queue (
+).
+
+The algorithm loops over all of the batches (line 13). At each iteration, the GPUJoinKernel is executed (line 14), which computes the result set for a single batch. On line 15 the result of the join operation is filtered (the result is in the form of key/value pairs which are filtered to reduce duplicate keys), and store only points in 
+ that have at least  neighbors. On line 16, those query points in the batch that have  neighbors are added to the 
+ set, and these queries are added back to the work queue on line 17.
+
+On lines 18–20, the algorithm will dynamically re-index Hybrid-GPU with a larger  value if  of points in 
+ found  neighbors (Sections 4.2.2 GPU-Join component (, 4.5 Assigning work using a work queue). And finally, on line 21, the rank retrieves work for the next batch from the work queue, and the 
+ buffer is reset on line 22.
+
+Regarding Hybrid-CPU, on line 24, queries are obtained from the work queue rank. If there are queries to process, a while loop is entered on line 25, which computes the result of the KNN search for its batch of queries on line 26. The next batch of work is obtained from the work queue rank on line 27, and the loop continues until their are no additional queries to compute.
+
+
+Download : Download high-res image (278KB)
+Download : Download full-size image
+We describe the Hybrid-GPU join kernel, but refer the reader to [19] for more detail. We make two minor changes to the self-join kernel to accommodate HybridKNN-Join. First, we add a query set, as we do not want to compare all points to each other, as range queries are only needed for those points in 
+. Second, we allow multiple threads to process an individual point (Section 4.7). In the GPU join kernel shown in Algorithm 1, the result set is initialized (line 30), and then the global thread id is computed (line 31). Next, the query point assigned to the thread is stored (line 32), and a loop iterates over all adjacent cells (lines 33–34). The point assigned to the thread is compared to all points in the adjacent cells, where a result is stored when a point is found to be within  of the query point (lines 35–36). The result is stored as key/value pairs, where the key is the query point id, and the results are both the point id within  of the key, and the distance between the points.
+
+If more than one thread computes the distance between a query point and points in neighboring cells, then each thread only computes a fraction of the points in the cell on line 35 (Section 4.7).
+
+4.4. Hybrid-GPU : selecting the search distance
+The input parameter to a KNN search is ; but Hybrid-GPU needs an -distance which is expected to find at least  neighbors for each point. Analytically deriving  is feasible when the input data distribution is known. However, real-world datasets have data distributions that make an analytical approach intractable.
+
+Consider a search distance, 
+, that on average finds  neighbors per 
+. Therefore, some points will find  neighbors, and some will find  neighbors. We derive 
+ which is used as an initial search distance for Hybrid-GPU.
+
+We rely on the execution of two GPU kernels that sample the dataset to determine a good value of . First, we simply sample 0.1% of , and compute the mean distance between points, denoted as 
+. Next, we define a number of bins, 
+, that store the frequency of the distances between pairs of points that fall within the distance bin, where the width of each bin is 
+. We then select a sample of the points in the dataset and compute the distance between each of these points and every other point in , and store the distances in the respective bin, where any distance 
+ is not stored (using a search distance of 
+ will return a large fraction of the dataset; much larger than any reasonable value of ).2 We compute the cumulative number of points in each bin. Let 
+ denote the distance bins, where 
+. Each 
+ stores:  its distance range denoted as 
+, where 
+, and 
+;  the number of points found within its distance range 
+, denoted as 
+; , and the cumulative number of points in the bin (including bins with points at lower distances), denoted as 
+, where 
+. This yields a relationship between the search distance and the average number of neighbors that will be found. 
+ corresponds to the query distance that yields  cumulative neighbors, where 
+, where 
+.
+
+We select 
+, which on average finds  neighbors for each searched point. Fig. 3 shows a 2-D example of a search within the grid, where the grid cell length is equal to the search radius and thus the search is bound to adjacent cells (Section 3.1).
+
+4.5. Assigning work using a work queue
+The GPU should execute range queries for points in dense regions, and the CPU should perform the KNN search in sparse regions (Fig. 1). We begin by estimating the total amount of work required to execute each 
+. We repurpose the grid index that is sent to the GPU (Sections 3.1 Indexing technique, 4.4 ) to estimate the total work. For each 
+, we check the total number of points that are found within the point’s grid cell. This information requires simply performing a scan over the GPU index’s non-empty grid cell array. For each point found within a given cell, the total number of points found within the cell are assigned to each point as an approximation of the amount of work that will need to be computed for that point. Then, we sort this array in non-increasing order by the number of points in each cell. Since the number of points in a cell will trace the data density in the immediate region around each point, this yields an estimate of the total amount of work for each point. Alternatively, we could count the number of neighbors in each point’s cell and the adjacent cells to obtain a more accurate estimate of the amount of work computed by each query point; however, this would require substantial work, and thus we employ the simple procedure outlined above to estimate the work required of each point.
+
+The GPU is efficient at performing distance calculations in high density regions, and the CPU is efficient at computing the lower density regions. Fig. 4 shows a work queue illustration, where an array  stores the number of points within the cell of each point 
+. For example, 
+ and 
+ both have 32 points in their cell. In contrast, the last point in , 
+, only has a single point in its cell (itself). The work queue assigns Hybrid-CPU query points starting at  in decreasing order, and assigns Hybrid-GPU query points starting at  in increasing order. Thus, the queries assigned to the CPU progressively require more work, and the queries assigned to the GPU progressively require less work. Depending on the data distribution, Hybrid-GPU may only compute the KNN of a small fraction of , but perform similar levels of work as Hybrid-CPU.
+
+We outline several work queue performance considerations as follows.
+
+
+Download : Download high-res image (107KB)
+Download : Download full-size image
+Fig. 4. Example of a work queue with  data points. An array, , stores the number of points within each cell for each 
+.  is sorted in non-increasing order, where Hybrid-GPU is assigned points with the greatest amount of work, and Hybrid-CPU is assigned points with the least amount of work.
+
+•
+Load Imbalance — Performance degrades while one architecture (CPU or GPU) waits for the other to finish processing their queries.
+
+•
+Work Queue Overhead — While the smallest work unit (a single query point) would lead to the best load balancing, there is overhead when accessing a work queue, and thus assigning batches of queries reduces work queue overhead. This is independent of the architecture requesting work to compute.
+
+•
+Maintaining GPU Throughput — The GPU requires large batches of queries to maintain high query throughput, as executing a single query point on the GPU will underutilize its resources. In contrast, the CPU does not suffer from this limitation.
+
+The work queue performance considerations are similar to the classical trade-off between load imbalance and work queue overhead (e.g., static vs. dynamic scheduling of for loops in OpenMP [8]). However, this scenario is different than this classical scenario, as the GPU requires larger query batches than the CPU to maintain high throughput. This can negatively impact load balancing, as the GPU may be assigned a large batch of points to compute towards the end of the computation, which would leave the CPU cores idle while waiting for the GPU to complete its work.
+
+We propose several design decisions for the work queue to mitigate load imbalance while maintaining high GPU query throughput.
+
+We allow Hybrid-GPU to be assigned two types of batches:  large monolithic batches containing a substantial fraction of 
+; and,  small batches. For a derived  value (Section 4.4), Hybrid-GPU may not find the KNN for each point assigned to it (Section 4.2.2). Each 
+ that fails to find its KNN is added back to the work queue, and may be found by either Hybrid-GPU (when  is expanded) or Hybrid-CPU in the future. At each monolithic batch round, we reduce the batch size by a factor of two. We denote 
+ to be the size of the monolithic batch as a fraction of .
+
+A drawback of the monolithic batches is that Hybrid-GPU can request many query points to compute and starve the CPU (Hybrid-CPU) of work. Consequently, we implement a window of reserved query points for the CPU to compute during monolithic batch processing. Thus, each time the GPU requests a monolithic batch, the work queue manager determines the maximum number of GPU points that can be assigned to Hybrid-GPU, such that the CPU has at least a minimum number of points to compute. We denote the size of the fraction  points reserved for Hybrid-CPU as 
+.
+
+Using 
+, and the fraction  points that have already been processed by the CPU and GPU, denoted as 
+ and 
+, respectively, if we let 
+ be the size of the monolithic batch at round , then the size at round  is as follows: 
+
+Therefore, the monolithic batch size at round  is either half the size of the monolithic batch at , or a smaller size, as a function of the fraction of queries already computed and the window of reserved queries, until 
+.
+
+Once the monolithic batch size decreases to 
+, Hybrid-GPU reverts to smaller batches and no queries are reserved for Hybrid-CPU (
+), such that:  the GPU is still utilized; and,  the GPU and CPU finish their computation at similar times. However, there may be a substantial number of queries to compute despite (potentially) executing several monolithic batches, as the CPU window will have reserved queries from being added to monolithic batches. We denote 
+ as the size of each smaller Hybrid-GPU (non-monolithic) batch, and 
+ as the size of each Hybrid-CPU batch, both given as a fraction of .
+
+Hybrid-GPU may fail to find the KNN for many points if  is not increased. As  stores points from most to least work, with each processed GPU batch, there are more query points that fail to find their KNN. Thus, when using the small or monolithic batches, we dynamically re-index Hybrid-GPU by increasing  by a distance of 
+, when on the previous batch, Hybrid-GPU failed to find the KNN of at least 25% of its assigned points. This dynamic approach attempts to reach a trade-off between  not increasing  too much which is expensive; and,  not failing to find too many query points in the batch. Re-indexing occurs in parallel on the GPU to reduce the time where the GPU is idle due to expanding . Finally, when 95% of the query points have found their KNN, we then decrease the batch sizes assigned to the CPU and GPU to 
+ and 
+, respectively. These smaller batches (half of the initial size) mitigates load imbalance at the end of the computation.
+
+Fig. 5 illustrates the monolithic batches from the work queue being assigned to Hybrid-GPU and small batches of queries assigned to Hybrid-CPU. Fig. 5(a) shows an initial work queue, where  of  (
+) is assigned to Hybrid-GPU, and  of the queries must be reserved for the CPU (
+). In Fig. 5(b), after Hybrid-GPU processes its queries from the first batch, some of the queries will be complete (the KNN were found for these query points) and some will have failed to find the KNN. Hence, because there are a mix of complete and incomplete queries, we show this as partially complete in the figure. The vertical lines denote 
+ (dashed line) and 
+ (solid line). The CPU is guaranteed to find the KNN of each query point, thus the queries are shown as complete. Comparing Fig. 5(a) and (b) we see that the maximum GPU batch size does not increase substantially because 
+ is halved between rounds. Comparing Fig. 5(c) and (d), the window of reserved CPU queries decreases the queries available for Hybrid-GPU to compute using a monolithic batch. After 
+, Hybrid-GPU reverts to smaller batches of size 
+. Table 3 summarizes algorithm reconfiguration operations that occur during execution.
+
+Note that we have made several parameter selection decisions. We dynamically re-index Hybrid-GPU when 25% of queries fail to find at least  neighbors in the previous batch. If we were to use a value 25%, then the number of failed queries would increase, whereas if we use 25% then the algorithm would spend more time re-indexing. Furthermore, we use half of the small GPU batch sizes (
+), and the CPU batch size (
+) when 95% of the queries have found their KNN in the dataset to obviate load imbalance at the end of the computation. While these parameters are arbitrarily selected, we believe that they are reasonable design decisions (e.g., similarly, OpenMP guided scheduling reduces the chunk size with increasing iteration [8]). In the experimental evaluation, we quantify the load imbalance between the CPU and GPU architectures, which demonstrates that the selection of parameters does indeed yield low load imbalance. The low load imbalance partially justifies the selection of these parameter values.
+
+
+Table 3. Summary of HybridKNN-Join algorithm reconfiguration operations that occur at runtime.
+
+When	Why	Where
+Increasing  and Re-indexing	The number of failed queries on the previous batch exceeds 25% of the queries assigned in that batch.	Re-indexing occurs because the search distance, , is increased to reduce the number of failed searches.	GPU
+GPU Decreasing Batch Size: Monolithic Batches	At each batch assigned to the GPU.	The GPU is initially assigned a very large batch of work to compute (
+). The batch size assigned to the GPU decreases at each batch to mitigate against load imbalance between the CPU and GPU until 
+ indicating that the monolithic batch rounds have completed.	CPU (work queue) and GPU
+GPU Small Batch Sizes	At each batch assigned to the GPU after 
+.	The GPU executes smaller batches of size 
+.	CPU (work queue) and GPU
+CPU and GPU Smallest Batch Sizes	95% of the queries have been completed.	CPU and GPU batch sizes are decreased to 
+ and 
+, respectively, to mitigate against load imbalance between the CPU and GPU.	CPU and GPU
+
+Download : Download high-res image (196KB)
+Download : Download full-size image
+Fig. 5. Assigning monolithic batches of queries from the work queue to Hybrid-GPU and queries to Hybrid-CPU (small Hybrid-GPU batch rounds not shown). (a) Initial work queue with 
+. (b) After processing a monolithic batch, some queries have been computed by Hybrid-GPU and Hybrid-CPU, and the monolithic batch size deceases. (c) The CPU window reduces the monolithic batch size. (d) After processing with Hybrid-GPU the monolithic batch rounds are finished as 
+.
+
+4.6. GPU: Indexing
+As discussed in Section 3.1, we use a grid-based index for the GPU. In the previous work on the similarity self-join that we leverage, the index was constructed on the host/CPU, because we only needed to construct the index once. However, since finding the KNN on the GPU may require dynamically expanding  several times, constructing the index on the host may become a bottleneck and degrade performance. Additionally, if the algorithm constructs the index on the host, then this reduces the resources available for the CPU component of the algorithm. Consequently, while we use the index described in previous work in Section 3.1, we construct the index on the GPU. We find that index construction on the GPU is much faster than constructing the index on the host. Our preliminary work on KNN-joins [18], that this paper extends, constructed the index on the host, and we found that it reduced performance particularly on lower values of  (smaller workloads), where the ratio of re-indexing overhead to computation is high. On the larger workloads, re-indexing overhead on the host is amortized across the entire computation and only has a minor impact on performance.
+
+4.7. GPU: Optimizing task granularity
+To improve resource utilization for parallel algorithms executed on the CPU or GPU, a common strategy is to reduce the size of each task to a smaller unit of work, and then redistribute these smaller tasks to threads or processes [36]. We describe a similar optimization as follows.
+
+In the self-join work that we leverage [19], a single thread is assigned to each point in the dataset, where the thread finds all points within  of its assigned point. This approach was tenable because the total number of threads is large (). Since Hybrid-GPU may only process a small fraction of  in a batch, then the GPU’s resources may be underutilized if we use one thread per point. Also, the GPU hides high memory latency by performing fast context switching between resident threads. Thus, oversubscribing the GPU by using more threads than cores is needed to saturate resources.
+
+We divide the work of the distance calculations for a single point between multiple threads to increase task granularity. Fig. 6 shows an example of using multiple threads per query point. The query point (red) is shown in the middle cell. The distances between the query point and the six points are computed in an adjacent cell (dashed blue outline). This example shows three threads each computing the distances between two points.
+
+
+Download : Download high-res image (75KB)
+Download : Download full-size image
+Fig. 6. Using multiple threads to compute the distances between points in 2-D.
+
+We assign a static number of threads per query point for performing the distance calculations, where the number of threads are referred to as  (e.g.,  denotes using 32 threads per point). An advantage of this approach is that the number of threads per point can be selected to reduce intra-warp thread divergence. For example, if  threads per point are used, then a full warp will compute the distance between a given point and the candidate points. There should be low divergence because each thread in the warp executes similar execution pathways. Recently, Gallet and Gowanlock [14] showed that on the similarity self-join, computing the distances between a query point and candidate points using more than one thread improves warp execution efficiency. However, as discussed above, the primary motivation for using  threads is that the KNN-join computes batches of query points which may be much smaller than the number of points in the dataset. Consequently, we need to use more threads per query point to saturate GPU resources.
+
+Two drawbacks of using  include:  using too many threads per point may increase overhead; and  query points in lower density regions may not need a large number of threads, and such threads will have minimal work to compute. There is a trade off between assigning too few or too many threads per point. We assume that the number of threads selected to compute the distance calculations for each point should evenly divide the size of a warp (32 threads). This eliminates the possibility of the threads assigned to a point spanning multiple warps and increasing divergence.
+
+5. Experimental evaluation
+5.1. Datasets
+We focus on low-dimensional KNN-joins due to their utility in many applications. Additionally, related work has consistently shown that GPU-accelerated KNN searches outperform CPU approaches at high dimensionality [15], [27], due to the increased cost of distance calculations. Thus, the GPU may be unsuitable to low-dimensional KNN-joins, and we target this low-dimensionality scenario.
+
+We employ two classes of synthetic datasets with different workload characteristics. The Unif- class of datasets contains uniformly distributed data points. The Expo- class of datasets contains exponentially distributed data points with . Datasets are generated in 2, 4, and 6 dimensions for both classes, and contain 
+ points. Since HybridKNN-Join splits the low and high density regions between the CPU and GPU, respectively, the Unif- datasets represent the case where there is very low variation in density across the data space, whereas the Expo- datasets represent the case where there is a large data density gradient. Comparing the performance between these two classes of datasets allows us to examine how performance may vary as a function of data distribution and workload assignment between the CPU and GPU.
+
+We also employ two 2-D real-world datasets: Gaia which contains 
+ positions of astronomical objects from the Gaia catalog [7], and Osm which contains 
+ positions from Open Street Map data [42]. Since the Open Street Map data contains GPS positions, we removed duplicate point coordinates, otherwise the KNN of many points may consist of a single GPS trajectory with identical (or nearly identical) point coordinates.
+
+5.2. Experimental methodology
+All HybridKNN-Join CPU code is written in C/C＋＋, compiled using the GNU compiler (v. 5.4.0) with the O3 flag. The GPU code is written in CUDA v. 9. We use OpenMPI v. 3.1.1 for parallelizing host-side tasks (discussed in Section 4.2.1). The work queue performs minimal work; however, we parallelize it using two OpenMP threads for assigning queries to Hybrid-CPU and Hybrid-GPU, as we need to wait on Hybrid-GPU without blocking Hybrid-CPU from obtaining new work.
+
+Our platform consists of an NVIDIA GP100 GPU with 16 GiB of global memory, and has 2 Intel E5-2620 v4 2.1 GHz CPUs, with 16 total physical cores. The Hybrid-GPU kernel uses 256 threads per block. In the experiments, we exclude the time needed to load the dataset or construct the Hybrid-CPU indexes or the initial Hybrid-GPU index (see Section 5.3). The response time of performing the KNN search on the CPU and GPU is measured after the indexes have been constructed by Hybrid-CPU. All other components of the algorithm are included in the response time (e.g., finding the search distance for Hybrid-GPU, and ordering the workload for the work queue). All time measurements are averaged over 3 trials.
+
+Table 4 outlines default parameter values in the experimental evaluation. Note that the initial monolithic batch size (
+) and the window size of reserved CPU queries (
+) are both 40% of . Increasing 
+ beyond 40% is unlikely to greatly improve performance as the larger the value of 
+, the more queries that fail to find  neighbors. 
+ and 
+ are 0.5% of , which is selected to minimize load imbalance, while not assigning too few queries per batch, which can increase the overhead of accessing the work queue.
+
+
+Table 4. Default parameter values used in the experimental evaluation.
+
+Parameter	Value
+8
+5.3. Implementations
+The implementations we use to carry out our performance evaluation are described below.
+
+•
+CPU-Only– We compare to a multi-core CPU ANN [3] implementation that obtains the exact neighbors, as described in Section 4.2.1. We compare HybridKNN-Join to CPU-Only to demonstrate the performance gains yielded by the GPU. CPU-Only uses the CPU component of the hybrid algorithm, Hybrid-CPU, as executed with 16 processes that perform KNN searches, and 1 process for the work queue. There is no communication between ANN process ranks, as they find the KNN independently and write results directly to shared memory. Recall that we needed to parallelize ANN using MPI. We have each process rank independently construct its own kd-tree which is queried in batches obtained from the work queue. Since ANN does not perform parallel index construction and we cannot share the index between processes, we exclude this index construction time.
+
+•
+HybridKNN-Join– Our hybrid approach uses: Hybrid-CPU with 15 processes, and Hybrid-GPU and the work queue each use 1 process. Hybrid-CPU uses one less process than CPU-Only. Due to the exclusion of the index construction time for CPU-Only (described above), we exclude the Hybrid-CPU index construction time, and the initial index constructed by Hybrid-GPU. However, we include all index construction time in the measurements when  must be dynamically expanded by Hybrid-GPU.
+
+•
+GPU-Only– We compare to a GPU-only implementation that uses Hybrid-GPU (the GPU component of HybridKNN-Join). Hybrid-GPU and the work queue each use 1 process. We note that because this implementation may fail to find at least  neighbors by design, depending on the data distribution, it may take significant time to find the KNN of all points, as those points in sparse regions were intended to be found by the Hybrid-CPU component of HybridKNN-Join. Thus, we show this implementation for comparison purposes, but note that it is not designed for standalone KNN searches. We configure GPU-Only to use only monolithic batches, i.e., 
+ and 
+ for all batches computed by the algorithm. We ensure that each query batch size is equal to the number of points that have not yet found their respective KNN.
+
+•
+CPU-Only-RR– We evaluate the potential negative performance impact of the work queue. We compare CPU-Only (described above) to another CPU implementation that has the work queue removed. Instead of using the work queue, we simply assign points in a round robin fashion to each process rank. Each 
+ is assigned to rank  when , where  is the number of processes (MPI ranks), and . The implementation with the work queue removed uses  processes; therefore, the number of ranks computing the KNN is equivalent to the CPU-Only implementation. We elect to use a round robin distribution of points to process ranks to achieve good load balancing.
+
+•
+BufferKDTree– We compare to the GPU buffer kd-tree algorithm by Gieseke et al. [17] discussed in Section 2. In all experiments where we compare to HybridKNN-Join we set the tree depth parameter to 12, as it achieves good performance across several datasets (this will be demonstrated in Section 5.4.3). The algorithm is designed for the same low/moderate dimensional searches that we examine in this paper. To maintain consistency with the methodology in Gieseke et al. [17], when reporting the response time, we only include the time to compute the query/test phase which finds the nearest neighbors. BufferKDTree allows for searching up to  neighbors; in our evaluation, the maximum value of  tested on this algorithm is . The BufferKDTree code is publicly available [16].
+
+•
+KDTree– We compare to the multi-core CPU implementation in Gieseke et al. [17]. The algorithm is configured to use 16 threads (the number of physical cores on our platform), and similarly to BufferKDTree, we only report the query response time. The code is publicly available [16].
+
+5.4. Results
+5.4.1. Scalability of the CPU-Only implementation
+The CPU-Only reference implementation is a parallelized version of ANN [3] and is used for the CPU component of the hybrid algorithm, Hybrid-CPU (Section 4.2.1). CPU-Only, uses 16 process ranks to independently find the KNN of batches of query points. Fig. 7 plots the scalability of CPU-Only across several datasets where . We find that scalability improves with data dimensionality. For example, Gaia is a 2-D dataset and achieves a speedup of 5.26 with 16 processes, whereas the 6-D Unif6D dataset achieves a speedup of 10.34 with 16 processes. The cost of the Euclidean distance calculation scales with dimensionality. Therefore, finding the KNN on lower dimensional datasets is memory-bound (the algorithm spends most of the time performing tree traversals), which transitions to becoming more compute-bound as the dimensionality increases. On Unif2D, the speedup slightly decreases from 12 to 16 processes. This is indicative of memory bandwidth saturation, where adding more processors does not improve performance (the same trend is observed on Gaia and Osm). However, on Unif4D and Unif6D, the greatest speedup is achieved when 16 processes are used, which indicates that memory bandwidth may not be saturated on those datasets when 16 processes are used. The poor scalability of the 2-D Osm dataset is surprising given that the other 2-D datasets (Gaia and Unif2D) achieve larger speedups.
+
+5.4.2. Scalability of the KDTree implementation
+The multi-threaded CPU KDTree implementation provides another baseline for comparison. In contrast, CPU-Only is parallelized using MPI. We execute the same experiment in Section 5.4.1 using KDTree. Fig. 8 plots the speedup vs. the number of threads. We find very similar scalability using KDTree as we find for CPU-Only in Section 5.4.1. Since 16 threads achieves the best performance, we configure KDTree to use 16 threads when we compare it to the other implementations.
+
+5.4.3. Impact of the BufferKDTree height parameter
+The BufferKDTree implementation uses a height parameter that achieves a trade-off between examining too many leaves and pruning overhead caused by tree traversals. To ensure that we configure BufferKDTree with a height parameter that achieves good performance, we execute BufferKDTree on several datasets across different values of the height parameter. From Fig. 9, we find that a height value of 12 achieves the best performance across all datasets, and this performance behavior is consistent with the experimental evaluation in Gieseke et al. [17]. In all future experiments, we use this tree height.
+
+
+Download : Download high-res image (216KB)
+Download : Download full-size image
+Fig. 9. Impact of the BufferKDTree tree height parameter on performance. The response time vs. tree height is plotted for the Osm, Gaia, Unif2D, Unif4D, and Unif6D datasets where . The best performance is achieved across all datasets when the tree height is 12.
+
+
+Table 5. Comparison of the total number of cache references and percentage of cache misses on the CPU-Only and CPU-Only-RR implementations on the Unif4D dataset. The lowest values of the percentage of cache misses as a function of  are highlighted in bold face.
+
+CPU-Only cache references	CPU-Only cache misses (%)	CPU-Only-RR cache references	CPU-Only-RR cache misses (%)
+1	29208826489	52.18	26790397165	57.80
+8	32379870022	54.42	31912590674	64.11
+16	34398747794	54.72	35841307333	67.81
+32	37541677665	53.76	41829138108	72.19
+64	44754599329	48.18	51312595208	76.67
+128	62648741911	38.39	68117485096	81.73
+5.4.4. Potential impact of work queue overhead on performance
+Utilizing work queues can add overhead to parallel algorithms (e.g., accesses must be serialized to avoid race conditions). We compare two parallel CPU-only algorithms: CPU-Only that uses the work queue, and CPU-Only-RR that has the work queue removed, where each point is assigned to a rank in a round robin fashion. By comparing the implementation with the work queue to the same implementation without the work queue, we are able to assess whether using the work queue adds considerable overhead.
+
+Fig. 10 plots the response time vs.  on the uniformly distributed datasets. We observe from the figure that the work queue improves performance over the round robin assignment of points on the larger workloads. For instance, when  on the Unif4D and Unif6D datasets, the implementation with the work queue (CPU-Only) outperforms the round robin distribution of points to ranks (CPU-Only-RR). However, on the Unif2D dataset, CPU-Only-RR outperforms CPU-Only when . Because the workload is relatively low in 2-D, the initial work queue overheads have a non-negligible performance impact (we elaborate on these overheads in Section 5.4.5), and accessing the work queue has a non-negligible impact, where several processes contend for a new batch of work to compute.
+
+Overall, we observe that the work queue generally has a positive impact on performance. In fact, the performance gain from the work queue over the round robin implementation is substantial in the cases described above (e.g., Fig. 10(b) and (c)). This is an unintended benefit of the work queue. We attribute this to two factors, described as follows:
+
+
+Download : Download high-res image (115KB)
+Download : Download full-size image
+Fig. 10. Response time vs.  comparing CPU-Only and CPU-Only-RR on the uniformly distributed datasets.
+
+
+Table 6. HybridKNN-Join work queue construction overheads on the Unif- and Expo- classes of datasets where . The total response time and the fraction of the total response time is shown for computing  and ordering the work queue workload. The default parameter values in Table 4 are used.
+
+Dataset	Total response time (s)	Fraction computing 	Fraction ordering work queue workload
+Unif2D	9.82	0.063	0.068
+Unif4D	19.54	0.037	0.035
+Unif6D	74.50	0.012	0.011
+Expo2D	10.82	0.057	0.063
+Expo4D	22.97	0.038	0.035
+Expo6D	77.21	0.013	0.011
+1.
+The work queue helps reduce load imbalance between process ranks, as queries are retrieved from the queue on-demand.
+
+2.
+The work queue first sorts the points by total work based on the number of points found in each cell. This means that spatially co-located points found in the same cell are likely to be assigned to the same process rank by the work queue. Because the points are spatially co-located, it is likely that the tree traversals are benefiting from good locality when performing KNN searches. In contrast, the round robin assignment of points to each process rank cannot benefit as much from the spatial co-location of points.
+
+We test the notion that cache effects are improving the performance of CPU-Only over CPU-Only-RR described above, by simply using the Performance analysis tools for Linux (perf) to count the total number of cache references and misses using the cache-references and cache-misses flags. We note that perf yields a coarse grained measurement of the cache references and misses in the program, and is not limited to KNN searches. However, since the vast majority of the computation is performing KNN searches (tree traversals and filtering) in these algorithms, perf is a reasonable tool for understanding whether good locality is responsible for the performance difference between the CPU-Only and CPU-Only-RR implementations.
+
+Table 5 shows the number of cache references and percentage of cache misses when executing the CPU-Only and CPU-Only-RR implementations on the Unif4D dataset. We find that the percentage of cache misses increases with  in the CPU-Only-RR implementation, whereas this percentage decreases with  in the CPU-Only implementation. We expect that the impact on locality of CPU-Only favors larger values of . The larger the value of , the larger the search space, which is likely to increase the probability of two searches for differing points to be able to reuse data in cache. In contrast, the CPU-Only-RR implementation processes queries in a round robin fashion and cannot exploit locality between consecutive searches. Therefore, as  increases, the total percentage of cache misses increases.
+
+By comparing CPU-Only and CPU-Only-RR, we find that the work queue does not add significant overhead to the CPU-Only algorithm (with the exception of the Unif2D dataset when ), and therefore, does not hinder HybridKNN-Join. Furthermore, we find that assigning batches of query points to processes through the work queue has a positive effect on locality. The performance gain due to positive cache effects outweighs the performance loss due to work queue access overhead.
+
+5.4.5. Overheads of work queue construction and selection of the search distance
+Table 6 quantifies the fraction of the total response time of major overheads when  on the Unif- and Expo- classes of datasets when executing HybridKNN-Join with the default parameter values in Table 4. From Table 6, we observe that the fraction of time computing  (Section 4.4) and ordering the work queue workload (Section 4.5) is dependent on the data dimensionality rather than the data distribution, as the uniform and exponentially distributed datasets require similar fractions of the total response time for each of these overheads.
+
+The percentage of the total response time to compute  ranges from 6.3% (Unif2D) to 1.2% (Unif6D), and these percentages for ordering the work queue workload range from 6.8% (Unif2D) to 1.1% (Unif6D). Thus, the overheads associated with constructing the work queue are mostly amortized on larger workloads; however, they are non-negligible on the smaller workloads. Despite these work queue construction overheads, from Section 5.4.4 we find that the work queue is generally advantageous due to positive cache effects.
+
+5.4.6. GPU kernel task granularity
+Hybrid-GPU uses a number of threads () to process each point (Section 4.7). Since the size of each batch assigned from the work queue to Hybrid-GPU, 
+, can vary (e.g., due to decreasing monolithic batch sizes), it is important that sufficient threads are executed, such that GPU resources remain saturated, which is achieved through oversubscription. Additionally, using more than one thread per query point allows for less divergence in each warp, as fewer query points (with differing execution pathways) are assigned to a single warp.
+
+Table 7 shows the total response time of HybridKNN-Join for a selection of datasets, and values of  (8, 32, 128) and  threads (1, 8, 16, and 32) assigned to perform the distance calculations for each query point. We select values of  such that the threads divide evenly into the size of a warp (32 threads). This ensures that a query point does not span two warps. From Table 7 we observe that many of the datasets have consistent response times when varying . For instance, on Gaia with , the response times range from 19.90 s to 21.00 s. In contrast, on the Unif6D dataset with , the response times range from 73.99 s to 90.01 s. Using  may lead to inter-warp load imbalance (waiting for the last warp to finish execution) and increases divergence in the kernel. At the other extreme, using a single warp () to compute each query point may underutilize resources. For instance, if there are fewer than 32 candidates within an adjacent cell of a query point, then several threads will not have any work to execute. Across all datasets and values of , we find that  yields the best performance. Additionally, in many cases where  does not yield the best performance, we find that it achieves similar performance to the best performing value of . Consequently, we configure HybridKNN-Join with a default value of .
+
+
+Table 7. Response time (s) of HybridKNN-Join when varying  for  and  on Gaia, Osm, Unif4D, and Unif6D datasets. Excepting , the default parameter values in Table 4 are used. The lowest response time is shown in bold face for each  on each dataset.
+
+Dataset					
+Gaia	8	19.96	19.90	19.98	21.00
+Osm	8	36.31	32.45	31.97	32.34
+Unif4D	8	11.75	12.23	12.50	14.00
+Unif6D	8	41.33	42.62	44.85	52.15
+Gaia	32	25.85	25.34	23.78	24.40
+Osm	32	36.73	32.13	31.92	31.19
+Unif4D	32	20.35	19.99	20.15	21.74
+Unif6D	32	90.01	73.99	78.15	84.43
+Gaia	128	41.45	39.42	40.32	40.38
+Osm	128	35.60	32.51	31.57	32.24
+Unif4D	128	41.65	37.27	38.27	40.23
+Unif6D	128	184.45	168.01	172.23	172.67
+5.4.7. Work queue performance: GPU monolithic batch size
+We examine performance as a function of the selection of the monolithic batch size. The selection of the monolithic batch size, 
+, has several performance implications. A large 
+ will decrease the fraction of queries that Hybrid-GPU is able to successfully compute in the first batch round, as  is selected to find on average  neighbors per 
+ (Section 4.4). A small value of 
+ will decrease GPU throughput, where GPU resources may not be sufficiently saturated. We examine the performance impact of the monolithic batch size when we do not reserve any queries for the CPU (
+). This allows us to observe how performance changes across values of 
+ in the range . Note that when 
+, the GPU can be assigned the entire dataset to process during its first batch round and this will have the effect of starving the CPU of work.
+
+Fig. 11(a), (c), and (e) plot the response time vs. 
+ on the Unif2D, Unif4D, and Unif6D datasets, respectively, and the exponential datasets are shown in Fig. 11(b), (d), and (f). For clarity, the uniform and exponential datasets of the same dimensionality are positioned adjacent to each other. From Fig. 11(a), (c), and (e), we find that 
+ should not be too small, otherwise GPU resources will not be fully utilized, which is shown by the initial decrease in response time (e.g., comparing 
+ and 0.2 in Fig. 11(a)). However, on Unif2D, we observe that a too large value of 
+ will decrease performance. This effect is more pronounced on the Unif6D dataset, where we find that the best value of 
+, which shows that Hybrid-GPU should be configured with large monolithic batches when computing larger workloads. However, the value should not be too large, otherwise, the CPU will be starved of work, which explains the performance degradation when 
+ on Unif6D. Similar results are shown on the exponential datasets in Fig. 11(b), (d), and (f), so we omit a similar discussion.
+
+
+Download : Download high-res image (249KB)
+Download : Download full-size image
+Fig. 11. HybridKNN-Join response time vs. monolithic batch size 
+ where  and 
+. Excepting 
+ and 
+, the default parameter values in Table 4 are used.
+
+Comparing the results in Fig. 11, 
+ can be selected in a large range to achieve good performance (the response times are similar between 
+). Hence, we select 
+ in Table 4 to achieve a compromise between small (low dimensionality) and large (high dimensionality) workloads.
+
+5.4.8. Work queue performance: Load balancing
+We determine whether the configuration of the work queue is able to mitigate load imbalance between CPU and GPU components. Load imbalance is defined as: 
+, where 
+ is the time that the last executing Hybrid-CPU rank finishes computation, 
+ is the time that the Hybrid-GPU rank finishes computing its last batch, and  is the total response time.
+
+Fig. 12 shows the load imbalance for  on the Unif- and Expo- classes of datasets. Across all datasets and values of , we find that the load imbalance is  and generally increases with . As  increases, the total work computed by each batch increases. This enhances the chances of either the CPU or GPU components of HybridKNN-Join finishing their work at disparate times. We find that HybridKNN-Join achieves reasonably good load balancing despite several confounding issues. To further mitigate load imbalance, the batch sizes could be adjusted based on the value of . For instance, when  is large, smaller batches can be employed. We do not consider this optimization, as it would require an additional parameter that scales as a function of , and it is unlikely to lead to substantial performance gains, as the load imbalance is already within an acceptable range ().
+
+5.4.9. Quantifying the number of failed queries
+As described in Sections 4.2.2 GPU-Join component (, 4.5 Assigning work using a work queue, Hybrid-GPU will fail to find some of the query points in each batch. This design decision was made to avoid dynamically increasing the search radius and number of searched cells inside the kernel.3 In this section, we examine the number of failed queries on all datasets for selected values of .
+
+Table 8 shows the fraction of failed queries computed as the total number of failed queries divided by the total number of attempted queries. The fraction of failed queries ranges from 0–0.342. There are two key observations regarding failed queries described as follows:
+
+1.
+Clearly, failed queries are wasted work computed by the GPU. From Table 8, up to 34.2% of queries are wasted.
+
+2.
+If  is sufficiently large you can always find the KNN of each query point, and eliminate the wasted work in (1) above. However, this is at the expense of wasted work in another context: many of the query points will find significantly more neighbors than needed, and this increases the overhead of the refinement step, thereby increasing the number of distance calculations.
+
+Since the fraction of failed queries is not too large (e.g., a fraction  is likely too large), it indicates that we are reaching a trade-off between not finding too few or too many points. In other words, if the fraction of failed queries was too small, we would expect that we are wasting work refining too many candidate points for the average query point. From Table 8 we find that on the Osm dataset, we (nearly) always find at least  neighbors for each query point. This indicates on this dataset that a lower value of  would likely lead to better performance, as the algorithm is refining many more candidate points than needed. We will elaborate on this observation in Section 5.4.10.
+
+
+Table 8. The fraction of failed Hybrid-GPU queries when executing HybridKNN-Join, calculated as the total number of failed queries divided by the total number of attempted queries. The default parameter values in Table 4 are used.
+
+Dataset			
+Gaia	0.073	0.164	0.240
+Osm	0.000	0.000	0.000
+Unif2D	0.163	0.135	0.162
+Unif4D	0.217	0.198	0.273
+Unif6D	0.270	0.236	0.211
+Expo2D	0.087	0.058	0.041
+Expo4D	0.257	0.280	0.296
+Expo6D	0.342	0.274	0.250
+All implementations that use indexes for KNN searches such as the CPU-Only and KDTree reference implementations will suffer from the refinement overhead described in (2) above. This is because an index cannot guarantee that only  neighbors will be found for a given search. Therefore, this is not a shortcoming of Hybrid-GPU, rather it is a consequence of using an index.
+
+5.4.10. Performance impact of the initial selection of the search distance
+As described in Section 4.4, we select an initial search distance, , that is expected to find at least  neighbors on average for each query point. In this section, we examine how sensitive the performance of HybridKNN-Join is to variations in this parameter. Fig. 13 plots the response time of HybridKNN-Join vs. the factor of the initial value of . In the plot the value of 1 corresponds to the initial/default value of . We vary the value of  to be 0.25–4 the initial search distance. From Fig. 13, we find that at a factor 2, the Gaia, Unif2D, and Expo2D datasets achieve slightly better performance than at the default value of ; however, the performance of Osm degrades significantly at . Additionally, we find that on Osm, the best performance is achieved at . Overall, our method for selecting an initial value of  achieves good performance across all datasets in Fig. 13. This supports the semi-analytic geometric justification for the selection of  outlined in Section 4.4.
+
+In Section 5.4.9 we observed that the Osm dataset has nearly 0 failed queries (Table 8). From Fig. 13, we observe that at a lower value of , such as , Osm achieves better performance than at the default  value. This demonstrates that having nearly no failed queries is an indicator that too many neighbors are being found, which yields additional distance calculations and associated overhead. Also, it demonstrates that having a moderate fraction of query failures is beneficial for performance.
+
+
+Download : Download high-res image (133KB)
+Download : Download full-size image
+Fig. 13. Examining the sensitivity of HybridKNN-Join to the initial selection of  on the 2-D datasets, where . We execute HybridKNN-Join with a factor 0.25, 0.5, 2, and 4 of the initial search radius, , where a value of 1 corresponds to the default  value. Default parameter values in Table 4 are used.
+
+5.4.11. Temporal evolution: Re-indexing and batch sizes
+At each batch, the Hybrid-GPU component of HybridKNN-Join counts the number of failed queries. If the number of failed queries on the previous batch exceeds 25% of the number of query points in the batch, the algorithm will re-index with a larger value of  (Sections 4.2.2 GPU-Join component (, 4.5 Assigning work using a work queue). During this time no queries are computed on the GPU. Table 9 shows the fraction of the total response time spent re-indexing across all datasets for various values of .4 Values in parentheses indicate the number of times Hybrid-GPU re-indexed. From Table 9 we find that Hybrid-GPU will sometimes not re-index at all (Osm for all values of ), and will re-index up to 3 times (Expo4D, ). The median number of times the algorithm will re-index is one. Furthermore, re-indexing accounts for 0%–8.3% of the total response time. In the majority of cases, less than 3% of the total response time is spent re-indexing. This demonstrates that re-indexing overhead does not significantly degrade the GPU’s query throughput.
+
+Using the same experiments shown in Table 9, Fig. 14 plots the total number of queries assigned to Hybrid-GPU at each batch on Unif4D and Expo4D using . The vertical red lines correspond to the batch number that triggered recomputing the index. The figure shows the temporal evolution of HybridKNN-Join indicating that large workloads are initially assigned to the GPU at batches 1 and 2, which decrease to ensure that low load imbalance occurs between CPU and GPU components of the algorithm.
+
+
+Table 9. The fraction of the total response time spent re-indexing Hybrid-GPU when  is expanded for various values of . Values in parentheses show the number of times Hybrid-GPU needed to re-index. The default parameter values in Table 4 are used.
+
+Dataset			
+Gaia	0.039 (1)	0.026 (1)	0.029 (1)
+Osm	0.000 (0)	0.000 (0)	0.000 (0)
+Unif2D	0.030 (1)	0.024 (1)	0.021 (1)
+Unif4D	0.028 (1)	0.018 (1)	0.017 (1)
+Unif6D	0.015 (1)	0.009 (1)	0.005 (1)
+Expo2D	0.061 (1)	0.027 (1)	0.020 (1)
+Expo4D	0.083 (3)	0.034 (2)	0.021 (2)
+Expo6D	0.036 (2)	0.017 (2)	0.011 (2)
+
+Download : Download high-res image (190KB)
+Download : Download full-size image
+Fig. 14. Hybrid-GPU batch size vs. batch number for (a) Unif4D and (b) Expo4D, where . The vertical red lines correspond to the batch number that triggered re-indexing the dataset.
+
+
+Download : Download high-res image (265KB)
+Download : Download full-size image
+Fig. 15. The fraction of queries in  that remain to be computed vs. the batch number when executing GPU-Only on the Unif6D and Expo6D datasets. (a) The Unif6D dataset is computed in 4 batches, whereas the Expo6D dataset requires 64 batches to find the KNN of all points. The vertical line at 9 batches denotes where 99% of the points in  have been computed on the Expo6D dataset. (b) The first 9 batches in (a).
+
+5.4.12. Characterization of the Hybrid-GPU search distance expansion
+Recall from Section 4.5 that Hybrid-GPU expands  while computing batches of query points. We examine the performance of the Hybrid-GPU expansion of  through an experiment using GPU-Only. As discussed in Section 5.3, the GPU-Only implementation is used for comparison purposes, but is not designed for standalone KNN searches. In this section, we also elaborate on the reasoning for the unsuitability of GPU-Only (that uses Hybrid-GPU) as a standalone KNN search algorithm.
+
+We execute GPU-Only on the Unif6D and Expo6D datasets. Fig. 15(a) plots the fraction of queries remaining to be processed vs. the batch number. With each successive batch, the number of queries left to be computed decreases, but the number of successfully solved queries is dependent on the search distance, , and the data distribution. For example, when the batch number is 1 (the first batch), then 100% of the queries still need to be computed. From Fig. 15(a) we observe that on the Unif6D dataset only 4 batches are required to find the KNN of all query points in the dataset. However, on the Expo6D dataset, 64 batches are needed to compute the KNN of all points in the dataset. However, on the Expo6D dataset, the KNN of 99% of the points in the dataset are found after only computing 9 batches (denoted by the vertical blue line). The remaining 1% of the data points require computing  additional batches. Fig. 15(b) shows Fig. 15(a) but constrained to the first 9 batches. From Fig. 15(b), we find that if we exclude the remaining 1% of data points that require executing an additional 55 batches (the long tail in Fig. 15(a)), then the fraction of queries remaining to be computed by Expo6D is reasonable. For comparison, when 4 batches have been computed, the KNN have been found for all points in the Unif6D dataset, and only 16.3% of the points are left to compute on the Expo6D dataset.
+
+
+Download : Download high-res image (839KB)
+Download : Download full-size image
+Fig. 16. Response time vs.  comparing HybridKNN-Join, CPU-Only, GPU-Only, BufferKDTree, and KDTree on (a)–(c) uniformly, and (d)–(f) exponentially distributed datasets. HybridKNN-Join is configured with the default parameter values in Table 4. In (d) and (e), we do not plot GPU-Only, as the total response times are much larger than the other implementations due to the explanation given in Section 5.4.12.
+
+In general, we find that when the data are uniformly distributed, the selection of the initial value of  is able to find the KNN of a large fraction of the data points with few expansions of . In contrast, when the data are exponentially distributed, the mean value of  needed to find  neighbors on average (
+) is largely unsuitable for those data points in sparse regions. Thus, the GPU-Only algorithm needs to continually expand  to find the points in these sparse regions, and this may require a prohibitive number of  expansions that degrades performance.
+
+To remedy this problem in a GPU-only implementation, a non-linear expansion of  could be employed to avoid the long tail exhibited in Fig. 15(a) (recall that  is expanded by 
+ when Hybrid-GPU fails to find the KNN of at least 25% of the query points in the previous batch). As an alternative, a simple brute force search could be employed when a small fraction of points in the dataset have not found their KNN (e.g., similarly to Expo6D in Fig. 15, where 99% of the data points find their respective KNN in 9 batches, then only 1% of the data are left to find their respective KNN). In this case, a brute force search will not be prohibitive to performance. However, we reiterate that Hybrid-GPU expects those points in the low density regions to be found by Hybrid-CPU; therefore, we do not use these solutions, as their implementation would not be executed when using HybridKNN-Join.
+
+Fig. 16(a)–(c) plots the response time vs.  on the Unif- datasets, and the Expo- datasets are shown in Fig. 16(d)–(f). Despite the performance drawback of the GPU-Only implementation on the Expo- datasets described above, we find that on the uniformly distributed datasets, the GPU-Only implementation is very efficient. In fact, we find that GPU-Only slightly outperforms HybridKNN-Join across all values of  on the Unif2D dataset. Because the dataset contains 2-D points (the smallest workload), the slight overheads and load imbalance between architectures are observable on this dataset. In contrast, on the Unif6D dataset (a larger workload), we find that HybridKNN-Join outperforms GPU-Only.
+
+5.4.13. Comparison of CPU-Only and KDTree
+We compare the performance of the standalone multi-core CPU implementations, CPU-Only and KDTree. Recall that CPU-Only is parallelized using MPI processes and KDTree is parallelized using threads. From Fig. 16, we observe that the on the synthetic datasets, the performance of CPU-Only degrades gracefully with increasing . In contrast, the performance of KDTree degrades much more significantly with  on some datasets, such as Unif2D and Expo2D.
+
+Fig. 17 plots the response time vs.  on the real-world datasets. These datasets are 2-D with 
+ points. We note on this experiment that KDTree failed to execute on  on both Gaia and Osm. We find that KDTree outperforms CPU-Only when , whereas CPU-Only outperforms KDTree when . Based on the performance of KDTree in Fig. 16, we expect the response time of KDTree to increase significantly at .
+
+To more clearly observe the performance differences between CPU-Only and KDTree, Fig. 18 plots the speedup of CPU-Only over KDTree on all datasets. We find that CPU-Only is much more efficient on the larger values of  on the Unif2D, Expo2D, and Expo4D datasets. Additionally, since these two multi-core CPU reference implementations have varying performance characteristics, they are able to provide a more comprehensive comparison to HybridKNN-Join (see Section 5.4.14).
+
+5.4.14. Comparison of HybridKNN-Join to CPU-Only and KDTree
+We compare the performance of HybridKNN-Join to the two multi-core CPU implementations, CPU-Only and KDTree. From Fig. 16, across all datasets and values of , HybridKNN-Join outperforms CPU-Only. This demonstrates that the use of the CPU and GPU in the hybrid algorithm does not degrade performance for any value of . Comparing HybridKNN-Join to KDTree, we find that there are a few cases where KDTree outperforms HybridKNN-Join on lower values of . For example, on Unif2D and Expo2D, KDTree slightly outperforms HybridKNN-Join when . Overall, HybridKNN-Join yields a reasonable performance gains over KDTree.
+
+On the Gaia dataset (Fig. 17(a)), HybridKNN-Join outperforms CPU-Only across all values of . On the Osm dataset (Fig. 17(b)), HybridKNN-Join and CPU-Only have nearly equal performance from ; however, when , HybridKNN-Join outperforms CPU-Only. We find that KDTree outperforms HybridKNN-Join on Gaia and Osm when .
+
+It is interesting to note that on Gaia and Osm, KDTree outperforms CPU-Only on low values of , whereas CPU-Only performs better on the higher values of  (we observed similar behavior on some of the synthetic datasets in Fig. 16). This suggests that HybridKNN-Join could be equipped with different algorithms, such as using KDTree instead of the ANN-based CPU-Only implementation for lower values of . While this is beyond the scope of this work, algorithm selection as a function of input parameters is an interesting research direction for hybrid CPU/GPU algorithms.
+
+Fig. 19(a) plots the speedup of HybridKNN-Join over CPU-Only for all datasets in Fig. 16, Fig. 17. The plot demonstrates that the performance advantage of HybridKNN-Join is greater when  is large or when the dimensionality increases (excepting the 2-D datasets). Fig. 19(b) shows that as  increases, the fraction of queries solved by Hybrid-GPU also increases on most datasets. Note that while the fraction of  computed by Hybrid-GPU is generally 50%, Hybrid-GPU is computing the queries with the greatest amount of work in the denser data regions of the Gaia, Osm, and Expo- datasets (by definition, the Unif- datasets have constant density across the data space).
+
+5.4.15. Comparison of HybridKNN-Join to BufferKDTree
+Fig. 20 plots the speedup of HybridKNN-Join over the GPU algorithm BufferKDTree vs.  on all datasets shown in Fig. 16, Fig. 17, corresponding to the synthetic and real-world datasets, respectively.
+
+We find that on most synthetic datasets, HybridKNN-Join achieves a speedup over BufferKDTree. However, BufferKDTree outperforms HybridKNN-Join on some smaller values of  (e.g., on the Unif2D and Unif4D datasets), and outperforms HybridKNN-Join on Unif6D when . Overall, we find that HybridKNN-Join significantly outperforms BufferKDTree on the larger values of .
+
+On the real-world datasets, Gaia and Osm, the performance gains over BufferKDTree are more pronounced than on the synthetic datasets. On the Gaia dataset, the speedup ranges from 1.08–16.59, and on the Osm dataset the speedup ranges from 0.85–19.24. Therefore, there is only one case at  on Osm where HybridKNN-Join achieves a slowdown relative to BufferKDTree.
+
+6. Discussion & conclusions
+Many of the GPU KNN works address high-dimensionality [2], [15], [24], [31]. Here, we advance a hybrid approach for low-dimensionality that exploits the relative strengths of the CPU and GPU architectures. GPU KNN algorithms are less likely to achieve significant performance gains in low dimensionality due to highly efficient CPU algorithms, such as ANN [3].
+
+We consider the throughput-oriented GPU vs. the low-latency CPU. Our strategy assigns large batches to the GPU to maintain high throughput, while the CPU ranks are assigned smaller chunks of work. We largely mitigate load imbalance and starvation by reducing the batch size assigned to the GPU depending on the number of completed queries, and reserving queries for the CPU. The work queue allows new advances in GPU- and CPU-only algorithms to be substituted into the framework to further improve performance. More broadly, the work queue could be used as a general technique to address other CPU/GPU algorithms with data-dependent performance characteristics.
+
+HybridKNN-Join yields reasonable performance gains over the reference implementations. We find that the speedup over the parallel CPU approach (CPU-Only) is ; however, from Fig. 19(a), we clearly observe that the speedup of HybridKNN-Join is expected to be greater at higher values of  (and potentially dimensionality) than the scenarios examined in this paper. Similarly, we find that HybridKNN-Join outperforms the GPU reference implementation, BufferKDTree, on most scenarios (Fig. 20).
+
+An overall observation from this exercise is that hybrid algorithms are difficult to design. Since the performance of each CPU and GPU algorithm largely varies due to input parameters () and data properties, it is challenging to design an algorithm that will outperform or achieve comparable performance to all other CPU-only or GPU-only reference implementations.
+
+We found that there are some experimental scenarios where HybridKNN-Join yields a slowdown compared to some of the reference implementations (e.g., the KDTree implementation on low values of ). Since all KNN algorithms have particular performance niches, hybrid algorithms could be developed to include algorithm selection as a function of several parameters, such as , data dimensionality, and data distribution. This would allow hybrid algorithms to achieve better performance over a wider range of scenarios. We leave this research direction for future work.
+
+A recent trend in computer architecture is the use of GPUs in clusters. For example, each compute node in the Summit supercomputer at Oak Ridge National Laboratory contains six Nvidia Volta GPUs [41]. The work queue proposed in this paper could be used to distribute work to multiple GPUs within a single node. Furthermore, the work queue is a good design for workloads that vary based on data distribution, and could be applied to other spatial search algorithms used for data analysis, such as similarity searches [25], and DBSCAN clustering [6], [11]. Based on our experiments, the work queue is able to achieve good load balancing between the CPU and GPU, and therefore, we would expect to achieve good load balancing between multiple GPUs. The work queue would only need to be reconfigured to incorporate several GPU consumers. Interestingly, on fat-nodes like those in Summit, the use of the CPU in hybrid algorithms would become less important, since the computational throughput of several GPUs would be much higher than the CPUs in the system. Another interesting design is partitioning the input dataset across the global memory of multiple GPUs to enable larger datasets to be processed. New interconnects such as NVLink [13] enable direct GPU-to-GPU communication, thus obviating slower main-memory accesses orchestrated by the host.

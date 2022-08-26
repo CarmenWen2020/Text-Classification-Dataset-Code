@@ -1,0 +1,579 @@
+Abstract
+This work presents Speculative Transaction Replication (STR), a protocol that exploits transparent speculation techniques to enhance performance of geo-distributed, partially replicated transactional data stores. In addition, we define a new consistency model, Speculative Snapshot Isolation (SPSI), a variant of Snapshot Isolation (SI), which shelters applications from the subtle anomalies that arise when using speculative transaction processing techniques.
+
+STR provides a form of speculation that is fully transparent for programmers (it does not expose the effects of misspeculations to clients). Since the speculation techniques employed by STR satisfy SPSI, they can be leveraged by application programs in a transparent way, without requiring any source-code modification to applications designed to operate using SI. STR combines two key techniques: speculative reads, which allow transactions to observe pre-committed versions, which can reduce the ‘effective duration’ of pre-commit locks and enhance throughput; Precise Clocks, a novel timestamping mechanism that uses per-item timestamps with physical clocks, which together greatly enhance the probability of successful speculation.
+
+We assess STR’s performance on up to nine geo-distributed Amazon EC2 data centers, using both synthetic benchmarks as well as realistic benchmarks (TPC-C and RUBiS). Our evaluation shows that STR achieves throughput gains up to 11× and latency reduction up to 10× (with respect to non-speculative systems that ensure SI) in workloads characterized by low inter-data center contention. Furthermore, thanks to a self-tuning mechanism that dynamically and transparently enables and disables speculation, STR offers robust performance even when faced with unfavorable workloads that suffer from high misspeculation rates.
+
+Keywords
+Data store
+Distributed transaction
+Geo-replication
+Strong consistency
+Speculation
+
+1. Introduction
+Modern large scale storage systems are increasingly deployed over geographically-scattered data centers [9], [21], [27]. Geo-replication allows storage systems to remain available even in the presence of outages affecting entire data centers and it reduces access latency by bringing data closer to clients. On the down side, though, the performance of geographically distributed data stores is challenged by large communication delays between data centers.
+
+To provide ACID transactions, a desirable feature that can greatly simplify application development [40], some form of global (i.e., inter-data center) certification is needed to safely detect conflicts between concurrent transactions executing at different data centers. The adverse performance impact of global certification is twofold: (i) system throughput can be severely impaired, as transactions need to hold pre-commit locks during their global certification phase, which can cripple the effective concurrency that these systems can achieve; and (ii) client-perceived latency is increased, since global certification lies in the critical path of transaction execution.
+
+Transparent speculation. This work investigates the use of speculative processing techniques to alleviate both of the above problems. We focus on geo-distributed partially replicated transactional data stores that provide Snapshot Isolation, a widely employed consistency criterion [11], [15] (SI), and propose a novel distributed concurrency control scheme, Speculative Snapshot Isolation (SPSI), that supports a form of transparent speculative execution called speculative reads.
+
+Speculative reads allow transactions to observe the data item versions produced by pre-committed transactions, instead of blocking until they are committed or aborted. As such, speculative reads can reduce the “effective duration” of pre-commit locks (i.e., as perceived by conflicting transactions), thus reducing transaction execution time and enhancing the maximum degree of parallelism achievable by the system — and, ultimately, throughput. We say that speculative reads are a transparent speculation technique, as misspeculations caused by it never surface to the clients and can be dealt with by simply re-executing the affected transaction.
+
+Avoiding the pitfalls of speculation. Past work has demonstrated how the use of speculation, either transparently or requiring source-code modification [19], [20], [26], [34], [44], can significantly enhance the performance of distributed [26], [34], [35], [36], [44] and single-site [19] transactional systems. However, these approaches suffer from several limitations:
+
+1. Unfit for geo-distribution/partial replication. Some existing works in this area [26], [36], [44] were not designed for partially replicated geo-replicated data stores. On the contrary, they target different data models (i.e., full replication [36], [44]) or rely on techniques that impose prohibitive costs in WAN environments, such as the use of centralized sequencers to totally order transactions [26].
+
+2. Subtle concurrency anomalies. Existing partially replicated geo-distributed transactional data stores that allow speculative reads [19], [22], [35] expose applications to anomalies that do not arise in non-speculative systems and that can severely undermine application correctness. Fig. 1 illustrates two examples of concurrency anomalies that may arise with these systems. The root cause of the problem is that existing systems allow speculative reads to observe any pre-committed data version. This exposes applications to data snapshots that reflect only partially the updates of transactions (Fig. 1(a)) and/or include versions created by conflicting concurrent transactions (Fig. 1(b)). These anomalies can have a twofold harmful impact. First, they can lead to externalizing non-atomic/non-isolated snapshots to clients. Second, if the application runs in non-sandboxed environments, observing anomalous states may affect transaction execution to the extent to generate anomalous/unexpected behaviors [18]. This is the case, for instance, of JAVA programs that use the JPA interface [49] to access transparently the data maintained by a back-end data store. In this case, applications can exploit in arbitrary ways the data they fetch from the data store. As such, observing inconsistent states could lead application to, e.g., crash or hang in infinite loops, as exemplified in Fig. 1.
+
+3. Performance robustness. If used injudiciously, speculation can hamper performance. As we will show, in adverse scenarios (e.g., large likelihood of transaction aborts and high system load) misspeculations can significantly penalize both user-perceived latency and system throughput.
+
+•
+Speculative Snapshot Isolation (SPSI), a novel consistency model that is the foundation of STR (Section 4). Besides guaranteeing the familiar Snapshot Isolation1 (SI) to committed transactions, SPSI provides clear and rigorous guarantees on the atomicity and isolation of the snapshots observed and produced by executing transactions. In a nutshell, SPSI requires an executing transaction to read data item versions committed before it started (as in SI), but it also allows to atomically observe the effects of non-conflicting transactions that originated on the same node and pre-committed before the transaction started. This shelters programmers from having to reason about complex concurrency anomalies that can otherwise arise in speculative systems.
+
+•
+Speculative Transaction Replication (STR), a novel speculative transactional protocol for partially replicated geo-distributed data stores (Section 5). STR shares several key design choices with state-of-the-art strongly consistent data stores [9], [11], [37], which contribute to its efficiency and scalability. These include: multi-versioning, which maximizes efficiency in read-dominated workloads [5], purely decentralized concurrency control based on loosely synchronized physical clocks [9], [11], [38], and support for partial replication [9], [43]. The key contribution of STR is its innovative, fully decentralized, concurrency control mechanism, which aims not only to ensure (SPSI-)safe speculations in a lightweight and scalable fashion, but also to enhance the chances of successful speculation via a novel transaction timestamping mechanism that we called Precise Clocks. We also discuss possible extensions to enable STR to provide Serializability (Section 7.2) and guarantee real-time ordering (Section 7.1).
+
+•
+A lightweight yet effective self-tuning mechanism, based on a feedback control loop, that dynamically enables or disables speculation based on the workload characteristics (Section 5.5).
+
+•
+We evaluate STR on up to nine geo-distributed Amazon EC2 data centers, using both synthetic and realistic benchmarks (TPC-C and RUBiS) (Section 8). Our experimental study shows that the use of transparent speculation (speculative reads) yields up to 11 throughput improvements and 10 latency reduction compared to a state of the art protocol, i.e., Clock-SI [11], that ensures SI without resorting to speculative techniques. This is achieved in a fully transparent way, i.e., requiring no compensation logic.
+
+2. Related work
+Distributed transactional data stores. The problem of designing efficient mechanisms to ensure strong consistency semantics in distributed and replicated data stores has been extensively studied. In this area, one class of solutions [12], [47] is based on the state-machine replication (SMR) [28] approach, in which replicas first agree on the serialization order of transactions and then execute them without further coordination. Other recent systems [9], [11], [27] adopt the deferred update (DU) [25] approach, in which transactions are first locally executed and then globally certified. This approach is more scalable than SMR in update intensive workloads [25], [48] and, unlike SMR, it can seamlessly support non-deterministic transactions [39]. The main down side of the DU approach is that locks must be maintained for the whole duration of transactions’ global certification, which can severely hinder throughput [45]. STR builds on the DU approach and tackles its performance limitation via speculative techniques.
+
+The usage of transactions has also been proposed in the context of distributed file systems and blob-stores [16], [30], [46], in order to simplify the development of applications and spare them from the complexity of having to explicitly coordinate access to files/blobs and avoid anomalies like race conditions and inconsistent writes. These papers typically focus on how to ensure the efficient, yet correct, management of the metadata and contents of file, which are characterized by very different access patterns and access costs, as well as on how to support file-oriented APIs (such as the one defined by the POSIX standards). In our work, we consider transactional data stores that provide a simpler data model and API, i.e., the classic key–value model. Yet, we argue that the speculative transaction processing techniques that we present in this work might be applicable also to the case of transactional file systems, provided that these adopt a consistency model that abides by the SI specification. In fact, the speculative techniques that we introduce in this work ensure that applications designed to operate correctly in the SI model will not be exposed to any additional concurrency anomaly and, therefore, will preserve their correctness.
+
+The property introduced in this work, SPSI, is related to PSI (Parallel Snapshot Isolation) [41], a consistency criterion that relaxes SI in order to reduce latency in geo-distributed data stores. When compared with SPSI, PSI specifies a weaker consistency criterion for final committed transactions: PSI requires that transactions read the most recent committed version of some data only if this is created by a transaction that originated at the same site. This allows for anomalies that are not possible in SI (called long forks [41]), and that are also excluded by SPSI, which guarantees SI-semantics for final committed transactions, i.e., they only observe the most recent committed version independently from the site in which it was originated. Further, PSI prohibits transactions from reading any version that is not final committed, which represents one of the key motivations underlying the definition of SPSI: sparing transactions from waiting for pre-commit locks to be released, while still providing rigorous consistency guarantees to shelter applications from arbitrary concurrency anomalies.
+
+Speculation. The idea of letting transactions “optimistically” borrow, in a controlled manner, data updated by concurrent transactions has already been investigated in the past. SPECULA [36] and Aggro [32] have applied this idea to local area clusters in which data is fully replicated via total-order based coordination primitives; Jones et al. [26] applied this idea to partially replicated/distributed databases, by relying on a central coordinator to totally order distributed transactions. These solutions provide consistency guarantees on executing transactions (and not only on committed ones) that are similar in spirit to the ones specified by SPSI. However, some of these systems [32], [36] adopt a full-replication scheme, which requires all replicas to store the full dataset and apply all updates. This significantly hinders their scalability. Other systems, e.g., [26], instead, rely on the use of a global sequencer, which can become a system bottleneck and imposes unacceptably large latency in geo-distributed settings.
+
+Other works in the distributed database literature, e.g., [19], [22], [35], have explored the idea of speculative reads (sometimes referred to as early lock release) in decentralized transactional protocols for partitioned databases, i.e., the same system model assumed by STR. However, these protocols provide no guarantees on the consistency of the snapshots observed by transactions (that eventually abort) during their execution and may expose applications to subtle concurrency bugs, such as the ones exemplified in Fig. 1.
+
+Another form of speculation that strives to reduce perceived-latency by exposing preliminary results to external clients, i.e., speculative commits, has been explored by various works. Helland et al. advocated the guesses and apologies programming paradigm [23], in which systems expose preliminary results of requests (guesses), but reconcile the exposed results if they are different from final results (apologies). A similar approach is adopted also in other recent works, like PLANET [34] and ICG [20]. Unlike STR, which is totally transparent to programmers, these approaches employ a form of external speculation, which requires source-code modification to incorporate compensation logics. Furthermore, these approaches are designed to operate on conventional storage systems, which do not support speculative reads of pre-committed data. As such, although these approaches may reduce user-perceived latency, they do not tackle the problem of reducing transaction blocking time, as STR does. We will provide experimental evidence supporting this claim in Section 8.
+
+Some of the speculative transaction processing systems mentioned above, e.g., SPECULA [36] and PLANET [34], rely on self-tuning mechanisms aimed at autonomously determining whether the use of speculation may be beneficial or not. As already mentioned, STR employs an ad-hoc self-tuning mechanism that aims at pursuing an analogous goal, i.e., dynamically enabling or disabling speculation based on the workload characteristics. More in general, there exists a large literature on self-tuning of transactional systems [13], [31], [33], which has shown the feasibility of using automatic techniques to predict and/or react timely to workload changes.
+
+3. System and data model
+Our target system model consists of a set of geo-distributed data centers, each hosting a set of nodes. In the following, we assume a key–value data model. This is done for simplicity and since our current implementation of STR runs on a key–value store. However, the protocol we present is agnostic to the underlying data model (e.g., relational or object-oriented).
+
+Data and replication model. The dataset is split into multiple partitions, each of which is responsible for a disjoint key range and maintains multiple timestamped versions for each key. Partitions may be scattered across the nodes in the system using arbitrary data placement policies. Each node may host multiple partitions, but no node or data center is required to host all partitions.
+
+A partition can be replicated within a data center and across data centers. STR employs synchronous master–slave replication to enforce fault tolerance and transparent fail over, as used, e.g., in [2], [9]. A partition has a master replica and several slave replicas. As will be clearer in Section 5, both the master replica and slave replicas (that are up-to-date) can serve read requests to their replicated data items. We say that a key/partition is remote for a node, if the node does not replicate that key/partition.
+
+Synchrony assumptions. We assume a classic asynchronous distributed system model, with no assumptions on upper bounds on relative process speeds and communication latency. STR requires that nodes are equipped with loosely synchronized, conventional hardware clocks, which we only assume to monotonically move forward. Note that while the correctness of the presented protocol is not affected by the clock skew (i.e., either the clock skew is small or large), it is known [9], [11] that the performance of protocols based on physical clocks, like Clock-SI or Spanner, can be negatively affected in case of large clock skews (e.g., by introducing large delays or suffering from large abort rates). The same consideration applies to the protocol proposed here, which extends this class of protocols (and in particular Clock-SI) with speculative transaction processing techniques.
+
+Additional synchrony assumptions are required to ensure fault-tolerance. Specifically, STR integrates a classic single-master replication protocol, which assumes perfect failure detection capabilities [8]. We note, though, that it would be possible to replace the replication scheme currently employed in STR to use techniques, like Paxos [14], which require weaker synchrony assumptions. Further, as we shall discuss in Section 5.6, the mechanisms employed by STR to ensure that SPSI semantics are guaranteed also in presence of failures hinge on the assumption that it is possible to establish a finite upper bound on the clock skew between nodes. The same additional synchrony assumption is necessary in order to allow the implementation of the variant of STR that ensures real-time ordering, which is presented in Section 7.1.
+
+Transaction execution model. A transaction is executed, by a process called its coordinator, in the node where it was originated. When the transaction starts, it is attributed a snapshot time, which we call , according to the physical clock of its originating node.
+
+When the transaction requests to commit, it undergoes a local certification phase, which checks for conflicts with concurrent transactions on all locally replicated partitions. If the certification phase succeeds at a partition, the transaction pre-commits at that partition obtaining a pre-commit timestamp, note  (in the following, we use the terms pre-committed and prepared as synonyms). If the transaction passes the certification phase for all the local partitions that it involves, the transaction local commits (at the node in which the transaction originated), or speculative commits, and it is attributed a local commit timestamp, noted . Next, it executes a global certification phase that detects conflicts with transactions originated at any other node in the system and aims at pre-committing the transaction on every master replica of the partitions that the transaction updated.
+
+We define the snapshot observed by a transaction T, or simply snapshot of transaction T, as the set of (local or final committed) versions that were read by T. We say that a transaction  is included in the snapshot of a transaction , if  reads a version created by  either directly, or indirectly, i.e., there exists a sequence of transactions  such that  reads a version created by .
+
+Transactions that pass the global certification phase are said to final commit and are attributed a final commit timestamp, noted . Commit requests are confirmed to applications only if the transaction is final committed, which guarantees that speculative states never surface to clients. However, the versions created by a local committed transaction  can be exposed to other transactions via the speculative read mechanism. We say that these transactions depend on .
+
+Note that, since our transaction execution model defines an additional (local) commit event, and since we intend to allow transactions to observe the effects of local committed transactions that originated at the same node, we need to revise the definition of concurrent transactions. Intuitively, two transactions ,  are concurrent if their execution intervals overlap, i.e., if the execution interval of  ends after the execution interval of  starts, or vice versa. We always identify the start of a transaction’s execution interval using its . The end of the execution interval of  and , though, is determined in different ways, depending on whether these are originated at the same node, or not. If  and  originate at different nodes, we identify the end of their execution interval using their . If  and  originate at the same node, we define the end of the execution interval of  as its , provided that  was only local committed but not final committed, or as its , if  was final committed.
+
+4. The SPSI consistency model
+We introduce Speculative Snapshot Isolation (SPSI), a consistency model that generalizes the well-known SI criterion [4] to define a set of guarantees that shelter applications from the subtle anomalies (Fig. 1) that may arise when using speculative techniques. Note that while the original definition of SI enforces real-time ordering guarantee, SPSI is defined upon a variant of SI [15], namely Generalized SI (GSI), which provides no real-time order guarantee. Thus, in the remainder of the paper, with the term SI we always refer to GSI, unless otherwise specified.
+
+Before presenting the SPSI specification, we first recall the definition of SI [15], which we adapted to match the terminology used in our transaction execution model and to simplify the original notation:
+
+•
+SI-1. (Totally-ordered committed versions) For each data item, its committed versions are totally ordered.
+
+•
+SI-2. (Transactions read consistent snapshots): All read operations issued by a transaction with snapshot timestamp  observe the most recent version committed by transactions with commit timestamp .
+
+•
+SI-3. (No Write–Write Conflicts) The write-sets of any committed concurrent transactions must be disjoint.
+
+We now introduce the SPSI specification:
+
+•
+SPSI-1 (Totally-ordered final committed versions) For each data item, its final committed versions are totally ordered.
+
+•
+SPSI-2 (Per-node totally-ordered final and speculatively committed versions) At each node, the final and speculative committed versions of each data item are totally ordered.
+
+•
+SPSI-3. (Transactions read consistent speculative snapshots) A transaction  originated at a node  with snapshot time  must observe the most recent versions created by transactions that (i) final commit with timestamp  (independently of the node where these transactions originated), and (ii) local commit with timestamp  and originated at node .
+
+•
+SPSI-4. (No Write–Write Conflicts among Final Committed Transactions) The write-sets of any final committed concurrent transactions must be disjoint.
+
+•
+SPSI-5. (No Write–Write Conflicts among Transactions in a Speculative Snapshot) Let S be the snapshot of a transaction. The write-sets of any concurrent transactions included in S must be disjoint.
+
+•
+SPSI-6. (No Dependencies from Uncommitted Transactions) A transaction can only be final committed if it does not depend on any non-final committed transaction.
+
+SPSI-1 and SPSI-2 jointly define the ordering of (final and speculatively) committed data item versions. Note that while SPSI-1 applies to all possible nodes, SPSI-2 only requires the total ordering of item versions within a node — speculatively committed versions in different nodes are not required to be totally ordered.
+
+SPSI-3 extends the notion of snapshot, at the basis of the SI definition, to provide the illusion that a transaction  executes on an immutable snapshot, which reflects the execution of all the transactions that local committed before ’s activation and that originated on the same node. By demanding that the snapshots over which transactions execute reflect only the effects of locally activated transactions, SPSI allows for efficient implementations, like STR’s, which can decide whether it is safe to observe the effects of a local committed transaction based solely on local information.
+
+Note that property SPSI-3 is specified for any transaction, including the ones that eventually abort (e.g., because some other SPSI property is violated). Hence, SPSI-3 must hold throughout the execution of transactions. This has also another relevant implication: assume that a transaction , which started at time , reads speculatively from a local committed transaction  with timestamp , and that, later on,  final commits with timestamp ; at this point  violates the first sub-property of SPSI-3. Hence,  must be aborted before  is allowed to final commit. The same applies in case  aborts: since SPSI-6 prohibits developing dependencies from aborted transactions, also in this case,  must be aborted before  is.
+
+SPSI-4 coincides with SI-3, ensuring the absence of write–write conflicts among concurrent final committed transactions. SPSI-5 complements SI-2 by ensuring that the effects of conflicting transactions can never be observed. Finally, SPSI-6 ensures that a transaction can be final committed only if it does not depend on transactions that may eventually abort.
+
+Which anomalies does SPSI allow? SPSI provides identical guarantees to SI for final committed transactions. As for local committed and active transactions, SPSI allows for histories that would be rejected by SI, e.g., observing a version locally committed by a transaction that eventually aborts due to a conflict with some remote transaction. However, we argue that these anomalies allowed by SPSI are unharmful for applications designed to operate using SI. This is easy to show if one considers that SPSI ensures that any transaction  behaves like if it had executed under SI in a history that includes only the transactions known by the node in which  originated at the time in which  was activated. More formally, the snapshot observable by  in any SPSI-compliant history  is equivalent to the one that  would observe in some SI-compliant history , which differs from  only because  may omit some remote transaction concurrent with . In other words, any snapshot observable with SPSI can be obtained via a (possible) history that would be legal using SI. Clearly, if an application works correctly with SI, i.e., it is correct with any SI-compliant history (including history ), the application will be also be correct when faced with history  — and, thus, when executing the SPSI-compliant history .
+
+Which anomalies does SPSI prevent? In Fig. 1 we have already exemplified some of the concurrency anomalies that SPSI prevents, and which could lead applications to hang or crash. Interestingly, while analyzing the TPC-C and RUBiS benchmarks, we have identified several concurrency bugs that may arise and cause application crashes, if SPSI’s guarantees are not enforced.
+
+
+Download : Download high-res image (134KB)
+Download : Download full-size image
+Listing 1 illustrates one of the anomalies we spotted in TPC-C benchmark, which involves the New Order (NO) and Order Status (OS) transactions. NO inserts a new order for a customer and then creates some number of corresponding order lines. OS fetches the identifies of the last order of a given customer, and then retrieves the corresponding order lines. In a partially-replicated setting, the order record may be stored in the node where the NO transaction was activated, but the order lines may be stored in some different node. An injudicious use of speculative reads may allow a OS transaction to read the pre-committed order record of a concurrent NO, but then allow the OS to miss the corresponding order lines (an atomicity violation that is prevented by SPSI-1). In this case, the parse method in OS would be fed with a null pointer and generate an unexpected exception, which would never occur with SI (or SPSI) and could lead to a crash of the application.
+
+5. The STR protocol
+This section introduces the Speculative Transaction Replication (STR) protocol. For reasons of clarity, we present the design of STR incrementally. We first present a non-speculative and not fault-tolerant base protocol that implements a SI-compliant transaction system (Section 5.1). Next, we extend this base protocol with a set of mechanisms aimed to support speculation in an efficient and SPSI-compliant way (Section 5.2). We then discuss how to augment the resulting protocol to tune the degree of speculation in a dynamic way (Section 5.5) and to achieve fault-tolerance (Section 5.6).
+
+5.1. Base non-speculative protocol
+The base protocol is a multi-versioned, SI-compliant algorithm that relies on a fully decentralized concurrency control scheme similar to that employed by recent, highly scalable systems, like Spanner or Clock-SI [9], [11]. In the following, we describe the main phases of STR’s base protocol.
+
+Execution. When a transaction is activated, it is attributed a snapshot timestamp, noted as ST, equal to the physical time of the node in which it was originated. The read snapshot determines which data item versions are visible to the transaction. Upon a read, a transaction  observes the most recent version  having final commit timestamp . However, if there exists a pre-committed version  with a timestamp smaller than , then  must wait until the pre-committed version is committed/aborted. In fact, as will become clear shortly, the pre-committed version may eventually commit with a timestamp  – in which case  should include it in snapshot – or  — in which case it should not be visible to .
+
+Note that read requests can be sent to any replica that maintains the requested data item. Also, if a node receives a read request with a read snapshot  higher than its current physical time, the node delays serving the request until its physical clock catches up with . Instead, writes are always processed locally and are maintained in a transaction’s private buffer during the execution phase.
+
+Certification. Read-only transactions can be immediately committed after they complete execution. Update transactions, instead, first check for write–write conflicts with concurrent local transactions. If  passes this local certification stage, it activates a, 2PC-based [5], global certification phase by sending a pre-commit request to the master replicas of any key it updated and for which the local node is not a master replica. If a master replica detects no conflict, it acquires pre-commit locks, and proposes its current physical time for the pre-commit timestamp.
+
+Replication. If a master replica successfully pre-commits a transaction, it synchronously replicates the pre-commit request to its slave replicas. These, in their turn, send to the coordinator their physical time as proposed pre-commit timestamps.
+
+Commit. After receiving replies from all the replicas of updated partitions, the coordinator calculates the commit timestamp as the maximum of the received pre-commit timestamps. Then it sends a commit message to all the replicas of updated partitions and replies to the client. Upon receiving a commit message, replicas mark the version as committed and release the pre-commit locks.
+
+This protocol has a potential for high scalability. Unfortunately, though, in geo-distributed settings, its throughput can be severely limited by convoy effects caused by the pre-commit locks. These locks are held throughout the transactions’ certification phase, which in geo-distributed data stores entail the latency of at least one inter-data center RTT — or more if data partitions are replicated in different data-centers to allow for disaster recovery. Throughout this period, concurrent transactions attempting to read pre-committed data are conservatively blocked to ensure that if a version of that data item is included in the snapshot of a transaction , then that version is guaranteed to have been committed (i.e., the transaction that created that version will not eventually abort) with a final timestamp smaller that ’s snapshot timestamp (i.e., the transaction that created that version will not eventually commit obtaining a final timestamp larger than ’s snapshot timestamp). This inherently limits the maximum degree of concurrency (and hence throughput) achievable by the system.
+
+As we mentioned, the idea at the basis of STR is to tackle this problem by allowing transactions to observe pre-committed versions. Materializing this idea to build STR raised several technical challenges: guaranteeing SPSI-safe speculations (Section 5.2), maximizing the likelihood of successful speculation (Section 5.3) and ensuring robust performance even in adverse workload settings (Section 5.5).
+
+5.2. Enabling SPSI-safe speculations
+Let us discuss how to extend the base protocol described above to incorporate speculative reads, while preserving SPSI semantics. The example executions in Fig. 1 illustrate two possible anomalies that could lead transactions to observe non-atomic snapshots, which violate property SPSI-3 (Fig. 1.a), or snapshots reflecting the execution of two conflicting transactions, which violate property SPSI-5 (Fig. 1.b).
+
+STR tackles these issues as follows. First, it restricts the use of speculative reads, as mandated by SPSI-3, by allowing to observe only pre-committed versions created by local transactions. This is sufficient to prevent the anomalous executions illustrated in Fig. 1, Fig. 1, since in both executions the transaction executing at node  (i.e., the transaction that in both executions experiences an anomaly) will be prevented from reading speculatively pre-committed data.
+
+However, the above mechanisms still do not suffice to ensure, in all possible scenarios, properties SPSI-3 and SPSI-5. There are, in fact, two other subtle cases that have to be taken into account, both involving speculative reads of versions created by local committed transactions that updated some remote key.
+
+The first scenario, illustrated in Fig. 2, is associated with the possibility of including in the same snapshot a local committed transaction,  — which will eventually abort due to a remote conflict, say with  — and a remote, final committed transaction, , that has read from . In fact, the totally decentralized nature of STR’s concurrency protocol, in which no node has global knowledge of all the transactions committed in the system, makes it challenging to detect scenarios like the ones illustrated in Fig. 2 and to distinguish them, in an exact way, from executions that did not include transaction  — in which case the inclusion of  and  in  would have been safe.
+
+The mechanism that STR employs to tackle this issue is based on the observation that such scenarios can arise only in case a transaction, like , attempts to read speculatively from a local committed transaction, like , which has updated some remote key. The latter type of transactions, which we call “unsafe” transactions, may have in fact developed a remote conflict with some concurrent final committed transaction (which may only be detected during their global certification phase), breaking property SPSI-3. In order to detect these scenarios, STR maintains two additional data structures per transaction:  (Oldest Local Commit) and  (Freshest Final Commit), which track, respectively, the read snapshot of the oldest “unsafe” local committed transaction and the commit timestamp of the most recent remote final committed transaction, which the current transaction has read from (either directly or indirectly). Thus, STR blocks transactions when they attempt to read versions that would cause  to become larger than . This mechanism prevents including in the same snapshot unsafe local committed transactions along with remote final committed transactions that are concurrent and may conflict with them. For example, in Fig. 2, STR blocks  when attempting to read  from , until the outcome of  is determined (not shown in the figure).
+
+The second scenario arises in case a transaction  attempts to speculatively read a data item  that was updated by a local committed transaction , where  is not replicated locally. In this case, if  attempted to remotely read , it may risk to miss the version of  created by , which would violate SPSI-3. To cope with this scenario, whenever an unsafe transaction local commits, it temporarily (until it final commits or aborts) stores the remote keys it updated in a special cache partition, tagging them with the same local commit timestamp. Also, when a transaction reads a remote data item, it first tries to read it from the local cache partition. This grants prompt and atomic (i.e., all or nothing) access to these keys to any local transaction that may attempt to speculatively read them.
+
+5.3. Promoting successful speculation via Precise Clocks
+Recall that, SPSI-1 requires that if a transaction  reads speculatively from a local committed transaction , and  eventually final commits with a commit timestamp that is larger than the read snapshot of , then  has to be aborted. Thus, in order to increase the chance of success of speculative reads, it is important that the commit timestamps attributed to final committed transactions are “as small as possible”.
+
+To this end, STR proposes a new timestamping mechanism, i.e., Precise Clocks, which is based on the following observation. The smallest final commit timestamp, , attributable to a transaction  that has read snapshot  must ensure the following properties:
+
+ P1. , which guarantees that if  reads a data item version with timestamp  and updates it, the versions it generates have larger timestamp than the one it read.
+
+ P2.  is larger than the read snapshot of all the transactions , which (a) read, before  final committed, any of the keys updated by , and (b) did not see the versions created by , i.e., max{}. This condition is necessary to ensure that  is serialized after the transactions , or, in other words, to track write-after-read dependencies among transactions correctly.
+
+Ensuring property P1 is straightforward: instead of proposing the value of the physical clock at its local node as pre-commit timestamp, the transaction coordinator proposes . In order to ensure property P2, STR associates to each data item an additional timestamp, called , which tracks the read snapshot of the most recent transaction that has read that data item. Hence, in order to ensure property P2, the nodes involved in the global certification phase of transaction  propose, as pre-commit timestamp, the maximum among the  timestamps of any key updated by  on that node.
+
+It can be easily seen that the Precise Clocks mechanism allows to track write-after-read dependencies among transaction at a finer granularity than the timestamping mechanism used in the base protocol — which, we recall, is also the mechanism used by non-speculative protocols like, e.g., Spanner [9] or Clock-SI [11]. Indeed, as we will show in Section 8, the reduction of commit timestamps achievable via Precise Clocks does not only increase the chances of successful speculation, but also reduces abort rate for non-speculative protocols.
+
+It should be noted that the Precise Clocks mechanism does bring overheads, in terms of both additional storage requirements as well as additional computational costs, which we discuss next.
+
+As will be shown in Section 8.1, the Precise Clocks mechanism introduces a storage overhead (for storing the  metadata at the key granularity) that can be quantified as approximately 10% with realistic workloads (i.e., TPC-C and RUBiS). We argue that one could further lower the spatial overhead, at the cost of increasing abort rate, by tracking the  information at a coarser granularity, e.g., associating a single  with a set of keys or even an entire partition.
+
+For what concerns computational overheads, the Precise Clocks mechanism requires updating the  variable upon each read operation, whereas typical SI protocols avoid the cost of tracking reads. However, STR targets a geo-distributed system setting in which throughput is normally limited by the global certification phase, which is affected by large communication delays between data centers. Keeping into account that these delays are often in the order of hundreds of milliseconds, we argue that the additional cost imposed by the local update of the  variables is likely to be negligible. In fact, as we will experimentally show in Section 8, the overhead of the Precise Clocks mechanism is, in practice, largely outweighed by the benefits it provides.
+
+
+Download : Download high-res image (590KB)
+Download : Download full-size image
+5.4. Pseudo-code of the STR Protocol
+The pseudocode of the STR protocol is reported in Algorithms 1 and 2, which describe, respectively, the behavior of transaction coordinators and of data partitions.
+
+Start transaction. Upon activation, a transaction is assigned a snapshot timestamp () equal to the current value of the node’s physical clock. Its FFC is set to 0 and its OLCSet, i.e., the set storing the identifiers and snapshot times of the unsafe transactions from which the transaction reads from, to {} (Algorithm 1, 1–6).
+
+Speculative read. Read requests to locally-replicated keys are served by local partitions. A read request to a non-local key is first served at the cache partition to check for updates from previous local committed transactions. If no appropriate version is found, the request is sent to any (remote) replica of the partition that contains this key (Algorithm 1, 8–13). Upon a read request for a key, a partition updates the  of the key and fetches the latest version of the key with a timestamp no larger than the reader’s read snapshot (Algorithm 2, 18). If the fetched version is final committed, or it is local committed and the reader is reading locally, then the partition returns the value and id of the transaction that created the value; otherwise, the reader is blocked until the transaction’s final outcome is known (Algorithm 2, 15–26). The reader transaction updates its OLCSet and FFC, and only reads the value if the minimum value in its OLCSet is greater than or equal than its FFC. If not, the transaction waits until the minimum value in its OLCSet becomes larger than its FFC (Algorithm 1, 14–16). This condition may never become true if the transaction that created the fetched value conflicts with transactions already contained in the reader’s snapshot. In that case, the reader will be aborted after this conflict is detected and stop waiting.
+
+Local certification. After a transaction  finishes execution, its write-set is locally certified. The local certification is essentially a local 2PC across all local partitions that contain keys in the transaction’s write-set, including the cache partition if the transaction updated non-local keys (Algorithm 1, 18–24). For each updated key, a partition detects if  has write–write conflicts with other transactions that have updated the same key, which we refer to as , as follows.
+
+If the latest version of a conflicting key updated by  has timestamp larger than ,  is aborted. This is true independently of whether the conflicting key is in the pre-commit, local commit or final commit state.
+
+Let us now discuss the case in which the most recent existing version has a timestamp smaller than or equal to . There are two cases to consider. If the most recent version is final committed or local committed, then a new version of the key is immediately added to the data store and its state is set to pre-committed. Else, i.e., the most recent version is pre-committed,  is forced to wait till  is either committed, aborted, or local committed.
+
+Note that if the most recent version is in  state, it follows that when  final commits, the  timestamp of this version might become larger than  and cause the abort of  (Algorithm 1, 49). In order to cope with this case,  is added to the set of transactions (Algorithm 2, 37–38) whose outcome depends on the FC of .
+
+If the certification check passes, the partition proposes a prepare timestamp according to the Precise Clocks rule (Algorithm 2, 27–42). Upon receiving replies from all updated local partitions (including the cache partition), the coordinator calculates the local commit timestamp as the maximum between the received prepare timestamps and the transaction’s read snapshot plus one. Then, it notifies all the updated local partitions. A notified partition converts the pre-committed record to local committed state with the local commit timestamp (Algorithm 1, 27–28 and Algorithm 2, 43–45). If the transaction updates non-local keys, the transaction is an ‘unsafe’ transaction, so it adds its snapshot time to its OLCSet (Algorithm 1, 25–26).
+
+Global certification and replication. After local certification, the keys in the transaction’s write-set that have a remote master are sent to their corresponding master partitions for certification (Algorithm 1, 30–31). Analogously to the local certification phase, the master partitions check for conflicts, propose a prepare timestamp and pre-commit the transaction (Algorithm 2, 27–38). Unlike the case in which  is a local transaction, though, if  is remote, its pre-commit request will be blocked in case of conflict with a local committed transaction  and  is not going to be local committed. We recall, in fact, that STR only allows locally originated transactions to expose their pre-committed states to other local transactions.
+
+Next, a master partition replicates the prepare request to its slave replicas and replies to the coordinator (Algorithm 2, 40–42). After receiving a replicated prepare request, the slave partition aborts any conflicting local committed transactions and stores the prepare records. As slave replicas can be directly read bypassing their master replica, slave replicas also track the  for keys; so, each slave also proposes a prepare timestamp for the transaction to the coordinator (Algorithm 2, 8–10).
+
+Final commit/abort. A transaction coordinator can final commit a transaction, if (i) it has received prepare replies from all replicas of updated partitions, and (ii) all dependencies are resolved. The commit decision, along with the commit timestamp, is sent to all non-local replicas of updated partitions. ’s  is updated to its own commit timestamp, and its  is set to infinity (Algorithm 1, 40–51). Upon abort, the coordinator removes any local committed updated version, triggers the abort of any dependent transaction and sends the decision to remote replicas (Algorithm 1, 52–55).
+
+
+Download : Download high-res image (656KB)
+Download : Download full-size image
+5.5. Dynamically tuning speculation
+Speculative reads are based on the optimistic assumption that local committed transactions are unlikely to experience contention with remote transactions. Although our experiments in Section 8 show that this assumption is met in well-known benchmarks such as TPC-C and RUBiS, this is an application-dependent property. In fact, the unrestrained use of speculation in adverse workloads can lead to excessive misspeculation and degrade performance.
+
+In order to enhance the performance robustness of STR, we coupled it with a lightweight self-tuning mechanism that dynamically decides whether to enable or disable the speculative mechanisms, depending on the workload characteristics. The tuning scheme takes a black-box approach that is agnostic of the data store implementation and also totally transparent to application developers. It relies on a simple feedback-driven control loop, steered by a centralized process that gathers measurements from all nodes in a periodic fashion, compares the throughput achieved with speculative reads enabled and disabled, and accordingly configures the system.
+
+We opted for a simple and quickly converging scheme, instead of more complex approaches (e.g., based on off-line trained classifiers or more sophisticated on-line search strategies [42]), since our experimental findings confirm that, for a given workload, the decision whether or not to use speculation has a straightforward effect on throughput (no jitterlike behavior).
+
+Our current implementation allows system administrators to initiate the self-tuning process periodically or upon request. The current self-tuning scheme could thus be naturally extended to detect statistically meaningful changes of the average input load via robust change detection algorithms, like CUSUM [3], and react to these events by re-initiating the self-tuning mechanism.
+
+5.6. Fault tolerance
+STR requires that a transaction coordinator collects replies from all the nodes that replicate data updated by the transaction. This approach assumes the existence of an underlying group management toolkit providing, e.g., virtual synchrony guarantees [6]. It is then straightforward, upon a view change event, to purge faulty nodes and reconfigure the system to ensure progress. Specifically, the replicas of a partition that transit to a new view could rely on the virtual synchrony properties to ensure that they all deliver the same set of updates, as well as agree upon the new partition’s master, before starting to operate in the view.
+
+We note also that, unless some additional mechanism is employed, in presence of replicas’ failures, property SPSI-3 could be violated, as illustrated in Fig. 3. In the considered execution, transaction , with  80, reads a key  from replica 2. Since the  variable (, which keeps track of the last transaction to have read a data item) is only updated on the replica that processes the read request, the information on ’s read request is lost in case of fault of replica 2. It is then possible for an update transaction  to commit with  smaller than : this happens since, after detecting the failure of replica 2 and excluding it from the system,  computes its  on the basis of a set of prepare messages that no longer reflect the state of replica 2.
+
+This issue can be tackled by enforcing that, in the new view, update transactions are attributed a  “sufficiently” in the future to avoid the anomaly illustrated above, i.e., their s should be set large enough to be larger than the s of any transaction that could have read a key on any failed replicas. This could be achieved by computing, during the reconfiguration phase following a replica’s fault, the upper bound on the clock skew among the replicas in the active view before the fault occurred, which we denote as . When resuming transaction processing in the new view, it is sufficient to ensure that the  timestamps computed by any transaction coordinator are larger than or equal to , where  is the local time, at each transaction coordinator, in which the new view was delivered. This can be ensured by having the transaction coordinators correct the  timestamps they determine in Algorithm 1 line 34, so that these are guaranteed to be larger or equal than .
+
+6. Safety and liveness
+In this section, we prove that STR is safe, i.e., it does not violate any SPSI property, and live, i.e., no transaction may be blocked for infinite time and will eventually either commit or abort. The following analysis assumes a failure-free scenario. A discussion on how to cope with failure scenarios is provided in Section 5.6.
+
+6.1. Safety
+Theorem 1
+
+SPSI-1: For each data item, its final committed versions are totally ordered
+
+Proof
+
+Assume, by contradiction, that two transactions  and  update  and both final commit producing a version of  tagged with the same . In order to final commit and produce a new version of key , a transaction must first prepare on all replicas of . Assume without loss of generality that at a given replica, , transaction  enters the prepared state before  does. At the time in which  requests to prepare on , the version of key  produced by , which we note  can be in three possible states:
+
+•
+ is pre-committed: in this case, if  is smaller than the  of ,  is immediately aborted, which contradicts the assumption that  final commits. In case  originated at , it will undergo a local commit phase and, possibly,  will be attributed a  timestamp larger than its current . In such a case,  waits until  local commits. This scenario is equivalent to the case in which  requests to prepare while  is local committed — which we describe next. The only case left to discuss is the one in which  did not originate at : in this scenario,  is blocked until  final commits. We discuss this scenario in the following (i.e.,  is final committed).
+
+•
+ is local committed: if the  timestamp of  is larger than ,  is aborted, which contradicts the assumption. Otherwise, if  originated at ,  pre-commits a new version of  and a dependence is added from  to . When  final commits two cases are possible: (i) if  is larger than ,  will be aborted — leading to contradicting the assumption; (ii) if  is larger than , according to Algorithm 1 line 19 and 34,  will final commit with an  that is at least . Therefore,  will be necessarily different from , which also contradicts the assumption.
+
+•
+ is final committed: if  is larger than ,  will be aborted; otherwise, by the same argument used for the previous case ( is local committed),  and  will not be attributed the same . In both cases, we obtain a contradiction. □
+
+Theorem 2
+
+SPSI-2: At each node, the final and speculative committed versions of each data item are totally ordered.
+
+Proof
+
+We also prove SPSI-2 by contradiction. Specifically, we assume that at a node , which replicates key , two transactions  and  update , and consider the following three scenarios in which SPSI-2 would be violated: (1) both  and  local commit, producing two versions of  with the same , (2)  final commits a version with timestamp , whereas  local commits with a timestamp , such that , and (3) both  and  final commit, producing two versions of  with the same . Note that the last case stands for a contradiction of SPSI-1, which we have already proven to be impossible. As such, here we focus on proving the impossibility of the first two cases.
+
+We start by considering the first case. In this case, without loss of generality, we assume that at node , transaction  enters the prepared state before  does. At the time in which  requests to prepare on , the version of key  produced by , noted , can be in two possible states:
+
+•
+ is pre-committed: in this case, if  is smaller than the pre-commit timestamp of ,  is immediately aborted, contradicting the assumption that  local commits. Otherwise,  will be blocked until  local commits — a case that we describe next.
+
+•
+ is local committed: if the  timestamp of  is larger than ,  is aborted, which contradicts the assumption. Otherwise, according to Algorithm 1 line 19 and 22,  will local commit with an  that is at least  and, therefore, necessarily different from  — also contradicting the assumption.
+
+Next, we discuss the case when  final commits with timestamp  and  local commits with timestamp , where . There are two possible sub-cases here: either  prepares before  does, or, vice versa,  prepares before  doers.
+
+If  prepares before  does, then when  tries to prepare on , the version created by , namely , can be in pre-committed or local committed state. By using the same argument employed to exclude the possibility that  and  can ever local commit with the same , it is possible to show that, in this sub-case,  either aborts, or final commits with a timestamp larger than ’s . Thus, this sub-case is not possible.
+
+Let us finally consider the sub-case in which  prepares before  does. When  tries to prepare at ,  can be in three possible states. We have already discussed the scenarios in which  is in pre-committed or local committed state, when  attempts to prepare. Thus, here, we only discuss the case in which  is final committed. If  is larger than ,  will be aborted; otherwise, according to Algorithm 1 line 19 and 21,  will obtain a pre-commit timestamp at least as large as , and since we are assuming that  and considering that  it follows that than . Hence, we obtain a contradiction.  □
+
+Theorem 3
+
+SPSI-3. (Transactions read consistent speculative snapshots) A transaction  originated at a node  with snapshot time  must observe the most recent versions created by transactions that (i) final commit with timestamp  (independently of the node where these transactions originated), and (ii) local commit with timestamp  and originated at node .
+
+Proof
+
+We prove SPSI-3 by contradiction. Assume there are two transaction  and : at time ,  creates, through local/final commit, a version of  denoted as , which is the most recent version that is ever going to be local/final committed with ; however, at time ,  reads  but does not observe . We discuss the case in which  is local or final committed separately.
+
+In case  is local committed,  can be local committed either no later than, or after  reads , namely either  or . In the former case, when  reads ,  must be local committed already; in the latter case,  can either be non-existent or pre-committed. We discuss all these three cases below:
+
+•
+non-existent: in this case,  reads the current latest version of , which is different from , and also updates the  of , causing any later transaction updating  (including ) to local/final commit with a timestamp at least . This contradicts the assumption that  is the most recent version ever going to be local/final committed with .
+
+•
+pre-committed: in this case,  will be blocked and it will be unblocked when  local commits, which we will discuss below.
+
+•
+local committed: in this case, if  is indeed the most recent version below , according to the read rule,  will fetch the most recent version below its snapshot, i.e. . This contradicts the assumption that  misses .
+
+Next, we consider the case that  is a final committed version. When  reads ,  can be non-existent, or in pre-committed, local committed (if  is a local transaction) or final committed state. As the above three states have already been discussed above, let us only discuss the case that  is in final committed state. Basically, if  is the latest version below , by the same argument used for the previous case (local committed state),  will read , contradicting the assumption that  will miss .  □
+
+Theorem 4
+
+SPSI-4. (No Write–Write Conflicts among Final Committed Transactions) The write-sets of any final committed concurrent transactions must be disjoint.
+
+Proof
+
+By contradiction, we assume two concurrent conflicting transactions  and  both update a key  and final commit. Without loss of generality, we assume that .
+
+To final commit, both  and  have to prepare on all replicas of . Assume  is a node that replicates . We first consider the case that  prepares on  before  does so. In this scenario, when  requests to prepare  on , the version of  created by  may be in the following states:
+
+•
+pre-committed: in this case, since , ’s certification check on  will fail, causing  to abort, which contradicts the assumption.
+
+•
+local committed:  may be local committed at , which implies that  originated at . In that case, if , T2 will be aborted. Otherwise, if  was not originated at ,  will be blocked until  final commits — a case that we discuss next. If  was originated at  and ,  will be prepared and a dependence is added from  to  (line 38 of Algorithm 2). Eventually when  final commits, since we have assumed that ,  will be aborted (line 49 of Algorithm 1).
+
+•
+final committed: as ,  will fail to prepare on  and abort, which contradicts the assumption.
+
+Now let us consider the case in which  prepares  on  before  does. Note that according to lines 19 and 21 of Algorithm 1, the  and  of  will all be at least as large as , which is larger than . Therefore, when  tries to prepare  on , no matter in which state the version created by  is, according to lines 30 of Algorithm 2,  will always be aborted. This contradicts the assumption that  final commits.  □
+
+Theorem 5
+
+SPSI-5. (No Write–Write Conflicts among Transactions in a Speculative Snapshot) Let S be the set of transactions included in a snapshot. The write-sets of any concurrent transactions in S must be disjoint.
+
+Proof
+
+We prove this property by contradiction, assuming that there exists a transaction  whose snapshot includes two concurrent transactions,  and , such that  and  have a write–write conflict on a key . We note that a necessary condition in order for  to include in its snapshot any other transaction , is that  must be either final committed or local committed. Thus, in the following we shall only analyze all possible scenarios in which  and  are either final or local committed and show that, by no means,  can include both of them in its snapshot.
+
+ and  are both final committed. This is not possible, since SPSI-4 guarantees that if two concurrent transactions have write–write conflicts, they cannot be both final committed. A contradiction.
+
+ and  are both local committed. In this case, in order for  and  to be both included in ’s snapshot,  and  must be originated at the same node as , say node . Assume, without loss of generality, that at node , transaction  enters the prepared state before  does. At the time in which  requests to prepare on , the version of key  produced by , noted , can be in two possible states:
+
+•
+ is pre-committed: in this case, if  is smaller than the pre-commit timestamp of ,  is immediately aborted (lines 30 of Algorithm 2), contradicting the assumption that  local commits. Otherwise,  will be blocked until  local commits — a case that we describe next.
+
+•
+ is local committed: since we are assuming that  pre-commits before  does,  can only succeed in pre-committing if  — else, T2 would abort in lines 30 of Algorithm 2. However, this implies that T2 is not concurrent with T1, yielding a contradiction.
+
+ is local committed and  is final committed, or vice versa: without loss of generality, we assume  is local committed and  is final committed. We note that  should be originated at the same node as , which we denote as , in order for ’s local committed versions to be readable by .
+
+We shall consider two scenarios: (1)  is replicated by , and (2)  is not replicated by . We discuss both scenarios in the following.
+
+ is replicated by .
+
+Since we assume that  final commits, this implies that  must be prepared on all replicas of , including .
+
+We show next that  cannot be a master replica of . Assume by contradiction that  is the master replica of . In this case, if  prepares after  on ,  would be aborted (lines 30 of Algorithm 2) when it requests to pre-commit at  — a contradiction, since  is assumed to final commit. If, conversely,  prepares before  on , then  will be aborted at  when it tries to pre-commit — another contradiction, since  is assumed to local commit on , which is only possible if  successfully pre-commits on .
+
+Let us now assume that  is a slave replica of . There are two possible scenarios here:  includes in its snapshot first  and then , or vice versa. We first consider the case in which  include in its snapshot first  and then . In this case, when  reads, directly or indirectly, from ,  must have already been prepared on all replicas of , including  — a necessarily condition for  to final commit. We analyze two sub-cases, which correspond to the scenarios in which  attempts local commits on  before  prepares on , and vice versa.
+
+(1)
+If  local commits on  before  prepares on , according to Algorithm 2 line 12, since  and  have a conflict on , when  receives from the master replica of  the request to replicate ’s pre-committed version of ,  would aborts .
+
+(2)
+If  prepares on  before  is local committed on , then, since  conflicts with ,  will fail to pre-commit on .
+
+In both cases, we obtain a contradiction.
+
+Next, let us consider the case in which  includes in its snapshot first  and then . This implies that, before  includes  in its snapshot,  must be pre-committed on . In order for  to later include  in its snapshot,  must have been replicated on  (as already discussed, this is a necessary condition for  to final commit). When this happens, though,  and  are aborted at , before ’s pre-committed versions are installed. This happens since  and  conflict and since  has read from , either directly or indirectly (see line 12 of Algorithm 2 and lines 52–55 of Algorithm 1). Therefore,  is guaranteed to abort before  final commits. This contradicts our assumption that  includes in its snapshot both  and .
+
+ is not replicated by .
+
+Let us consider the moment when  includes both  and  into its snapshot. At this point in time, the following inequations must hold:
+
+(1) min_value(T.OLCSet)  T.FFC, since  has read, either directly or indirectly, from both  and , i.e.,  did not block when executing line 15 of Algorithm 1.
+
+(2) min_value(T1.OLCSet)  T1.ST, because  updated a non-local key (Algorithm 1 line 26),
+
+(3) T.FFC  T2.FC, because  has read, either directly or indirectly, from the final committed transaction . Thus,  is necessarily larger than ’s final commit timestamp (Algorithm 1 line 14), and
+
+(4) min_value(T1.OLCSet)  min_value(T.OLCSet), since  has read, either directly or indirectly, from . Thus, the smallest timestamp included in  is necessarily larger than the smallest timestamp in T1.OLCSet (Algorithm 1 line 10).
+
+By combining the above inequations, we can conclude that . This implies that  and  are not concurrent which contradicts the assumption.  □
+
+Theorem 6
+
+SPSI-6. (No Dependencies from Uncommitted Transactions) A transaction can only be final committed if it does not depend on any non-final committed transaction.
+
+Proof
+
+As shown in Algorithm 1 lines 40–55, a transaction  can only be final committed when all the transactions it depends on have final committed (with a smaller  timestamp than ’s  timestamp); when a transaction aborts, it aborts all transactions that depend on it. As such, a transaction can never commit if it still depends on any uncommitted transaction.  □
+
+6.2. Liveness
+This section is devote to analyzing the liveness of STR and, more precisely, to prove that in a failure free execution transactions will either abort or commit after a finite amount of time (refer to Section 5.6 for a discussion on how to handle failure scenarios).
+
+In Algorithm 1, we can see that during its execution, a transaction  can only be blocked in the following four scenarios:
+
+S1.
+when  reads a key for which a pre-committed or a remote local-committed version exists that may be final committed with a smaller timestamp than  (lines 9 and 13 of Algorithm 1).
+
+S2.
+when  reads a key for which a local or final committed version exists, whose creating transaction may conflict with another final or local committed transaction  has previously read from, i.e. the FFC of  is larger than the minimum value in its OLCSet (line 15 of Algorithm 1).
+
+S3.
+while executing its certification phase (line 32 and 37 of Algorithm 1).
+
+S4.
+while waiting for resolving any of its speculative dependencies, which are developed whenever  reads a local committed transaction (line 33 of Algorithm 1).
+
+We inspect these scenarios in the following, and show that  can never be blocked indefinitely.
+
+S1. The blocking statements in both lines 9 and 13 of Algorithm 1 are rooted to line 26 of Algorithm 2. This blocking condition occurs in two cases: (i) if  attempts to read a version in pre-committed or local committed state that was created by a transaction  originated on a different node than ; (ii) if  attempts to read a version in pre-committed state that was created by a transaction . In both cases,  is executing its certification phase and, as we will discuss later (scenarios S3 and S4),  will eventually final commit or abort, unblocking .
+
+S2.  blocks in line 15 of Algorithm 1 if its updated  (reflecting the reading of the version returned by the readFrom() method) is larger than . This implies that there must exist one or more unsafe transactions in the  of  whose  is smaller than the  of . However, such unsafe transactions must be in local committed state, which implies that they are executing their certification phase and, as we shall discuss in scenarios S3 and S4, they will eventually abort or final commit and remove themselves from the  of . As a result, eventually,  will be unblocked.
+
+S3. During the execution of ’s (local or global) certification phase, a partition may delay replying to ’s certification request if a key that  tries to prepare has already been prepared or local committed by another transaction (line 34 and 36 of Algorithm 2).
+
+Assume, by contradiction that  is blocked indefinitely due to the existence of a cycle in the transactions’ wait-for graph [5] composed by a set of transactions , , , , , where , such that: (P1) transaction  is blocked by transaction , given that  is attempting to prepare a key that was already prepared or local committed by , and (P2)  is blocked by , for analogous reasons (recall that ). However, according to line 30 of Algorithm 2, a transaction  can only be blocked by a transaction  if either ¿ or ¿ hold (else  is aborted).
+
+Considering that the  of a transaction is necessarily larger than the its  (line 22 of Algorithm 1), property P1 implies that: and, since the  of a transaction is necessarily smaller than its , we obtain that . However, for property P2 to hold, it must be: . Hence, we obtain a contradiction and the proof follows.
+
+S4. So far we have proved that  cannot be indefinitely blocked while reading or while executing its certification phase. It remains to prove that  does not block indefinitely because of some unresolved dependency (line 33 of Algorithm 1). Let us assume, by contradiction, that  reads speculatively from a local committed transaction  and that  never final commits or aborts.
+
+Let us assume, without loss of generality, that there exists a series of dependent transactions , , , , , , such that transaction  depends on (i.e., it has read a version local committed by) transaction , where we have denoted with  and ,  and , respectively. Since a transaction can only speculatively read from another local committed transaction if the  of the former is larger than the  of the latter, and since the  of a transaction is necessarily larger than its own , it follows that the above series of dependent transactions cannot be cyclic. Thus, the first transaction in the series, namely , cannot have any speculative dependency and, as such, it will eventually commit or abort – based on the above arguments for scenarios S1, S2 and S3 – and will eventually unblock , which in its turn will unblock the next transaction in the series and so forth, until eventually unblocking .
+
+7. Ensuring real-time ordering and serializability
+7.1. Real-time ordering
+SPSI extends the SI specification introduced by Pedone et al. [15] and both specifications, as discussed in Section 4, do not impose real-time ordering, i.e., they do not guarantees that:
+
+•
+ If a transaction commits at real time t, its effects must be visible to any transaction starting after real time t.
+
+In fact, according to property SI-2, transactions determine their snapshots using the physical clock of their originating node. Since we assume physical clocks be possibly subject to arbitrary skews, it follows that a version committed by transaction  at real-time  may be missed by a transaction  starting at real-time  if, due to clock skews, the snapshot time () of  is smaller than the final commit timestamp () attributed to . We note that this sort of anomaly, illustrated also in Fig. 4(a), affects not only STR, but also various other recent systems that adopt the same (or a similar) SI definition, e.g., [10], [11], [41].
+
+In the following, we shall discuss how to extend STR to rule out this type of anomaly and ensure . While there exist several approaches to enforce RTO for transactional protocols [9], [24], here we show how to integrate in STR the technique proposed by Spanner [9], which we call delayed commit.
+
+
+Download : Download high-res image (160KB)
+Download : Download full-size image
+Fig. 4. Exemplifying how real-time ordering can be violated (a), and how commit delay can avoid the problem (b).  and  denote two nodes;  and  denote two transactions; arrowed lines denote the progress of time.
+
+7.1.1. Delayed commit
+We integrate the approach employed by Spanner [9] to ensure real-time order, which achieves so by delaying the commit operation of transactions, after having attributed their commit timestamp. Specifically, assume that the upper bound of clock skew across system nodes is  and the commit timestamp of a transaction is : a node can only commit that transaction when its physical clock has passed . Additionally, visibility of committed versions is prevented during the delayed commit phase: this is achieved by delaying by  time units the sending of the final commit messages at the transaction coordinator, which has the effect of extending the effective duration of the pre-commit locks by .
+
+Fig. 4 illustrates how this technique can be used to avoid violating real-time order. In Fig. 4(a), although  starts after  commits in real-time, due to clock skew,  is assigned snapshot time () 100 at its origin node (), whereas  is attributed a final commit timestamp equal to . As such, if  reads item , which was modified by ,  will miss ’s updated version, violating real-time order. By applying the commit delay technique (Fig. 4(b)),  only finalizes the commit of  (i.e., sending of the final commit messages to involved partitions and returning from the commit request issued by the application) after its local clock is larger than  (120). This way,  and  become concurrent transactions and are freed from any real-time ordering constraint — hence, it becomes legal for  to “miss” the version produced by . This approach essentially delays the commit of a transaction  long enough to guarantee the following key property:
+
+•
+ Any transaction that starts in real-time after the commit of  obtains a snapshot timestamp larger than the commit timestamp attributed to .
+
+In other words, transactions that start after  commits in real-time and that, due to clock skews, may possibly miss ’s updates are guaranteed to become concurrent with .
+
+7.1.2. How to integrate with STR
+Integrating the delayed commit technique into STR would be relatively straightforward. This technique, in fact, implies simply injecting a delay before line 44 of Algorithm 1, namely after having established the final commit timestamp () and determined whether any local, dependent transaction should be aborted.
+
+7.1.3. Impact on correctness
+We first discuss why introducing the delayed commit mechanism in STR does not compromise its correctness with respect to the SPSI’s specification. Next we discuss why its use would ensure .
+
+SPSI. The delayed commit technique is equivalent to assume that the execution of line 34 of Algorithm 1 is delayed by  time units. However, as discussed in Section 3, our system model assumes no bound on the relative speed of processes, so incorporating this technique into the presented protocol would not endanger its correctness with respect to the SPSI’s specification.
+
+. We start by noting that the integration of delayed commit in STR would allow, just like in Spanner, to ensure property . Let us now discuss the case of non-speculative and speculative reads, separately:
+
+•
+non-speculative reads: non-speculative reads, in STR, use the same visibility logic as in Spanner (a transaction’s read returns the most recent version tagged with a commit timestamp smaller than its snapshot timestamp). Since the use of delayed commit ensures  also in STR, it follows that a transaction starting at time  and reading non-speculatively committed data item  cannot miss any version final committed by a transaction by time  — thus, ensuring .
+
+•
+speculative reads: Through the use of speculative reads, it is possible for a transaction T to read local committed data versions, which will only be final committed (unless the creating transaction is aborted due to misspeculation) after the start of . However,  only requires that the effects of the transactions committed by real time  are visible to transactions starting after time , but does not preclude transactions from observing the effects of transactions that do commit after real time .
+
+7.1.4. Impact on the effectiveness of speculation
+In STR speculation can fail only in two scenarios: (i) speculative reads return a version locally committed by a transaction that eventually commits with a final commit timestamp () larger than the snapshot timestamp () of the reading transaction, or (ii) speculative reads return a version locally committed by a transaction that eventually aborts due to either contention or to case (i). We note that, since delayed commit does not increase the final commit timestamps of transactions, it does not affect the chance that speculation will fail due to case (i). The likelihood of transactions’ aborts due to contention, however, may increase as a consequence of the increase in the duration of the pre-commit locks caused by the delayed commit mechanism. On the one hand, this implies that, in contention-prone workloads, the use of the delayed commit technique may reduce the effectiveness of speculative reads, i.e., increase the likelihood that speculation will lead to transactions’ aborts. On the other hand, though, when speculation does succeed, e.g., in low-contentions scenarios, the performance gains achievable through speculation are expected to be amplified: via the use of speculative reads, in fact, it is possible to bypass the wait for pre-commit locks held by concurrent transactions, whose duration is amplified by the delayed commit mechanism.
+
+7.2. Serializability
+Section Section 6 has described how STR ensures SPSI, a consistency criterion that extends SI to provide additional correctness guarantees regarding the speculative execution of transactions. Although SI has been widely adopted and is deemed as sufficient for many applications, it is known to allow for non-serializable executions [4] that may endanger correctness in certain scenarios. Since SPSI imposes the same restrictions as SI on non-speculative executions, i.e., on transactions that final commit, it follows that SPSI admits the same type of well-studied anomaly that also affects SI. This anomaly, which is often referred to as write skew, is illustrated in Fig. 5, where two concurrent transactions withdraw from a person’s saving and credit account, respectively, provided that the total balance after the withdrawal does not become negative. Since these two transactions do not generate any write–write conflict, when using either SI or SPSI, both transactions can commit, breaking the application’s invariant that imposes the total balance to never go negative.
+
+In the following, we discuss how to extend STR to ensure serializability. In the literature there exists a number of works that investigated how to ensure serializability on top of database systems that provide SI via the use of middleware/application-level solutions (e.g., the acquisition of additional locks [17] or the detection of specific conflict patterns [7]) that do not requiring any change to the underlying SI-compliant DBMS. We note that those solutions may be adaptable, at least in principle, to operate also in a partially-replicated distributed settings with loosely synchronized clocks, i.e., the deployment scenario targeted by STR. However, we argue that serializability may be attained in a simpler way by introducing a relatively straightforward alteration to the certification logic employed by STR.
+
+Basically, instead of checking whether transactions have only generated Write–Write conflicts during (both local and global) certification, it is necessary to further check whether transactions have incurred any read–write conflict, i.e. whether the read-set of the transaction being certified has been invalidated by the commit of a concurrent transaction. More specifically, when certifying, both locally and globally, a transaction , the following additional check should be performed: for every key in ’s read-set, the timestamp of the most recently final or local committed version must be smaller than or equal to the snapshot timestamp of . If this is not the case, the transaction should be aborted. It is easy to see that this technique would avoid the problem illustrated in Fig. 5: as  and  develop read–write conflicts, only one of the two would pass validation and be committed.
+
+Nevertheless, note that this mechanism requires tracking the read sets of transactions in order to enable the detection of read–write conflicts. This may introduce a significant performance penalty especially for update transactions that perform a large number of reads, e.g., range scans.
+
+8. Evaluation
+This section presents an extensive experimental study aimed at answering the following key questions:
+
+1.
+What performance gains can be achieved by STR by allowing transactions to speculatively read pre-committed data?
+
+2.
+How does STR compare with systems, like PLANET [34], which employ external speculation techniques and that, unlike STR, require programmers to develop compensation logics to deal with possible misspeculations?
+
+3.
+Which workload characteristics have the strongest impact on the performance of STR?
+
+4.
+How relevant is the Precise Clocks technique, when used in conjunction with both speculative and non-speculative protocols?
+
+5.
+How effective is STR’s self-tuning mechanism to ensure robust performance in presence of workloads that are not favorable to speculative techniques?
+
+Baselines. The first baseline protocol we consider is Clock-SI [11], which we extended to support replication, as explained in Section 5.1. We refer to this protocol as ClockSI-Rep. ClockSI-Rep is representative of state of the art transactional protocols based on decentralized physical clocks and it provides Snapshot Isolation, namely the consistency guarantee that SPSI extends to accommodate speculation. Thus, ClockSI-Rep is an appropriate baseline to evaluate the performance gains achievable by STR thanks to the use of speculative reads and Precise Clocks.
+
+The second baseline we consider is representative of recent approaches [20], [23], [34] that propose programming models aimed to support external speculation techniques (in contrast to STR’s internal/transparent speculation), i.e., exposing uncommitted results to clients. Supporting it comes at the cost of extra complexity for the programmers, who are forced to identify the possible concurrency anomalies that may affect their programs and develop the corresponding compensation logics (which is not needed for STR). We build this baseline, which we call Ext-Spec, by developing a variant of ClockSI-Rep that externalizes to client the results of a transaction, once it passes its local certification phase and is still undergoing its global certification phase. Note that no compensation logic is executed when using Ext-Spec: this is done for simplicity and since in the considered benchmarks, speculation can lead only to the production of incorrect replies to clients, but does not compromise the internal consistency of the server-side of the application. It should be noted that this choice actually favors Ext-Spec, as it spares this baseline from the additional overheads associated with the execution of potentially complex compensation logic.
+
+Since Ext-Spec and ClockSI-Rep share the same (distributed) concurrency control mechanism, as we will see, they deliver very similar peak throughput, final latency and abort rate. However, Ext-Spec’s use of external speculation can reduce speculative (but not final) latency, with respect to ClockSI-Rep.
+
+Finally, our evaluation is focused on evaluating performance in absence of failures. Thus neither STR, nor the baselines used in this study, implement the additional fault-tolerance mechanisms discussed in Section 5.6.
+
+Experimental setup. We implemented the baseline protocols and STR in Erlang, based on Antidote,2 an open-source platform for evaluating distributed consistency protocols (such as the one in [1]). More precisely, the in-memory backend of Antidote (which provides a key–value store interface) has been extended to develop fully-fledged prototypal implementations of STR and of the aforementioned baselines. The code of all protocols used in this study is publicly accessible at https://github.com/marsleezm/STR.
+
+Our experimental testbed is deployed across nine DCs of Amazon EC2 (spanning over 4 continents), each of which consists of three m4.large instances. We use a replication factor of six, so each partition has six replicas, and each instance holds one master replica of a partition and slave replicas of five other partitions. These settings ensure that only a small fraction (less than ¡5%) of reads target remote partition. This choice allows us to evaluate the gains that stem from accelerating the commit phase using speculation techniques, which is the problem that STR aims at tackling. In fact, in scenarios with low locality/lots of remote reads, we expect the gains from STR to decrease, as STR does not allow transactions to speculatively read remote data items that are being updated so the relative benefit of STR will decrease. Further, we argue that in realistic settings, it is desirable to optimize data partitioning schemes to minimize the frequency of remote reads and avoid incurring high latency both during transaction execution – due to the need for fetching remote data upon reads – and in the commit phase — else, a large number of geo-distributed servers would have to be involved in the 2PC protocol.
+
+Load is injected by spawning one thread per emulated client in some node of the system. Each client issues transactions to a pool of local transaction coordinators and retries a transaction if it gets aborted. We use two metrics to evaluate latency: the final latency of a transaction is calculated as the time elapsed since its first activation until its final commit (including possible aborts and retries); for Ext-Spec, we report also the speculative latency, which is defined as the time since the first activation of a transaction until its last speculative commit, i.e., the one after which it is final committed. Besides reporting abort rate, for Ext-Spec we also report the rate of external misspeculation, i.e., the percentage of transactions that were speculatively committed but finally aborted triggering the activation of some compensation logic (which we do not implement in this study, for simplicity). Each reported result is obtained from the average of at least three runs. As the standard deviations are low, we omit reporting them in the plots to enhance readability.
+
+Unless otherwise specified, STR uses the self-tuning mechanism described in  Section 5.5 to enable and disable the use of internal speculation. The self-tuning process gathers throughput measurements with a 10 s frequency. The reported results for STR refer to the final configuration identified by the self-tuning process.
+
+8.1. Synthetic workloads
+Let us start by considering a synthetic benchmark, which allows for generating workloads with precisely identifiable and very heterogeneous characteristics. The synthetic benchmark generates transactions with zero “think time”, i.e., client threads issue a new transaction as soon as the previous one is final committed.
+
+Transaction and data access. Each node in the system hosts a single partition for which it serves as the master replica, yielding a total of 27 distinct partitions. Each node also serves as slave replicas for 5 additional partitions.
+
+Each data partition has two million keys that are logically subdivided into two regions, called local and remote regions, where each region contains one million keys. The first region is only accessed by locally originated transactions, and the second region is only accessed by transactions that originate at a different node. Within each of these regions, we assume the existence of a “hotspot”, i.e., a relatively small set of keys that have a higher probability of being accessed, and we adjust the size of the hotspot to control contention rate. This allows adjusting in an independent way the likelihood of contention among transactions initiated by the same local node (local contention) and among transactions originated at remote nodes (remote contention), as we will detail, shortly.
+
+A transaction reads and updates 10 keys, which are all selected from partitions for the originating node serves as either master or slave replica. 80% of the accesses of a transaction target the partition for which the originating node is the master replica of. The remaining 20% of the accesses target some partition for which the originating node serves as a slave replica. For the sake of brevity, we refer to the former partitions as master partitions and to the latter ones as slave partitions. Once a transaction has determined whether to target a master/slave partition, it accesses with 10% of probability the hotspot of the corresponding local/remote region, respectively.
+
+We consider two workloads,3 which we obtain by varying the size of the hotspot sizes in the master and slave data partitions in order to synthesize two extreme scenarios:
+
+1.
+a workload, noted Synth-A, which generates very high local contention, by configuring the hot spots of master partitions to contain only a single key, but very low remote contention, by configuring the hot spot of slave partitions to contain 800 keys. Due to the high likelihood of local contention, transactions are very likely to speculatively read versions that were local committed by some concurrent local transaction. Since remote contention is very low, though, internal speculation is very likely to succeed.
+
+2.
+a workload, noted Synth-B, which has both very high local and remote contention, by using 10, resp. 3, keys in the hot spots of local, resp. remote, partitions. Like in workload Synth-A, transactions frequently use speculative reads, but, in this case, internal speculation is almost certainly doomed to fail due to the high remote contention.
+
+Synth-A. Fig. 6.(a) clearly highlights the potential benefits that internal speculation can provide in favorable workload conditions. Both ClockSI-Rep and Ext-Spec fail to achieve any scalability and thrash, due to high abort rates (see middle plot), as soon as the degree of concurrency in the system grows to more than 2 clients. Conversely, STR scales almost linearly up to 20 clients and throughput saturates only at around 40 clients, achieving a 11.5 gain with respect to both baselines (which achieve very similar throughput levels). Also, the abort rate of STR is significantly lower than for the two baseline protocols. This is explicable considering that, with the baselines, any transaction  that read a key pre-committed by some concurrent transaction  is forced to block; when  commits, it is very likely that  generates a commit timestamp larger the read snapshot of , which causes  to abort. In the same scenario, though, STR would allow  to speculatively read from ; also, the commit timestamp attributed to  by Precise Clocks is likely to be smaller in absolute terms, and, with a higher probability than for the baselines, also smaller than the read timestamp of . In this case, STR spares  from aborting, as well as from blocking — this allows STR not only to minimize the wasted work due to transactions’ rollbacks, but also to enhance the degree of parallelism sustainable by the system.
+
+It should be noted that since local contention dominates in this workload, most of the aborts occur during the local certification phase of transactions. Also, if transactions pass local certification, they are likely to avoid conflicts with remote transactions and, hence, commit with high probability. These considerations explain why Ext-Spec incurs an abort rate that is very similar to the one of ClockSI-Rep and to incur a very small external misspeculation rate.
+
+As for the latency, the bottom plot shows about one order magnitude smaller final latency for STR compared to the baselines with more than 2 clients. This is due to the fact that both ClockSI-Rep and Ext-Spec are thrashing due to high contention in this load range. For analogous reasons, the speculative latency of Ext-Spec is only lower than the final latency of STR at very low load (2 clients), where the abort rate is still relatively low.
+
+Synth-B. Fig. 6.(b) shows that, even in such an unfavorable workload for internal speculation, STR can provide robust performance that is at par with the baseline protocols. Thanks to its self-tuning capabilities, in fact, STR automatically disables the use of speculative reads for 30 or more clients, which correspond to load levels in which internal speculation has an adverse effect on performance.
+
+This is illustrated in Fig. 7, which reports the performance achieved by STR when statically configured to enable or disable speculative reads, as well as when using the self-tuning mechanism to select between these two configurations. More in detail, the -axis of this figure reports the throughput of each variant of STR normalized with respect to the throughput of the variant that achieves best performance for the considered workload and number of clients (on the x-axis).
+
+By Fig. 7, we can observe that, indeed, the use of speculative reads reduces throughput by around 40% in workload Synth-B with 40 clients and that the proposed self-tuning scheme can correctly identify the optimal configuration. By this plot, we can also observe that the choice of enabling/disabling internal speculation is not only affected by the workload type – as expected, speculative reads are beneficial in Synth-A but they are not in Synth-B – but also by the level load, fixed a given workload – speculative reads do not actually penalize throughput in Synth-B with 2 clients. Moreover, Fig. 7 shows that without enabling speculative techniques, STR achieves similar throughput as the non-speculative baseline. This represents an experimental evidence supporting the efficiency of the proposed mechanism.
+
+
+Table 1. Normalized throughput/abort rate of different techniques, varying the number of keys updated by a transaction. Physical/Precise denotes the use of Physical Clocks/Precise Clocks; SR denotes that speculative reads are enabled. Throughputs reported in each column are normalized according to the throughput of ‘Physical’ in that column.
+
+Techniques	# of keys
+10	20	40	100
+Physical	1/59%	1/60%	1/60%	1/72%
+Precise	1.07/38%	1.07/38%	1.1/35%	1.41/48%
+Physical SR	0.68/84%	0.57/83%	0.59/77%	0.97/75%
+Precise SR	1.22/47%	1.21/44%	1.31/36%	1.59/49%
+
+Download : Download high-res image (634KB)
+Download : Download full-size image
+Fig. 6. The performance of different protocols for two synthetic workloads, representative of a favorable (Synth-A) and an unfavorable (Synth-B) scenario for internal speculation. In the latency plot, we use solid lines for final latency and dashed lines for speculative latency; in the abort rate plot, we report total abort rate with solid lines and misspeculation rate with dashed lines.
+
+Benefits and overhead of Precise Clocks. This experiment aims at quantifying the benefits stemming from the use of the Precise Clocks mechanism, when used in conjunction with both speculative and non-speculative protocols. To this end, in Table 1, we consider four alternative systems obtained by considering ClockSI-Rep (noted Physical) and extending it to use Precise Clocks (noted Precise) and/or speculative reads (noted SR). In this study we vary the transactions’ duration, and hence the corresponding abort cost, by varying the number of keys updated by a transaction. In order to maintain the contention level stable, when we increase the number of keys accessed by transactions, we accordingly increase the key space by the same factor.
+
+
+Download : Download high-res image (189KB)
+Download : Download full-size image
+Fig. 7. Normalized throughput with respect to the best performing static configuration. No SR/SR denote enabling/disabling statically speculative reads in STR; Auto denotes the use of the self-tuning technique presented in Section 5.5.
+
+
+Download : Download high-res image (618KB)
+Download : Download full-size image
+Fig. 8. The performance of different protocols for three TPC-C workloads. In the latency plot, we use solid lines for final latency and dashed lines for speculative latency; in the abort rate plot, we report total abort rate with solid lines and misspeculation rate with dashed lines.
+
+Table 1 shows that Precise Clocks significantly reduces abort rate and can achieve as much as 38% of throughput gain over Physical Clock for a non-speculative protocol. Generally, the more keys transactions update, the larger is the abort cost and the larger the throughput gain achieved by Precise Clocks. Another interesting result is that enabling speculative reads with Physical Clock actually has negative effects on abort rate and throughput. In fact, as we have discussed in 5.3, physical clock based protocols, like Clock-SI or Spanner [9], [11], tend to generate large commit timestamp, which reduces the chances that speculative reads succeed. Finally, the collective use of Precise Clocks and speculative reads results in the best throughput gain (59% for transactions updating 100 keys).
+
+We also assessed the additional storage overhead introduced by the use of Precise Clocks, which, we recall, requires maintaining additional metadata (a timestamp) for each accessed key. Our measurement shows that for the TPC-C and RUBiS benchmarks (Section 8.2), Precise Clocks requires about 9% of extra storage.
+
+8.2. Macro benchmarks
+Next, we evaluate the performance of STR by implementing two realistic benchmarks, namely TPC-C.4 and RUBiS5 Unlike the previous synthetic benchmarks, TPC-C and RUBiS specify several seconds of “think time” between consecutive operations issued by a client. Hence, we need to use a much larger client population to saturate the system.
+
+TPC-C. Our TPC-C workload consists of three representative transactions: the payment transaction, which has very high local contention and low remote contention; new-order transaction, which has low local contention and high remote contention; and order-status, a read-only transaction. We consider three workload mixes: 5% new-order, 83% payment and 12% order-status (TPC-C A, Fig. 8.(a)); 45% new-order, 43% payment and 12% order-status (TPC-C B, Fig. 8.(b)) and 5% new-order, 43% payment and 52% order-status (TPC-C C, Fig. 8.(c)). Each server is the master replica of five warehouses.
+
+Fig. 8 shows that speculative reads bring significant throughput gains, as all three workloads have high degree of local contention. Compared with the baseline protocols (ClockSI-Rep and Ext-Spec), STR achieves significant speedup especially for the TPC-C A (6.13), which has the highest degree of local contention due to having large proportion of payment transaction. For TPC-C B and TPC-C C, STR achieve 2.12 and 3 of speedup respectively. We see that the use of external speculation in this case barely brings any improvement on throughput over ClockSI-Rep. We also observe that the use of external speculation can significantly reduce the (speculative) latency perceived by clients, but only in low load conditions. This can be explained by looking at the abort rate plots, which clearly show that, as load increases, the likelihood that external speculation is successful quickly decreases.
+
+In fact, with larger number of clients (more than 1000 clients per server), the latency of Ext-Spec and ClockSI-Rep is on the order of 5–8 s, as a consequence of the high abort rate incurred by these protocols. Conversely, STR still delivers a latency of a few hundred milliseconds.
+
+RUBiS. RUBiS models an online bidding system and encompasses 26 types of transactions, five of which are update transactions. RUBiS is designed to run on top of a SQL database, so we performed the following modifications to adapt it to STR’s key–value store data model: (i) we horizontally partitioned database tables across nodes, so that each node contains an equal portion of data of each table; (ii) we created a local index for each table shard, so that some insertion operations that require a unique ID can obtain the ID locally (instead of updating a table index shared by all shards by default). We run RUBiS’s 15% update default workload and use its default think time (from 2 to 10 s for different transactions).
+
+Also with this benchmark (see Fig. 9) STR achieves remarkable throughput gains and latency reduction. With 4000 clients (level at which we hit the memory limit and were unable to load more clients), STR achieves about 43% higher throughput. The final latency gains of STR over the considered baselines extend up to 10 latency reduction over ClockSI-Rep and Ext-Spec. Also in this case, external speculation is effective in reducing speculative latency only at very low load levels, before loosing effectiveness and collapsing to the same performance of ClockSI-Rep.
+
+9. Conclusion and future work
+This paper proposes STR, an innovative protocol that exploits speculative techniques to boost the performance of distributed transactions in geo-replicated settings. STR is based on a novel consistency criterion, which we call SPeculative Snapshot Isolation (SPSI). SPSI extends the familiar SI criterion and shelters programmers from subtle anomalies that can arise when adopting speculative transaction processing techniques. Furthermore, using STR requires no source-code modification, and for both of these reasons it is fully transparent to programmers.
+
+STR builds on recent, highly scalable transactional protocols based on physical clocks (like Clock-SI and Google’s Spanner) and extends them with a novel item-based timestamping mechanism (Precise Clocks), speculative reads and a self-tuning mechanism. Via an extensive experimental study, we show that STR can achieve striking gains (up to 11 throughput increase and 10 latency reduction) in workloads characterized by low inter-data center contention, while ensuring robust performance even in adverse settings.
+
+An interesting research opportunity raised by this work is related to the design and evaluation of alternative self-tuning mechanisms, e.g., based on different modeling methodologies (e.g., relying on white-box analytical models), aimed at optimizing multiple KPIs (e.g., external misspeculation and throughput) or supporting diverse speculation degrees for different transactions’ types or at different nodes in a heterogeneous cluster.
+
+
+Download : Download high-res image (252KB)
+Download : Download full-size image
+Fig. 9. The performance of different protocols for RUBiS. In the latency plot, we use solid lines for final latency and dashed lines for speculative latency; in the abort rate plot, we report total abort rate with solid lines and misspeculation rate with dashed lines.
+
